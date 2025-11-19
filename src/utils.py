@@ -145,11 +145,3 @@ def compute_clip(das_array, pclip=99):
     clip = float(np.percentile(das_array, pclip))
     logger.debug(f'Clip ({pclip}th percentile) = {clip:.4f}')
     return clip
-
-
-
-
-
-
-
-

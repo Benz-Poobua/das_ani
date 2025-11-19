@@ -10,9 +10,10 @@
 import torch
 import logging
 import numpy as np
-import scipy.signal as signal
 from torch import nn
-from scipy.signal import butter, filtfilt, convolve
+import scipy.signal as signal
+from scipy.signal import butter, filtfilt, convolve, detrend
+from utils import convert_to_numpy, convert_to_tensor, runtime
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +265,94 @@ def spectral_whitening(rfftdata, df, window_freq, f1, f2):
 
     return rfftdata
 
+def preprocess(x, fs_raw, f1, f2, decimation, diff, ram_win):
+    """
+    Preprocess a single DAS data chunk following the ambient noise workflow:
+    differentiation → detrend → bandpass filter → decimation → 
+    temporal normalization.
+
+    :param x: Input DAS array of shape (n_channels × n_samples).
+    :type x: numpy.ndarray or torch.Tensor
+    :param fs_raw: Original sampling frequency (Hz).
+    :type fs_raw: float
+    :param f1: Low-cut frequency for bandpass filter (Hz).
+    :type f1: float
+    :param f2: High-cut frequency for bandpass filter (Hz).
+    :type f2: float
+    :param decimation: Decimation factor (integer > 0).
+    :type decimation: int
+    :param diff: Whether to take time derivative (∂/∂t).
+    :type diff: bool
+    :param ram_win: Window length (seconds) for running-absolute-mean
+                    temporal normalization. If 0 → one-bit normalization.
+    :type ram_win: float
+
+    :return: Preprocessed DAS array (float32) with shape 
+             (n_channels × n_samples/decimation).
+    :rtype: numpy.ndarray
+    """
+    start_time = runtime()
+
+    logger.info(
+        f'Preprocess | shape={x.shape} | fs={fs_raw}Hz | '
+        f'band=[{f1}, {f2}] Hz | decim={decimation} | '
+        f'diff={diff} | RAM={ram_win}s'
+    )
+
+    # Track initial type to decide final output type
+    is_tensor = torch.is_tensor(x)
+    if is_tensor:
+        logger.debug('Input is torch.Tensor → converting to numpy')
+        x = convert_to_numpy(x) 
+
+    # 1. Differentiation
+    # ========================================
+    if diff:
+        logger.debug('Applying time derivative (np.gradient)')
+        x = np.gradient(x, axis=-1) * fs_raw
+
+    # 2. Detrend
+    # ========================================
+    logger.debug('Detrending time series')
+    x = detrend(x, axis=-1)
+
+    # 3. Bandpass filter (Butterworth + Tukey taper)
+    # ========================================
+    logger.debug(f'Applying bandpass filter: {f1}-{f2} Hz')
+    x = bandpass_filter_tukey(x, fs_raw, f1, f2)
+
+    # 4. Decimation
+    # ========================================
+    if decimation > 1:
+        logger.debug(f'Decimation by factor {decimation}')
+        x = x[:, ::decimation]
+
+    fs_proc = fs_raw / decimation
+
+    # 5. Remove channel-wise DC offset
+    # ========================================
+    logger.debug('Remove median trace offset')
+    x -= np.median(x, axis=0)
+
+    # 6. Temporal normalization (one-bit or RAM)
+    # ========================================
+    logger.debug(f'Applying temporal normalization | RAM window={ram_win}s')
+    x = temporal_normalization(x, fs_proc, ram_win)
+
+    # 7. Return float32
+    # ========================================
+    x = x.astype(np.float32)
+    elasped = runtime() - start_time
+    logger.info(f'Preprocess complete | output shape={x.shape} | {elasped:.3f}s')
+
+    # 8. Optional return to torch
+    # ========================================
+    if is_tensor:
+        logger.debug('Returning output as torch.Tensor on proper device')
+        return convert_to_tensor(x)
+    
+    return x
+
 def nextpow2(x):
     """
     Vectorized next power of 2 for tensor inputs, fully GPU-accelerated.
@@ -499,19 +588,3 @@ def cross_correlation_full(data, ich1, ich2,
         f'(Nsel={n_sel}, Ntotal={n_total}, CClen={x_corr_len})'
     )
     return cc_out
-
-    
-
-
-
-
-
-
-
-
-
-   
-
-
-
-
