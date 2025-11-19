@@ -22,12 +22,13 @@ __pycache__/
 *.txt
 *.h5
 
-# Ignore everything inside geometry folder
+# Ignore everything inside these folders
 geometry/*
+preprocessed_data/*
 
 # But keep the placeholder file so the folder exists in Git
 !geometry/.gitkeep
-
+!preprocessed_data/.gitkeep
 
 
 
