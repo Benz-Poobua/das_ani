@@ -42,13 +42,19 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     logger.info(f'Processing file: {file_path}')
 
     # Set data parameters
-    fs_raw = 250                                    # sampling frequency (Hz)
-    nch_expected = 200                              # expected number of channels
+    fs_raw      = 250                               # sampling frequency (Hz)
+    first_chan  = 400                               # first channel number
+    last_chan   = 749                               # last channel number
+
+    nch_expected = last_chan - first_chan + 1       # expected number of channels
     dx = 8.16                                       # spatial sampling interval (m); `chann_len`
 
     # Set virtual sources
-    src_ch_all = np.arange(10, nch_expected, 10)   # every 10th channel up to nch_expected
-    logger.info(f'Virtual source channels: {src_ch_all}')
+    src_ch_all_num = np.arange(first_chan, last_chan + 1, 10)  # every 10th channel up to nch_expected
+    logger.info(f'Virtual source channels: {src_ch_all_num}')
+
+    # Convert to array indices (0-based)
+    src_ch_all = src_ch_all_num - first_chan
 
     # Set preprocessing parameters
     decimation  = 1                                 # decimation factor after filtering 
@@ -122,9 +128,9 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
 
     # Loop over virtual sources
     # ========================================
-    for src_ch in src_ch_all:
-        logger.info(f'Processing virtual source channel {src_ch:03d}')
-        pair_channel1 = src_ch * np.ones(nch, dtype=int)
+    for src_idx in src_ch_all:
+        logger.info(f'Processing virtual source channel index {src_idx} (channel number {first_chan + src_idx})')
+        pair_channel1 = src_idx * np.ones(nch, dtype=int)
         pair_channel2 = np.arange(nch, dtype=int)
         npair   = len(pair_channel1)
         nchunk  = int(np.ceil(npair / npair_chunk))
@@ -160,7 +166,7 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
 
         output_file_tmp = os.path.join(
             output_cc, 
-            basename.replace('.npz', f'_cc_{src_ch:03d}.npy')
+            basename.replace('.npz', f'_cc_{src_idx:03d}.npy')
         )
         logger.info(f'Saving output to {output_file_tmp}')
         np.save(output_file_tmp, ccall)
@@ -169,7 +175,7 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     logger.info(f'Finished {file_path} in {elapsed:.2f} seconds')
     return output_file_tmp
 
-def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=10):
+def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=8, use_gpu=False):
     """
     Orchestrate the DAS ambient-noise processing workflow across multiple files.
 
@@ -200,7 +206,7 @@ def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=10):
 
     # Parallel processing
     with ProcessPoolExecutor(max_workers=njobs) as executor:
-        futures = [executor.submit(process_signal_file, fpath, output_root) for fpath in filelist]
+        futures = [executor.submit(process_signal_file, fpath, output_root, use_gpu) for fpath in filelist]
         for fut in tqdm(as_completed(futures), total=len(futures), desc='Processing files'):
             try: 
                 result = fut.result()
