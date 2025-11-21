@@ -38,13 +38,12 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     :return: Path to the saved output file of this processing run.
     :rtype: str or None
     """
-    start_time = runtime()
     logger.info(f'Processing file: {file_path}')
 
     # Set data parameters
     fs_raw      = 250                               # sampling frequency (Hz)
-    first_chan  = 400                               # first channel number
-    last_chan   = 749                               # last channel number
+    first_chan  = 399                               # first channel number
+    last_chan   = 748                               # last channel number
 
     nch_expected = last_chan - first_chan + 1       # expected number of channels
     dx = 8.16                                       # spatial sampling interval (m); `chann_len`
@@ -171,8 +170,6 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
         logger.info(f'Saving output to {output_file_tmp}')
         np.save(output_file_tmp, ccall)
 
-    elapsed = runtime() - start_time
-    logger.info(f'Finished {file_path} in {elapsed:.2f} seconds')
     return output_file_tmp
 
 def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=8, use_gpu=False):
@@ -187,6 +184,7 @@ def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=8, use
     :type njobs: int
     :return: None
     """
+    start_time = runtime()
     logger.info('\n--- DAS Ambient Noise Processing Workflow ---\n')
 
     # Expand user (~) and normalize paths
@@ -214,7 +212,8 @@ def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=8, use
             except Exception as e:
                 logger.error(f'Error processing file: {e}')
 
-    logger.info('All files processed.')
+    elapsed = runtime() - start_time
+    logger.info(f'All files processed.in {elapsed:.2f} seconds')
 
 def parse_args():
     """
@@ -273,4 +272,4 @@ if __name__ == '__main__':
     )
 
 # Example
-# python src/cc.py --data_root ./data/preprocessed --output_root ./data/ncf --njobs 10 --use_gpu --verbose
+# python3 src/cc.py --data_root ./data/preprocessed --output_root ./data/ncf --njobs 10 --use_gpu --verbose

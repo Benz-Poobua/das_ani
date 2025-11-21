@@ -28,8 +28,8 @@ data/*
 
 # But keep the placeholder file so the folder exists in Git
 !geometry/.gitkeep
-!preprocessed/.gitkeep
-!ncf/.gitkeep
+!data/preprocessed/.gitkeep
+!data/ncf/.gitkeep
 
 
 
