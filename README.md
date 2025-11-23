@@ -75,8 +75,8 @@ Destination = current directory.
 │
 ├── data/
 │   ├── ncf/*.npy            # Noise cross-correlation results
-│   └── preprocessed/*.npz   # Preprocessed DAS time windows
-│
+│   └── preprocessed         # Preprocessed DAS time windows
+│       └──day/*.npz 
 ├── notebooks/
 │   ├── das_geometry.ipynb            # Fiber geometry visualization
 │   └── das_processing_demo.ipynb     # End-to-end DAS processing demo
@@ -86,6 +86,13 @@ Destination = current directory.
     ├── ani.py                # Ambient Noise Interferometry algorithms
     ├── cc.py                 # Cross-correlation workflow for DAS
     └── fake.py (optional)    # Synthetic DAS generator (used for testing)
+```
+---
+## Tutorial
+After downloading the data, ensure that the directory `./data/preprocessed` exists.
+You can then run the processing workflow with:
+```bash
+python3 src/cc.py --data_root ./data/preprocessed --output_root ./data/ncf --njobs 10 --use_gpu --verbose
 ```
 ---
 ## License
