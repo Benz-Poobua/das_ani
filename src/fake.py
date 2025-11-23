@@ -4,9 +4,10 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: This script generate synthetic DAS data (low‐rank + noise) for testing.
+:purpose: This script generates synthetic DAS data (low‐rank + noise) for testing. It also serves as a prototype.
 """
-import os 
+import os
+import glob
 import torch
 import logging
 import numpy as np
@@ -18,17 +19,15 @@ logger = logging.getLogger(__name__)
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 logger.info(f'Using device: {device}')
 
-# Input DAS files (loop over many if desired)
-das_paths = [
-    '../data/preprocessed/20210901/20210901_000000.npz',
-    '../data/preprocessed/20210901/20210901_001000.npz',
-    '../data/preprocessed/20210901/20210901_002000.npz',
-    '../data/preprocessed/20210901/20210901_003000.npz',
-]
+# Input DAS files 
+input_dir = os.path.join('..', 'data', 'preprocessed', '20210901')
+das_paths = sorted(glob.glob(os.path.join(input_dir, '*.npz')))
 
-# Output folder 
-output_dir = '../data/synthetic'
-os.makedirs(output_dir, exist_ok=True)
+
+# Output base folder (data subfoler will be created)
+script_dir = os.path.dirname(os.path.abspath(__file__))
+outpath_base = os.path.normpath(os.path.join(script_dir, '..', 'data', 'synthetic'))
+os.makedirs(outpath_base, exist_ok=True)
 
 # Choose rank
 k_svd = 50
@@ -48,7 +47,7 @@ def rsvd_torch(A: torch.Tensor, k: int, n_oversample: int = 10, n_power_iter: in
     # Step 2: sample columns
     Z = A @ P
 
-    # Step 3: power iterations
+    # Step 3: power iterations (improve accuracy)
     for _ in range(n_power_iter):
         Z = A @ (A.T @ Z)
 
@@ -104,14 +103,18 @@ for path in das_paths:
     A_rec = Ur @ torch.diag(Sr) @ Vhr
 
     # Add Gaussian noise
-    noise_level = 0.05   # 5% noise relative to StdDev
+    noise_level = 0.05   # 5% noise relative to standard deviation
     A_rec_cpu = A_rec.cpu().numpy()
-    noise = noise_level * np.std(A_rec_cpu) * np.random.rand(*A_rec_cpu.shape).astype(np.float32)
+    noise = noise_level * np.std(A_rec_cpu) * np.random.randn(*A_rec_cpu.shape).astype(np.float32)
     A_synth = A_rec_cpu + noise 
 
     # Save synthetic array
-    basename = os.path.basename(path).replace('.npz', '_fake.npy')
-    out_path = os.path.join(output_dir, basename)
+    basename = os.path.basename(path)
+    data_str = basename.split('_')[0]       # e.g., '20210901
+    output_subdir = os.path.join(outpath_base, data_str)
+    os.makedirs(output_subdir, exist_ok=True)
+    out_name = basename.replace('.npz', '_fake.npy')
+    out_path = os.path.join(output_subdir, out_name)
     np.save(out_path, A_synth)
     logger.info(f'Saved synthetic DAS to {out_path}')
 
