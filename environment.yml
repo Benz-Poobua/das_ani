@@ -1,0 +1,15 @@
+name: das_ani-env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pytorch=2.6.0
+  - numpy=2.0.2
+  - scipy=1.16.0
+  - pip
+  - pip:
+      - tqdm==4.66.5
+
