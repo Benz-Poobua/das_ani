@@ -4,7 +4,7 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: This script provides DAS ambient noise processing workflow
+:purpose: This script provides DAS ambient noise processing workflow.
 """
 import os
 import argparse
@@ -272,4 +272,4 @@ if __name__ == '__main__':
     )
 
 # Example
-# python3 src/cc.py --data_root ./data/preprocessed --output_root ./data/ncf --njobs 10 --use_gpu --verbose
+# python3 src/cc.py --data_root ./data/preprocessed --output_root ./data/ncf --njobs 8 --use_gpu --verbose
