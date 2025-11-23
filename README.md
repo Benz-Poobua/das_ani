@@ -74,8 +74,8 @@ Destination = current directory.
 │   └── .gitkeep             # originally stores: geometry_offset.csv, map_data.npy, map_data.txt
 │
 ├── data/
-│   ├── ncf/                 # Noise cross-correlation results
-│   └── preprocessed/        # Preprocessed DAS time windows
+│   ├── ncf/*.npy            # Noise cross-correlation results
+│   └── preprocessed/*.npz   # Preprocessed DAS time windows
 │
 ├── notebooks/
 │   ├── das_geometry.ipynb            # Fiber geometry visualization
