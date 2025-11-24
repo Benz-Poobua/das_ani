@@ -13,7 +13,7 @@ import numpy as np
 from torch import nn
 import scipy.signal as signal
 from scipy.signal import butter, filtfilt, convolve, detrend
-from utils import convert_to_numpy, convert_to_tensor, runtime
+from utils import convert_to_numpy, convert_to_tensor, runtime, nextpow2
 
 logger = logging.getLogger(__name__)
 
@@ -352,19 +352,6 @@ def preprocess(x, fs_raw, f1, f2, decimation, diff, ram_win):
         return convert_to_tensor(x)
     
     return x
-
-def nextpow2(x):
-    """
-    Vectorized next power of 2 for tensor inputs, fully GPU-accelerated.
-
-    :param x: 1D or multi-dim tensor of integers
-    :type x: torch.Tensor
-
-    :return: tensor of next powers of 2 (same shape as x)
-    :rtype: torch.Tensor
-    """
-    x = x.to(torch.float32)
-    return 2 ** torch.ceil(torch.log2(x))
 
 def cross_correlation(signal_1, signal_2, is_spectral_whitening=False, whitening_params=None):
     """

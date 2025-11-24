@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 device = (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
 logger.info(f'Using device: {device}')
 
-# Load .npz DAS file
 def load_data(filepath):
     """
     Load DAS waveform data from a .npz file.
@@ -50,7 +49,6 @@ def load_data(filepath):
     logger.info(f'DAS loaded: shape={das_array.shape}, dt={dt}')
     return data_dict, das_array, dt, N, T
 
-# Convert NumPy → PyTorch
 def convert_to_tensor(das_array):
     """
     Convert a NumPy DAS array to a PyTorch tensor on the active device.
@@ -64,7 +62,6 @@ def convert_to_tensor(das_array):
     logger.debug('Converting NumPy array to torch.Tensor.')
     return torch.from_numpy(das_array.astype(np.float32)).to(device)
 
-# Convert PyTorch → NumPy
 def convert_to_numpy(das_torch):
     """
     Convert a PyTorch tensor to a NumPy array on CPU.
@@ -79,7 +76,6 @@ def convert_to_numpy(das_torch):
 
     return das_torch.detach().cpu().numpy()
 
-# Runtime measurement helper
 def runtime():
     """
     Return synchronized high-resolution timestamp for benchmarking.
@@ -91,7 +87,6 @@ def runtime():
         torch.cuda.synchronize()
     return time.perf_counter()
 
-# Memory size utility
 def size(das_torch):
     """
     Compute tensor size in megabytes.
@@ -109,7 +104,6 @@ def size(das_torch):
     logger.debug(f'Tensor size = {MB:.3f} MB')
     return MB
 
-# Normalized Frobenius error
 def norm_fro(ori_torch, reconstructed_torch):
     """
     Compute normalized Frobenius error: ||A - A_rec|| / ||A||.
@@ -129,7 +123,6 @@ def norm_fro(ori_torch, reconstructed_torch):
     logger.debug(f'Frobenius error = {error:.6e}')
     return error
 
-# Percentile clip for plotting
 def compute_clip(das_array, pclip=99):
     """
     Compute percentile-based clipping value for image display.
@@ -145,3 +138,94 @@ def compute_clip(das_array, pclip=99):
     clip = float(np.percentile(das_array, pclip))
     logger.debug(f'Clip ({pclip}th percentile) = {clip:.4f}')
     return clip
+
+def nextpow2(x):
+    """
+    Vectorized next power of 2 for tensor inputs, fully GPU-accelerated.
+
+    :param x: 1D or multi-dim tensor of integers
+    :type x: torch.Tensor
+
+    :return: tensor of next powers of 2 (same shape as x)
+    :rtype: torch.Tensor
+    """
+    x = x.to(torch.float32)
+    return 2 ** torch.ceil(torch.log2(x))
+
+def fk_transform(data, dt, dx, fast_len_t=None, fast_len_x=None):
+    """
+    Compute the f–k (frequency–wavenumber) spectrum of DAS data using PyTorch.
+    Automatically pads FFT length to the next power of 2 unless overridden.
+
+    :param data: DAS waveform matrix (nch × nt). Can be numpy array or torch tensor.
+    :type data: numpy.ndarray or torch.Tensor
+
+    :param dt: Time sampling interval in seconds.
+    :type dt: float
+
+    :param dx: Spatial sampling interval in meters.
+    :type dx: float
+
+    :param fast_len_t: Optional FFT length for time axis (overrides nextpow2).
+    :type fast_len_t: int or None
+
+    :param fast_len_x: Optional FFT length for space axis (overrides nextpow2).
+    :type fast_len_x: int or None
+
+    :return:
+        - **freqs** (*torch.Tensor*) -- frequency axis in Hz, shape (nfreq,)
+        - **wavenumbers** (*torch.Tensor*) -- wavenumber axis (cycles/m), shape (nk,)
+        - **fk_spectrum** (*torch.Tensor*) -- complex f–k spectrum, shape (nk × nfreq)
+    :rtype: tuple
+
+    Notes
+    -----
+    - FFT along time (axis=1) followed by FFT along channels (axis=0).
+    - Uses nextpow2() for fast FFTs unless user overrides.
+    - Output preserved as torch complex tensor for whitening/filtering in f–k domain.
+    """
+    logger.info('Computing f-k transform.')
+
+    # Ensure torch tensor
+    if not isinstance(data, torch.Tensor):
+        logger.debug('Input is not a torch.Tensor; converting via convert_to_tensor().')
+        data = convert_to_tensor(data)
+    
+    data = data.to(device)
+    nch, nt = data.shape
+    logger.debug(f'Input data shape = (nch={nch}, nt={nt}) on device {device}.')
+
+    # Determine FFT lengths using nextpow2()
+    if fast_len_t is None:
+        Ft = int(nextpow2(torch.tensor([nt], device=device))[0].item())
+    else:
+        Ft = fast_len_t
+
+    if fast_len_x is None:
+        Fx = int(nextpow2(torch.tensor([nch], device=device))[0].item())
+    else:
+        Fx = fast_len_x
+    
+    logger.debug(f'FFT lengths: time-axis Ft={Ft}, space-axis Fx={Fx}')
+
+    # 1. FFT along time axis (dim=1)
+    # ----------------------------------------------
+    fft_t = torch.fft.rfft(data, n=Ft, dim=1)           # -> (nch, nfreq)
+    nfreq = fft_t.shape[1]
+    logger.debug(f'Time FFT complete: fft_t shape = {fft_t.shape}')
+
+    # Frequency axis (Hz)
+    freqs = torch.fft.rfftfreq(Ft, dt).to(device)       # shape (nfreq,)
+
+    # 2. FFT along space axis (dim=0)
+    # ----------------------------------------------
+    fk_spectrum = torch.fft.fft(fft_t, n=Fx, dim=0)     # -> (nk, nfreq)
+    nk = fk_spectrum.shape[0]
+    logger.debug(f'Space FFT complete: fk_spectrum shape = {fk_spectrum.shape}')
+
+    # Wavenumber axis (cycles/m)
+    wavenumbers = torch.fft.fftfreq(Fx, dx).to(device)  # shape (nk,)
+
+    logger.info('f-k transform completed successfully.')
+
+    return freqs, wavenumbers, fk_spectrum
