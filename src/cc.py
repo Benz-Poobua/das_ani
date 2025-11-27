@@ -122,7 +122,7 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     model.eval()
 
     # Move data to Tensor
-    data_tensor = convert_to_tensor(data_proc).to(device)
+    data_tensor = convert_to_tensor(data_proc, device=device)
     logger.debug(f'Data tensor shape: {data_tensor.shape}, device: {data_tensor.device}')
 
     # Loop over virtual sources

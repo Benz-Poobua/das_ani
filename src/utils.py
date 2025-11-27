@@ -49,32 +49,59 @@ def load_data(filepath):
     logger.info(f'DAS loaded: shape={das_array.shape}, dt={dt}')
     return data_dict, das_array, dt, N, T
 
-def convert_to_tensor(das_array):
+def convert_to_tensor(x, device=None):
     """
-    Convert a NumPy DAS array to a PyTorch tensor on the active device.
+    Convert input to a torch.Tensor on a given device.
+    If already a tensor, move it to the target device.
 
-    :param das_array: DAS matrix
-    :type das_array: numpy.ndarray
+    :param x: Input array or tensor.
+    :type x: numpy.ndarray, list, or torch.Tensor
+
+    :param device: Target torch.device ('cpu', 'cuda', 'mps').
+    :type device: torch.device or None
 
     :return: DAS matrix as a float32 PyTorch tensor
     :rtype: torch.Tensor
-    """
-    logger.debug('Converting NumPy array to torch.Tensor.')
-    return torch.from_numpy(das_array.astype(np.float32)).to(device)
 
-def convert_to_numpy(das_torch):
+    :return: Tensor on the target device.
+    :rtype: torch.Tensor
     """
-    Convert a PyTorch tensor to a NumPy array on CPU.
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Already a torch tensor
+    if isinstance(x, torch.Tensor):
+        # avoid copying if already correct device and dtype
+        if x.device != device:
+            x = x.to(device)
+        # do not cast complex tensors to float32
+        if x.is_complex():
+            return x
+        return x.to(torch.float32)
+    
+    # Convert numpy → tensor
+    x = np.asarray(x)
 
-    :param das_torch: DAS tensor
-    :type das_torch: torch.Tensor
+    # Complex numpy? preserve complex64
+    if np.iscomplexobj(x):
+        return torch.tensor(x, dtype=torch.complex64, device=device)
+    
+    # Otherwise real-valued float32
+    return torch.tensor(x, dtype=torch.float32, device=device)
+
+def convert_to_numpy(x):
+    """
+    Convert tensor or array to numpy.ndarray on CPU.
+
+    :param x: Input tensor or array.
+    :type x: torch.Tensor or numpy.ndarray 
 
     :return: converted NumPy array
     :rtype: numpy.ndarray
     """
-    logger.debug('Converting torch.Tensor to NumPy array.')
-
-    return das_torch.detach().cpu().numpy()
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
 def runtime():
     """
