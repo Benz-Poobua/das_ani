@@ -4,8 +4,8 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: This module contains DAS preprocessing (Bensen et al., 2007) and cross-correlation scripts.
-:reference: The script is modified from Yan Yang 2022-07-10
+:purpose: DAS preprocessing (Bensen et al., 2007) + GPU-accelerated cross-correlation.
+:reference: Modified from Yan Yang (2022-07-10).
 """
 import torch
 import logging
@@ -13,7 +13,7 @@ import numpy as np
 from torch import nn
 import scipy.signal as signal
 from scipy.signal import butter, filtfilt, convolve, detrend
-from utils import convert_to_numpy, convert_to_tensor, runtime, nextpow2
+from utils import convert_to_numpy, convert_to_tensor, nextpow2, timeit
 
 logger = logging.getLogger(__name__)
 
@@ -40,17 +40,11 @@ def bandpass_filter_tukey(data, fs, f1, f2, alpha=0.05):
                  f'f1={f1}, f2={f2}, alpha={alpha})')
 
     if data.ndim != 2:
-        logger.error(f"Input 'data' must be 2D (n_channels × n_samples). Got shape {data.shape}")
-        raise ValueError('Input data must be 2D')
+        raise ValueError('bandpass_filter_tukey: data must be 2D.')
     
-    if f1 <= 0 or f2 <= 0 or f2 <= f1:
-        logger.error(f'Invalid bandpass frequencies f1={f1}, f2={f2}')
-        raise ValueError('Frequencies must satisfy 0 < f1 < f2 < Nyquist')
-    
-    nyquist = fs / 2
-    if f2 >= nyquist:
-        logger.error(f'f2={f2} exceeds Nyquist frequency ({nyquist})')
-        raise ValueError('High corner frequency is above Nyquist')
+    nyq = fs / 2
+    if not (0 < f1 < f2 < nyq):
+        raise ValueError('Invalid f1/f2: must satisfy 0 < f1 < f2 < Nyquist.')
     
     # Create Tukey window
     n_samples = data.shape[1]
@@ -58,8 +52,8 @@ def bandpass_filter_tukey(data, fs, f1, f2, alpha=0.05):
     logger.debug(f'Tukey window generated (alpha={alpha}, length={n_samples})')
 
     # Butterworth bandpass filter
-    low = f1 / nyquist 
-    high = f2 / nyquist
+    low = f1 / nyq 
+    high = f2 / nyq
     b, a = butter(4, [low, high], btype='bandpass')
     logger.debug(f'Butterworth filter designed: order=4, low={low}, high={high}')
 
@@ -76,7 +70,7 @@ def bandpass_filter_tukey(data, fs, f1, f2, alpha=0.05):
         logger.error(f'Filtering failed: {e}')
         raise
 
-    return filtered
+    return filtered.astype(np.float32)
 
 def running_absolute_mean(trace, nwin):
     """
@@ -98,12 +92,11 @@ def running_absolute_mean(trace, nwin):
     if trace.ndim != 1:
         raise ValueError("Input 'trace' must be a 1D array.")
     
-    npts = len(trace)
     if nwin <= 1:
         logger.warning('nwin <= 1; returning original trace.') 
         return trace.copy()
     
-    # Absolute values of trace
+    npts = len(trace)
     abs_trace = np.abs(trace)
 
     # Prepare padded array: length = npts + 2*nwin
@@ -164,11 +157,11 @@ def temporal_normalization(data, fs, window_time):
 
     logger.info(f'Applying RAM normalization: window={window_time}s ({nwin} samples).')
 
-    norm_data = data.copy()
+    out = data.copy()
     for i in range(nch):
-        norm_data[i, :] = running_absolute_mean(norm_data[i, :], nwin)
+        out[i, :] = running_absolute_mean(out[i, :], nwin)
 
-    return norm_data
+    return out
 
 def spectral_whitening(rfftdata, df, window_freq, f1, f2):
     """
@@ -198,6 +191,7 @@ def spectral_whitening(rfftdata, df, window_freq, f1, f2):
     """
     if not torch.is_tensor(rfftdata):
         raise TypeError('rfftdata must be a torch.Tensor.')
+    
     if not rfftdata.is_complex():
         raise ValueError('rfftdata must be a complex-valued tensor.')
 
@@ -206,7 +200,7 @@ def spectral_whitening(rfftdata, df, window_freq, f1, f2):
 
     # Frequency indices
     idxf1 = int(f1 / df)
-    idxf2 = idxf2 = int(torch.ceil(torch.tensor(f2/df, device=device)).item())  
+    idxf2 = int(torch.ceil(torch.tensor(f2/df, device=device)).item())  
 
     if idxf1 < 0 or idxf2 > nfreq:
         raise ValueError('f1 or f2 exceed available frequency bins.')
@@ -265,6 +259,7 @@ def spectral_whitening(rfftdata, df, window_freq, f1, f2):
 
     return rfftdata
 
+@timeit
 def preprocess(x, fs_raw, f1, f2, decimation, diff, ram_win):
     """
     Preprocess a single DAS data chunk following the ambient noise workflow:
@@ -291,8 +286,6 @@ def preprocess(x, fs_raw, f1, f2, decimation, diff, ram_win):
              (n_channels × n_samples/decimation).
     :rtype: numpy.ndarray
     """
-    start_time = runtime()
-
     logger.info(
         f'Preprocess | shape={x.shape} | fs={fs_raw}Hz | '
         f'band=[{f1}, {f2}] Hz | decim={decimation} | '
@@ -301,6 +294,8 @@ def preprocess(x, fs_raw, f1, f2, decimation, diff, ram_win):
 
     # Track initial type to decide final output type
     is_tensor = torch.is_tensor(x)
+    orig_device = x.device if is_tensor else None
+
     if is_tensor:
         logger.debug('Input is torch.Tensor → converting to numpy')
         x = convert_to_numpy(x) 
@@ -342,14 +337,11 @@ def preprocess(x, fs_raw, f1, f2, decimation, diff, ram_win):
     # 7. Return float32
     # ========================================
     x = x.astype(np.float32)
-    elasped = runtime() - start_time
-    logger.info(f'Preprocess complete | output shape={x.shape} | {elasped:.3f}s')
 
     # 8. Optional return to torch
     # ========================================
     if is_tensor:
-        logger.debug('Returning output as torch.Tensor on proper device')
-        return convert_to_tensor(x)
+        return convert_to_tensor(x, device=orig_device)
     
     return x
 
@@ -382,7 +374,7 @@ def cross_correlation(signal_1, signal_2, is_spectral_whitening=False, whitening
     x_corr_len = 2 * npts - 1
 
     # nextpow2 returns tensor → convert to python int
-    fast_length = int(nextpow2(torch.tensor(x_corr_len, device=device)).item())
+    fast_length = int(nextpow2(torch.tensor([x_corr_len], device=device))[0].item())
 
     logger.info(f'Cross-correlation | FFT size = {fast_length}')
 
@@ -523,7 +515,7 @@ def cross_correlation_full(data, ich1, ich2,
 
     # FFT size for full CC
     x_corr_len = 2 * npts - 1
-    fast_length = int(nextpow2(torch.tensor(x_corr_len, device=device)).item())
+    fast_length = int(nextpow2(torch.tensor([x_corr_len], device=device))[0].item())
     logger.info(
         f'FFT length: npts={npts} → xcorr_len={x_corr_len} → fast_length={fast_length}'
     )
