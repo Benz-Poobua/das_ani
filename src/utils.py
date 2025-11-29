@@ -12,6 +12,7 @@ import time
 import torch
 import psutil
 import logging
+import functools
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -122,9 +123,10 @@ def timeit(func):
         def my_function(...):
             ...
     """
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
         # Use the logger of the module where the function is defined
-        logger = logging.getLogger(func.__module__)
+        log = logging.getLogger(func.__module__)
 
         # Sync GPU before timing 
         if torch.cuda.is_available():
@@ -142,13 +144,12 @@ def timeit(func):
         dt = time.perf_counter() - t0
 
         msg = f'[{func.__name__}] elapsed = {dt:.3f} s'
-        logger.info(msg)
+        log.info(msg)
 
-        # Optional runlog write
         try:
             write_runlog(msg)
         except Exception:
-            pass
+            log.debug('Runlog not available — skipping file logging.')
 
         return result
     
@@ -208,11 +209,18 @@ def nextpow2(x):
     :return: Next power of 2.
     :rtype: torch.Tensor
     """
+    # Determine device
+    device = x.device if isinstance(x, torch.Tensor) \
+             else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Convert Python scaler → tensor
     if not isinstance(x, torch.Tensor):
-        x = torch.tensor([x], dtype=torch.float32)
-        return 2 ** torch.ceil(torch.log2(x))[0]
-   
-    x = x.to(torch.float32)
+        x = torch.tensor(float(x), dtype=torch.float32, device=device)
+
+    else:
+        # Tensor input → ensure float32 on same device
+        x = x.to(device=device, dtype=torch.float32)
+
     return 2 ** torch.ceil(torch.log2(x))
 
 # 5. FK transform
@@ -254,8 +262,8 @@ def fk_transform(data, dt, dx, fast_len_t=None, fast_len_x=None):
 
     nch, nt = data.shape
 
-    Ft = fast_len_t or int(nextpow2(nt))
-    Fx = fast_len_x or int(nextpow2(nch))
+    Ft = fast_len_t or int(nextpow2(nt).item())
+    Fx = fast_len_x or int(nextpow2(nch).item())
     
     # 1. FFT along time axis (dim=1)
     # ----------------------------------------------

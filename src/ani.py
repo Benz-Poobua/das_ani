@@ -374,7 +374,7 @@ def cross_correlation(signal_1, signal_2, is_spectral_whitening=False, whitening
     x_corr_len = 2 * npts - 1
 
     # nextpow2 returns tensor → convert to python int
-    fast_length = int(nextpow2(torch.tensor([x_corr_len], device=device))[0].item())
+    fast_length = int(nextpow2(x_corr_len).item())
 
     logger.info(f'Cross-correlation | FFT size = {fast_length}')
 
@@ -515,7 +515,7 @@ def cross_correlation_full(data, ich1, ich2,
 
     # FFT size for full CC
     x_corr_len = 2 * npts - 1
-    fast_length = int(nextpow2(torch.tensor([x_corr_len], device=device))[0].item())
+    fast_length = int(nextpow2(x_corr_len).item())
     logger.info(
         f'FFT length: npts={npts} → xcorr_len={x_corr_len} → fast_length={fast_length}'
     )
