@@ -13,7 +13,7 @@ import numpy as np
 from torch import nn
 import scipy.signal as signal
 from scipy.signal import butter, filtfilt, convolve, detrend
-from utils import convert_to_numpy, convert_to_tensor, nextpow2, timeit
+from src.utils import convert_to_numpy, convert_to_tensor, nextpow2, timeit
 
 logger = logging.getLogger(__name__)
 

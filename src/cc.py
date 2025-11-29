@@ -16,12 +16,16 @@ from torch import nn
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
-from utils import (load_data, 
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+
+from src.utils import (load_data, 
                    convert_to_tensor, 
                    timeit,
                    write_runlog, 
                    gpu_memory, 
-                   cpu_memory)
+                   cpu_memory, 
+                   auto_np_pair_chunk)
 
 from ani import preprocess, TorchCrossCorrelation
 
@@ -49,6 +53,7 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     :rtype: str or None
     """
     logger.info(f'Processing file: {file_path}')
+    
     write_runlog(f'Started: {file_path}')
 
     # Set data parameters
@@ -85,8 +90,6 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     # Computational parameters
     device          = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')   
     logger.info(f'Using device: {device}')
-    # gpu_ids         = [0]                           # GPU device id, if using GPU
-    npair_chunk     = 1250                          # chunk size for pair processing
 
     # Load data
     # ========================================
@@ -117,6 +120,18 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     nseg = npts_new // npts_seg
     flag_mean = nseg
 
+    # Decide batch size automatically
+    npair_chunk = auto_np_pair_chunk(
+        nch=nch, 
+        npts_seg=npts_seg, 
+        device=device, 
+        frac_mem=0.25,  
+        min_chunk=64, 
+        max_chunk=4096
+    ) 
+    logger.info(f'Using npair_chunk = {npair_chunk} (auto-selected)')
+    write_runlog(f"npair_chunk={npair_chunk} | nch={nch} | npts_seg={npts_seg}")
+
     # Free GPU memory before heavy ops
     if device.type == 'cuda':
         torch.cuda.empty_cache()
@@ -125,16 +140,28 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     # ========================================
     model_conf = {
         'is_spectral_whitening': is_spectral_whitening, 
-        'whitening_params': (fs_proc, window_freq, f1, f2)
+        'whitening_params': (float(fs_proc), float(window_freq), float(f1), float(f2))
     }
 
     model = TorchCrossCorrelation(**model_conf)
-    model.to(device)
 
-    # Multi-GPU optional
-    if device.type == 'cuda' and use_gpu and torch.cuda.device_count() > 1:
+    # Multi-GPU optional (CUDA only)
+    multi_gpu = (device.type == 'cuda' and use_gpu and torch.cuda.device_count() > 1)
+
+    if multi_gpu:
         logger.info(f'Using DataParallel over {torch.cuda.device_count()} GPUs.')
         model = nn.DataParallel(model)
+        model.to(device)
+    else: 
+        model.to(device)
+
+    # Optional torch.compile for extra speed (single-device only)
+    if not multi_gpu:
+        try:
+            model = torch.compile(model, mode='max-autotune')
+            logger.info('Enabled torch.compile() for TorchCrossCorrelation.')
+        except Exception as e:
+            logger.warning(f'torch.compile() not available or failed: {e}')
     
     model.eval()
 
@@ -146,16 +173,21 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     # ========================================
     last_output = None
 
-    for src_idx in src_ch_all:
-        logger.info(f'Processing virtual source channel index {src_idx} (channel number {first_chan + src_idx})')
+    for i, src_idx in enumerate(src_ch_all):
+        logger.info(
+        f'[VS {i+1}/{len(src_ch_all)}] '
+        f'Processing virtual source channel index {src_idx} '
+        f'(channel number {first_chan + src_idx})'
+        )
         write_runlog(f'Start VS {src_idx}: {gpu_memory()} | {cpu_memory()}')
 
         pair_ch1 = np.full(nch, src_idx, dtype=int)
-        pair_ch2 = np.arange(nch)
+        pair_ch2 = np.arange(nch, dtype=int)
         npair   = len(pair_ch1)
 
         # GPU-safety chunking
         nchunk  = int(np.ceil(npair / npair_chunk))
+        write_runlog(f"VS {src_idx}: npair={npair}, npair_chunk={npair_chunk}, nchunk={nchunk}")
 
         # Prepare output array 
         ccall = np.zeros((npair, 2 * npts_lag + 1), dtype=np.float32)
@@ -165,15 +197,15 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
             start_idx   = npair_chunk * ichunk
             end_idx     = min(start_idx + npair_chunk, npair)
 
-            ich1 = pair_ch1[start_idx:end_idx].astype(int)
-            ich2 = pair_ch2[start_idx:end_idx].astype(int)
+            ich1 = pair_ch1[start_idx:end_idx]
+            ich2 = pair_ch2[start_idx:end_idx]
 
             # Reshape into (batch, npts_seg)
             data1 = data_tensor[ich1, :].reshape(-1, npts_seg)
             data2 = data_tensor[ich2, :].reshape(-1, npts_seg)
 
             cc_chunk = model(data1, data2)
-            cc_np    = cc_chunk.cpu().numpy()
+            cc_np    = cc_chunk.detach().cpu().numpy()
 
             # Sum over segments
             cc_sum   = np.sum(cc_np.reshape(len(ich1), nseg, -1), axis=1)
@@ -185,9 +217,10 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
             ccall[start_idx:end_idx, :] += cc_sum[:, lag_start:lag_end]
 
             # Log current memory
-            write_runlog(
-                f"Batch {ichunk+1}/{nchunk} | {gpu_memory('GPU:')} | {cpu_memory('CPU:')}"
-            )
+            if ichunk % 5 == 0 or ichunk == nchunk - 1:
+                write_runlog(
+                    f"Batch {ichunk+1}/{nchunk} | {gpu_memory('GPU:')} | {cpu_memory('CPU:')}"
+                )
 
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -238,8 +271,7 @@ def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=8, use
         os.path.join(root, fname)
         for root, _, files in os.walk(data_root)
         for fname in files
-        if fname.endswith('.npz')
-)
+        if fname.endswith('.npz'))
 
     logger.info(f'Found {len(filelist)} files in {data_root}')
     write_runlog(f'Found {len(filelist)} input files in {data_root}.')
@@ -301,6 +333,9 @@ def parse_args():
 
 
 if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
+
     args = parse_args()
 
     # Set verbose / debug logging if requested
@@ -316,4 +351,4 @@ if __name__ == '__main__':
     )
 
 # Example
-# python3 src/cc.py --data_root ./data/preprocessed --output_root ./data/ncf --njobs 8 --use_gpu --verbose
+# python -m src.cc --data_root ./data/preprocessed --output_root ./data/ncf --njobs 4 --use_gpu --verbose

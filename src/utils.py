@@ -36,6 +36,7 @@ def load_data(filepath, mmap=False):
         - **N** (*int*) -- number of samples  
         - **T** (*float*) -- total duration in seconds  
     """
+    logger.info(f"[load_data] using utils at: {__file__}")
     logger.info(f'Loading file: {filepath} (mmap={mmap})')
 
     data_dict = np.load(filepath, mmap_mode='r' if mmap else None)
@@ -43,11 +44,11 @@ def load_data(filepath, mmap=False):
     if 'data' not in data_dict or 'dt' not in data_dict:
         raise KeyError("NPZ file must contain 'data' and 'dt'.")
     
-    das_array = data_dict['data']   # may be a memmap if mmap=True
+    das_array = data_dict['data']       # may be a memmap if mmap=True
     dt = float(data_dict['dt'])     # sampling interval (seconds)
 
-    N = das_array.shape[1]          # number of samples
-    T = N * dt                      # total duration
+    N = das_array.shape[1]              # number of samples
+    T = N * dt                          # total duration
 
     logger.info(f'DAS loaded: shape={das_array.shape}, dt={dt}')
     return data_dict, das_array, dt, N, T
@@ -335,48 +336,30 @@ def cpu_memory(prefix=""):
 def auto_np_pair_chunk(nch, npts_seg, device, frac_mem=0.25, min_chunk=64, max_chunk=4096):
     """
     Heuristic to choose a safe GPU/CPU batch size for channel pairs.
-
-    :param nch: Number of channels (upper bound on pairs for one VS).
-    :type nch: int
-    :param npts_seg: Samples per correlation segment.
-    :type npts_seg: int
-    :param device: torch.device where CC will run ('cpu' or 'cuda').
-    :type device: torch.device
-    :param frac_mem: Fraction of free memory to use as a budget.
-    :type frac_mem: float
-    :param min_chunk: Minimum batch size (lower safety bound).
-    :type min_chunk: int
-    :param max_chunk: Maximum batch size (upper safety bound).
-    :type max_chunk: int
-
-    :return: Estimated safe batch size (# of channel pairs per chunk).
-    :rtype: int
     """
-    # Rough memory model (very conservative):
-    # - 2 real inputs per pair:     2 * npts_seg * 4 bytes
-    # - FFTs + products, etc.:      ~ (6 * npts_seg * 4) bytes
-    # → ~8 * npts_seg * 4 bytes ≈ 32 * npts_seg bytes
-    # Use a more conservative factor (64) to be safe.
+    import psutil
+
+    # Rough memory model
     bytes_per_pair = 64 * npts_seg
 
     if bytes_per_pair <= 0:
-        return min_chunk
+        return int(min_chunk)
     
-    # Memory budget 
+    # Memory budget
     if device.type == 'cuda' and torch.cuda.is_available():
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_bytes, _ = torch.cuda.mem_get_info()
         budget = free_bytes * frac_mem
     else:
         budget = psutil.virtual_memory().available * frac_mem
     
-    max_pairs_by_mem = int(budget // bytes_per_pair) if bytes_per_pair > 0 else max_chunk
+    max_pairs_by_mem = int(budget // bytes_per_pair)
 
-    # Clamp to reasonable range and to nch
+    # Clamp
     if max_pairs_by_mem < min_chunk:
         npair_chunk = min_chunk
     else:
         npair_chunk = min(max_pairs_by_mem, max_chunk)
     
-    npair_chunk = min(npair_chunk, nch)     # no need to exceed #channels
+    npair_chunk = min(npair_chunk, nch)
 
     return int(max(npair_chunk, 1))
