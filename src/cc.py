@@ -4,7 +4,8 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: This script provides DAS ambient noise processing workflow.
+:purpose: DAS ambient noise interferometry (ANI)
+          Cross-correlation workflow for NCF generation.
 """
 import os
 import argparse
@@ -12,11 +13,16 @@ import logging
 import torch
 import numpy as np
 from torch import nn
-from glob import glob
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
-from utils import load_data, convert_to_tensor, runtime
+from utils import (load_data, 
+                   convert_to_tensor, 
+                   timeit,
+                   write_runlog, 
+                   gpu_memory, 
+                   cpu_memory)
+
 from ani import preprocess, TorchCrossCorrelation
 
 logging.basicConfig(
@@ -25,9 +31,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# PROCESS ONE NPZ → MULTI NCF (virtual-source CC)
+# =====================================================
+@timeit
 def process_signal_file(file_path, output_cc, use_gpu=False):
     """
-    Main DAS processing workflow for ambient noise cross-correlation.
+    Process one DAS file and compute cross-correlation (NCF)
+    for all virtual source channels.
 
     :param file_path: Path to the DAS file to process.
     :type file_path: str
@@ -39,17 +49,17 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     :rtype: str or None
     """
     logger.info(f'Processing file: {file_path}')
+    write_runlog(f'Started: {file_path}')
 
     # Set data parameters
     fs_raw      = 250                               # sampling frequency (Hz)
     first_chan  = 399                               # first channel number
     last_chan   = 748                               # last channel number
-
     nch_expected = last_chan - first_chan + 1       # expected number of channels
     dx = 8.16                                       # spatial sampling interval (m); `chann_len`
 
     # Set virtual sources
-    src_ch_all_num = np.arange(first_chan, last_chan + 1, 10)  # every 10th channel up to nch_expected
+    src_ch_all_num = np.arange(first_chan, last_chan + 1, 10)  # every 10th channel
     logger.info(f'Virtual source channels: {src_ch_all_num}')
 
     # Convert to array indices (0-based)
@@ -75,12 +85,12 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     # Computational parameters
     device          = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')   
     logger.info(f'Using device: {device}')
-    gpu_ids         = [0]                           # GPU device id, if using GPU
+    # gpu_ids         = [0]                           # GPU device id, if using GPU
     npair_chunk     = 1250                          # chunk size for pair processing
 
     # Load data
     # ========================================
-    data_dict, data_raw, dt, N, T = load_data(file_path)
+    data_dict, data_raw, dt, N, T = load_data(file_path, mmap=True)
     nch, npts = data_raw.shape
     basename = os.path.basename(file_path)
 
@@ -97,7 +107,8 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
 
     # Prepare for cross-correlation
     # ========================================
-    npts_new = (npts // npts_seg) * npts_seg
+    npts_proc = data_proc.shape[1]
+    npts_new = (npts_proc // npts_seg) * npts_seg
     if npts_new < npts_seg:
         logger.warning(f'File {file_path} too short after segmentation: npts_new = {npts_new}')
         return None
@@ -106,7 +117,7 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     nseg = npts_new // npts_seg
     flag_mean = nseg
 
-    # Free GPU memory if any
+    # Free GPU memory before heavy ops
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
@@ -116,9 +127,15 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
         'is_spectral_whitening': is_spectral_whitening, 
         'whitening_params': (fs_proc, window_freq, f1, f2)
     }
+
     model = TorchCrossCorrelation(**model_conf)
-    model = nn.DataParallel(model, device_ids=gpu_ids)
     model.to(device)
+
+    # Multi-GPU optional
+    if device.type == 'cuda' and use_gpu and torch.cuda.device_count() > 1:
+        logger.info(f'Using DataParallel over {torch.cuda.device_count()} GPUs.')
+        model = nn.DataParallel(model)
+    
     model.eval()
 
     # Move data to Tensor
@@ -127,22 +144,31 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
 
     # Loop over virtual sources
     # ========================================
+    last_output = None
+
     for src_idx in src_ch_all:
         logger.info(f'Processing virtual source channel index {src_idx} (channel number {first_chan + src_idx})')
-        pair_channel1 = src_idx * np.ones(nch, dtype=int)
-        pair_channel2 = np.arange(nch, dtype=int)
-        npair   = len(pair_channel1)
+        write_runlog(f'Start VS {src_idx}: {gpu_memory()} | {cpu_memory()}')
+
+        pair_ch1 = np.full(nch, src_idx, dtype=int)
+        pair_ch2 = np.arange(nch)
+        npair   = len(pair_ch1)
+
+        # GPU-safety chunking
         nchunk  = int(np.ceil(npair / npair_chunk))
 
         # Prepare output array 
         ccall = np.zeros((npair, 2 * npts_lag + 1), dtype=np.float32)
 
+        # Chunked correlation loop (GPU batching)
         for ichunk in range(nchunk):
             start_idx   = npair_chunk * ichunk
             end_idx     = min(start_idx + npair_chunk, npair)
-            ich1 = pair_channel1[start_idx:end_idx].astype(int)
-            ich2 = pair_channel2[start_idx:end_idx].astype(int)
 
+            ich1 = pair_ch1[start_idx:end_idx].astype(int)
+            ich2 = pair_ch2[start_idx:end_idx].astype(int)
+
+            # Reshape into (batch, npts_seg)
             data1 = data_tensor[ich1, :].reshape(-1, npts_seg)
             data2 = data_tensor[ich2, :].reshape(-1, npts_seg)
 
@@ -155,66 +181,84 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
             # Extract lag window centered
             lag_start = npts_seg - npts_lag - 1
             lag_end = lag_start + (2 * npts_lag + 1)
+
             ccall[start_idx:end_idx, :] += cc_sum[:, lag_start:lag_end]
 
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
+            # Log current memory
+            write_runlog(
+                f"Batch {ichunk+1}/{nchunk} | {gpu_memory('GPU:')} | {cpu_memory('CPU:')}"
+            )
+
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
 
         # Normalize by number of segments
         ccall /= flag_mean
 
-        output_file_tmp = os.path.join(
+        out_path = os.path.join(
             output_cc, 
             basename.replace('.npz', f'_cc_{src_idx:03d}.npy')
         )
-        logger.info(f'Saving output to {output_file_tmp}')
-        np.save(output_file_tmp, ccall)
+        np.save(out_path, ccall)
+        logger.info(f'Saving output to {out_path}')
 
-    return output_file_tmp
+        write_runlog(f'Completed VS {src_idx}, saved → {out_path}')
 
+        last_output = out_path
+
+    return last_output
+
+# MAIN MULTI-FILE EXECUTION
+# =====================================================
+@timeit
 def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=8, use_gpu=False):
     """
-    Orchestrate the DAS ambient-noise processing workflow across multiple files.
+    Run ANI workflow across all .npz files in data_root.
 
-    :param data_root: Root directory containing subfolders of preprocessed DAS `.npz` files.
+    :param data_root: Directory containing preprocessed DAS files (.npz).
     :type data_root: str
-    :param output_root: Directory where cross-correlation output files will be saved.
+    :param output_root: Output directory for generated NCF stacks.
     :type output_root: str
-    :param njobs: Number of parallel worker processes.
+    :param njobs: Number of parallel worker processes (ProcessPoolExecutor).
     :type njobs: int
+    :param use_gpu: Whether GPU is used for CC.
+    :type use_gpu: bool
+
     :return: None
     """
-    start_time = runtime()
     logger.info('\n--- DAS Ambient Noise Processing Workflow ---\n')
 
     # Expand user (~) and normalize paths
     data_root = os.path.expanduser(data_root)
     output_root = os.path.expanduser(output_root)
-
-    # Collect input files
-    filelist = []
-    for subdir, dirs, files in os.walk(data_root):
-        for fname in files:
-            if fname.endswith('.npz'):
-                filelist.append(os.path.join(subdir, fname))
-    filelist = sorted(filelist)
-
-    logger.info(f'Found {len(filelist)} files in {data_root}')
     os.makedirs(output_root, exist_ok=True)
 
+    # Collect input files (recursive, .npz only)
+    filelist = sorted(
+        os.path.join(root, fname)
+        for root, _, files in os.walk(data_root)
+        for fname in files
+        if fname.endswith('.npz')
+)
+
+    logger.info(f'Found {len(filelist)} files in {data_root}')
+    write_runlog(f'Found {len(filelist)} input files in {data_root}.')
+    
     # Parallel processing
-    with ProcessPoolExecutor(max_workers=njobs) as executor:
+    Executor = ProcessPoolExecutor
+    with Executor(max_workers=njobs) as executor:
         futures = [executor.submit(process_signal_file, fpath, output_root, use_gpu) for fpath in filelist]
         for fut in tqdm(as_completed(futures), total=len(futures), desc='Processing files'):
             try: 
                 result = fut.result()
-                logger.debug(f'Completed: {result}')
+                if result:
+                    logger.info(f'Done: {result}')
             except Exception as e:
                 logger.error(f'Error processing file: {e}')
+                write_runlog(f'Error: {e}')
 
-    elapsed = runtime() - start_time
-    logger.info(f'All files processed.in {elapsed:.2f} seconds')
-
+# CLI
+# =====================================================
 def parse_args():
     """
     Parse command-line arguments for the DAS ambient-noise CC pipeline.
