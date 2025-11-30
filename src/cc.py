@@ -15,7 +15,7 @@ import torch
 import numpy as np
 from torch import nn
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
@@ -122,9 +122,10 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     xcorr_seg               = 2.0                   # segment length in seconds for CC window
     npts_lag                = int(max_lag * fs_proc)               
     npts_seg                = int(xcorr_seg * fs_proc) 
+    cc_out_len              = 2 * npts_lag + 1  # length of lag window
 
     # Computational parameters
-    device          = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')   
+    device      = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')   
     logger.info(f'Using device: {device}')
 
     # Load data
@@ -143,19 +144,34 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     # Preprocess data (on CPU)
     # ========================================
     data_proc = preprocess(data_raw, fs_raw, f1, f2, decimation, diff, ram_win)
-
-    # Prepare for cross-correlation
-    # ========================================
     npts_proc = data_proc.shape[1]
-    npts_new = (npts_proc // npts_seg) * npts_seg
-    if npts_new < npts_seg:
-        logger.warning(f'File {file_path} too short after segmentation: npts_new = {npts_new}')
-        return None
-    
-    data_proc = data_proc[:, :npts_new]
-    nseg = npts_new // npts_seg
-    flag_mean = nseg
 
+    # Compute segmentation
+    npts_new = (npts_proc // npts_seg) * npts_seg
+    nseg = npts_new // npts_seg
+    leftover = npts_proc - npts_new
+
+    # Segmentation consistency check 
+    if leftover != 0:
+        logger.warning(
+            f'[WARN] Preprocessed length {npts_proc} not divisible by '
+            f'npts_seg={npts_seg}. Trimming {leftover} samples.')
+
+    if npts_new <= 0 or nseg == 0:
+        logger.warning(
+            f'[WARN] After preprocessing/segmentation, npts_new={npts_new}, '
+            f'nseg={nseg}. Skipping file {file_path} (too short).')
+        return None
+        
+    if npts_new != nseg * npts_seg:
+        raise RuntimeError(
+            f'[ERROR] Segmentation mismatch: npts_new={npts_new}, '
+            f'nseg={nseg}, npts_seg={npts_seg}')
+    
+    # Trim to exact multiple of npts_seg
+    data_proc = data_proc[:, :npts_new]
+    flag_mean = nseg
+    
     # Decide batch size automatically
     npair_chunk = auto_np_pair_chunk(
         nch=nch, 
@@ -200,9 +216,17 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
             logger.warning(f'torch.compile() not available or failed: {e}')
     
     model.eval()
+    
+    # Convert data to tensor: CPU → pinned → GPU
+    # ========================================
+    data_tensor = convert_to_tensor(data_proc, device='cpu')    # always CPU first
 
-    # Move data to Tensor
-    data_tensor = convert_to_tensor(data_proc, device=device)
+    # Optional pinned memory (benefits GPU cloud execution)
+    if device.type == 'cuda':
+        data_tensor = data_tensor.pin_memory()
+    
+    # Move to final device
+    data_tensor = data_tensor.to(device, non_blocking=True)
     logger.debug(f'Data tensor shape: {data_tensor.shape}, device: {data_tensor.device}')
 
     # Resume state file
@@ -217,7 +241,7 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
 
         # Output path
         out_path = os.path.join(output_cc, basename.replace('.npz', f'_cc_{src_idx:03d}.npy'))
-        expected_shape = (nch, 2 * npts_lag + 1)
+        expected_shape = (nch, cc_out_len)
 
         # Auto-resume check
         if check_existing_output(out_path, expected_shape):
@@ -237,38 +261,52 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
         pair_ch2 = np.arange(nch, dtype=int)
         npair   = len(pair_ch1)
 
-        # GPU-safety chunking
+        # Chunking to avoid memory overflow 
         nchunk  = int(np.ceil(npair / npair_chunk))
         write_runlog(f'VS {src_idx}: npair={npair}, npair_chunk={npair_chunk}, nchunk={nchunk}')
 
         # Prepare output array 
-        ccall = np.zeros((npair, 2 * npts_lag + 1), dtype=np.float32)
+        ccall = np.zeros((npair, cc_out_len), dtype=np.float32)
 
         # Chunked correlation loop (GPU batching)
         chunk_bar = tqdm(range(nchunk), desc=f'VS {src_idx} batches', leave=False)
         
         for ichunk in chunk_bar:
-            chunk_bar.set_postfix_str(f'{ichunk+1}/{nchunk}')
+            if ichunk % 10 == 0 or ichunk == nchunk - 1:
+                chunk_bar.set_postfix_str(f'{ichunk+1}/{nchunk}')
 
             start_idx   = npair_chunk * ichunk
             end_idx     = min(start_idx + npair_chunk, npair)
+            batch_len = end_idx - start_idx
 
             ich1 = pair_ch1[start_idx:end_idx]
             ich2 = pair_ch2[start_idx:end_idx]
 
-            # Reshape into (batch, npts_seg)
-            data1 = data_tensor[ich1, :].reshape(-1, npts_seg)
-            data2 = data_tensor[ich2, :].reshape(-1, npts_seg)
+            # Full-length traces for this batch: (batch_len, npts_new)
+            full1 = data_tensor[ich1, :]
+            full2 = data_tensor[ich2, :]
 
+            # Reshape into segments: (batch_len * nseg, npts_seg)
+            if device.type == 'cuda':
+                # GPU → use preallocated buffers + copy_
+                data1 = full1.reshape(batch_len * nseg, npts_seg).contiguous()
+                data2 = full2.reshape(batch_len * nseg, npts_seg).contiguous()
+            else:
+                # CPU → zero-copy views (no .copy_ – faster)
+                data1 = full1.reshape(batch_len * nseg, npts_seg)
+                data2 = full2.reshape(batch_len * nseg, npts_seg)
+
+            # Run CC model
             cc_chunk = model(data1, data2)
             cc_np    = cc_chunk.detach().cpu().numpy()
 
             # Sum over segments
-            cc_sum   = np.sum(cc_np.reshape(len(ich1), nseg, -1), axis=1)
+            # cc_np shape: (batch_len * nseg, full_corr_len)
+            cc_sum = cc_np.reshape(batch_len, nseg, -1).sum(axis=1)
 
             # Extract lag window centered
             lag_start = npts_seg - npts_lag - 1
-            lag_end = lag_start + (2 * npts_lag + 1)
+            lag_end = lag_start + cc_out_len
 
             ccall[start_idx:end_idx, :] += cc_sum[:, lag_start:lag_end]
 
@@ -278,7 +316,7 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
                     f"Batch {ichunk+1}/{nchunk} | {gpu_memory('GPU:')} | {cpu_memory('CPU:')}"
                 )
 
-            if device.type == 'cuda':
+            if device.type == 'cuda' and ichunk % 3 == 0:
                 torch.cuda.empty_cache()
 
         # Normalize by number of segments
