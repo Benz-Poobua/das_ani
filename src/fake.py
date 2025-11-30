@@ -1,121 +1,147 @@
 """
 :module: src/fake.py
-:auth: Benz Poobua 
+:auth: Benz Poobua
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: This script generates synthetic DAS data (low‐rank + noise) for testing. It also serves as a prototype.
+:purpose: Generate synthetic DAS data using low‐rank rSVD only (no noise),
+          saving .npz files compatible with the real DAS processing pipeline.
 """
 import os
 import glob
-import torch
 import logging
+import torch
 import numpy as np
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Choose device
+# Device selection
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 logger.info(f'Using device: {device}')
 
-# Input DAS files 
+# Input DAS directory (real data)
 input_dir = os.path.join('..', 'data', 'preprocessed', '20210901')
 das_paths = sorted(glob.glob(os.path.join(input_dir, '*.npz')))
 
+if not das_paths:
+    logger.warning(f'No .npz files found in {input_dir}')
 
-# Output base folder (data subfoler will be created)
+# Output directory base for synthetic data
 script_dir = os.path.dirname(os.path.abspath(__file__))
-outpath_base = os.path.normpath(os.path.join(script_dir, '..', 'data', 'synthetic'))
-os.makedirs(outpath_base, exist_ok=True)
+out_base = os.path.normpath(os.path.join(script_dir, '..', 'data', 'synthetic'))
+os.makedirs(out_base, exist_ok=True)
 
-# Choose rank
-k_svd = 50
+# Parameters
+k_svd = 50             # target rank for low-rank reconstruction
+seed = 1234            # reproducibility
+np.random.seed(seed)
+torch.manual_seed(seed)
 
+# Randomized SVD
 def rsvd_torch(A: torch.Tensor, k: int, n_oversample: int = 10, n_power_iter: int = 2):
     """
-    Randomized SVD in PyTorch (GPU‐accelerated if available).
+    Randomized SVD in PyTorch (GPU if available).
     Returns U (m×k), S (k,), Vh (k×n) such that A ≈ U diag(S) Vh.
+
+    :param A: Input matrix (m×n)
+    :type A: torch.Tensor
+    :param k: Target rank
+    :type k: int
+    :param n_oversample: Oversampling parameter
+    :type n_oversample: int
+    :param n_power_iter: Number of power iterations to improve accuracy
+    :type n_power_iter: int
     """
     m, n = A.shape
     dtype = A.dtype
-    device = A.device
+    dev = A.device
 
     # Step 1: random test matrix
-    P = torch.randn(n, k + n_oversample, device=device, dtype=dtype)
+    P = torch.randn(n, k + n_oversample, device=dev, dtype=dtype)
 
-    # Step 2: sample columns
+    # Step 2: sample the column space
     Z = A @ P
 
-    # Step 3: power iterations (improve accuracy)
+    # Step 3: power iterations
     for _ in range(n_power_iter):
         Z = A @ (A.T @ Z)
 
-    # Step 4: orthonormal basis Q
+    # Step 4: orthonormal basis
     Q, _ = torch.linalg.qr(Z, mode='reduced')
 
-    # Step 5: project into smaller space
-    B = Q.T @ A  # shape (k + n_oversample) × n
+    # Step 5: small matrix
+    B = Q.T @ A   # (k + r) × n
 
-    # Step 6: full SVD on smaller matrix
+    # Step 6: SVD on small matrix
     Ub, S, Vh = torch.linalg.svd(B, full_matrices=False)
 
-    # Step 7: lift U back
+    # Step 7: lift back to original space
     U = Q @ Ub
 
-    # Step 8: truncate to k
+    # Step 8: truncate to rank k
     return U[:, :k], S[:k], Vh[:k, :]
 
+# Main synthetic generation loop
 for path in das_paths:
-    try: 
+    # Load real DAS file
+    try:
         data = np.load(path)
     except Exception as e:
-        logger.error(f'Failed loading {path}: {e}')
+        logger.error(f'Could not load {path}: {e}')
         continue
 
     if 'data' not in data:
-        logger.error(f"No key 'data' in {path}")
+        logger.error(f"Missing key 'data' in {path}, skipping.")
         continue
 
-    das_array = data['data']
-    dt = data.get('dt', None)
-    if dt is None:
-        logger.warning(f'No dt in {path}; assume default dt=0.004s')
-        dt = 0.004
+    A_np = data['data'].astype(np.float32)
+    dt = float(data.get("dt", 0.004))
 
-    # Select first 60 seconds of data
-    samples_test = int(60.0 / dt)
-    if das_array.shape[1] < samples_test:
-        samples_test = das_array.shape[1]
-
-    A_np = das_array[:, :samples_test].astype(np.float32)
     m, n = A_np.shape
-    logger.info(f'Loaded {path} → shape {A_np.shape}')
+    logger.info(f'Loaded {path} → shape {A_np.shape}, dt={dt}')
 
-    # Convert to torch tensor
+    # Use FULL record
+    # A_np is already (nch × npts_full)
+
+    # Convert to torch
     A = torch.from_numpy(A_np).to(device)
 
-    # Compute low-rank approx via rSVD
-    Ur, Sr, Vhr = rsvd_torch(A, k_svd)
-    logger.info(f'rSVD shapes: U={Ur.shape}, S={Sr.shape}, Vh={Vhr.shape}')
+    # If k_svd > min(m, n), cap it to the valid range
+    k_eff = min(k_svd, m, n)
+    if k_eff < k_svd:
+        logger.warning(
+            f'k_svd={k_svd} is larger than min(m, n)={min(m, n)} for {path}. '
+            f'Using k={k_eff} instead.'
+        )
 
-    # Reconstruct synthetic
-    A_rec = Ur @ torch.diag(Sr) @ Vhr
+    U, S, Vh = rsvd_torch(A, k=k_eff)
+    A_lr = U @ torch.diag(S) @ Vh
+    A_synth = A_lr.cpu().numpy().astype(np.float32)
 
-    # Add Gaussian noise
-    noise_level = 0.05   # 5% noise relative to standard deviation
-    A_rec_cpu = A_rec.cpu().numpy()
-    noise = noise_level * np.std(A_rec_cpu) * np.random.randn(*A_rec_cpu.shape).astype(np.float32)
-    A_synth = A_rec_cpu + noise 
-
-    # Save synthetic array
+    # Output directory per day
     basename = os.path.basename(path)
-    data_str = basename.split('_')[0]       # e.g., '20210901
-    output_subdir = os.path.join(outpath_base, data_str)
-    os.makedirs(output_subdir, exist_ok=True)
-    out_name = basename.replace('.npz', '_fake.npy')
-    out_path = os.path.join(output_subdir, out_name)
-    np.save(out_path, A_synth)
-    logger.info(f'Saved synthetic DAS to {out_path}')
+    datestamp = basename.split('_')[0]     # e.g., '20210901'
+    out_dir = os.path.join(out_base, datestamp)
+    os.makedirs(out_dir, exist_ok=True)
 
-logger.info('All done')
+    out_name = basename.replace('.npz', '_fake.npz')
+    out_path = os.path.join(out_dir, out_name)
+
+    # Save in .npz format expected by cc.py
+    # - 'data': synthetic DAS array (nch × npts_full)
+    # - 'dt'  : sampling interval
+    np.savez_compressed(
+        out_path,
+        data=A_synth,
+        dt=dt,
+        start_time='synthetic_lowrank_full',
+        comment=f'Pure low-rank synthetic (rank={k_eff})'
+    )
+
+    logger.info(f'Saved synthetic DAS → {out_path} (shape={A_synth.shape})')
+
+logger.info('All synthetic DAS generation completed (no noise, full record).')
