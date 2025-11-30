@@ -8,6 +8,7 @@
           Cross-correlation workflow for NCF generation.
 """
 import os
+import json
 import argparse
 import logging
 import torch
@@ -34,6 +35,41 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# AUTO-RESUME HELPERS
+# =====================================================
+def check_existing_output(out_path, expected_shape):
+    """Return True if output file exists, and shape is correct."""
+    if not os.path.exists(out_path):
+        return False
+    
+    try: 
+        arr = np.load(out_path)
+        if arr.shape == expected_shape:
+            return True
+        else:
+            logger.warning(f'Corrupt output detected at {out_path}, recomputing...')
+            return False
+    except Exception:
+        logger.warning(f'Failed to load {out_path}, recomputing...')
+        return False
+
+def load_resume_state(meta_path):
+    """Load .json resume state for completed VSs."""
+    if not os.path.exists(meta_path):
+        return set()
+    try: 
+        with open(meta_path, 'r') as f:
+            state = json.load(f)
+        return {int(x) for x in state.get('completed_src', [])}
+    except:
+        return set()
+    
+def save_resume_state(meta_path, completed_set):
+    """Save updated resume state."""
+    safe_list = [int(x) for x in completed_set]
+    with open(meta_path, 'w') as f:
+        json.dump({'completed_src': sorted(safe_list)}, f, indent=2)
 
 # PROCESS ONE NPZ → MULTI NCF (virtual-source CC)
 # =====================================================
@@ -125,7 +161,7 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
         nch=nch, 
         npts_seg=npts_seg, 
         device=device, 
-        frac_mem=0.25,  
+        frac_mem=0.25,  # recommend for 8GB RAM CPU
         min_chunk=64, 
         max_chunk=4096
     ) 
@@ -169,31 +205,51 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     data_tensor = convert_to_tensor(data_proc, device=device)
     logger.debug(f'Data tensor shape: {data_tensor.shape}, device: {data_tensor.device}')
 
+    # Resume state file
+    meta_path = os.path.join(output_cc, basename.replace('.npz', '_cc_state.json'))
+    completed_src = load_resume_state(meta_path)
+
     # Loop over virtual sources
     # ========================================
-    last_output = None
+    vs_bar = tqdm(src_ch_all, desc=f'VS {basename}', leave=True)
 
-    for i, src_idx in enumerate(src_ch_all):
-        logger.info(
-        f'[VS {i+1}/{len(src_ch_all)}] '
-        f'Processing virtual source channel index {src_idx} '
-        f'(channel number {first_chan + src_idx})'
-        )
+    for src_idx in vs_bar:
+
+        # Output path
+        out_path = os.path.join(output_cc, basename.replace('.npz', f'_cc_{src_idx:03d}.npy'))
+        expected_shape = (nch, 2 * npts_lag + 1)
+
+        # Auto-resume check
+        if check_existing_output(out_path, expected_shape):
+            vs_bar.set_postfix_str(f'skip VS={src_idx}')
+            continue
+
+        if src_idx in completed_src:
+            vs_bar.set_postfix_str(f'resume-skip VS={src_idx}')
+            continue
+
+        vs_bar.set_postfix_str(f'proc VS={src_idx}')
+        logger.info(f'[VS] Processing src_idx={src_idx} (abs ch={first_chan+src_idx})')
         write_runlog(f'Start VS {src_idx}: {gpu_memory()} | {cpu_memory()}')
 
+        # Prepare receiver pairs
         pair_ch1 = np.full(nch, src_idx, dtype=int)
         pair_ch2 = np.arange(nch, dtype=int)
         npair   = len(pair_ch1)
 
         # GPU-safety chunking
         nchunk  = int(np.ceil(npair / npair_chunk))
-        write_runlog(f"VS {src_idx}: npair={npair}, npair_chunk={npair_chunk}, nchunk={nchunk}")
+        write_runlog(f'VS {src_idx}: npair={npair}, npair_chunk={npair_chunk}, nchunk={nchunk}')
 
         # Prepare output array 
         ccall = np.zeros((npair, 2 * npts_lag + 1), dtype=np.float32)
 
         # Chunked correlation loop (GPU batching)
-        for ichunk in range(nchunk):
+        chunk_bar = tqdm(range(nchunk), desc=f'VS {src_idx} batches', leave=False)
+        
+        for ichunk in chunk_bar:
+            chunk_bar.set_postfix_str(f'{ichunk+1}/{nchunk}')
+
             start_idx   = npair_chunk * ichunk
             end_idx     = min(start_idx + npair_chunk, npair)
 
@@ -228,18 +284,16 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
         # Normalize by number of segments
         ccall /= flag_mean
 
-        out_path = os.path.join(
-            output_cc, 
-            basename.replace('.npz', f'_cc_{src_idx:03d}.npy')
-        )
+        # Save
         np.save(out_path, ccall)
         logger.info(f'Saving output to {out_path}')
-
         write_runlog(f'Completed VS {src_idx}, saved → {out_path}')
 
-        last_output = out_path
+        # Update resume state
+        completed_src.add(src_idx)
+        save_resume_state(meta_path, completed_src)
 
-    return last_output
+    return out_path
 
 # MAIN MULTI-FILE EXECUTION
 # =====================================================
