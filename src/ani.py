@@ -7,13 +7,16 @@
 :purpose: DAS preprocessing (Bensen et al., 2007) + GPU-accelerated cross-correlation.
 :reference: Modified from Yan Yang (2022-07-10).
 """
+import re
+import os
 import torch
 import logging
 import numpy as np
 from torch import nn
 import scipy.signal as signal
+from tqdm import tqdm
 from scipy.signal import butter, filtfilt, convolve, detrend
-from src.utils import convert_to_numpy, convert_to_tensor, nextpow2, timeit
+from src.utils import convert_to_numpy, convert_to_tensor, nextpow2, write_runlog, check_existing_output 
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +262,6 @@ def spectral_whitening(rfftdata, df, window_freq, f1, f2):
 
     return rfftdata
 
-@timeit
 def preprocess(x, fs_raw, f1, f2, decimation, diff, ram_win):
     """
     Preprocess a single DAS data chunk following the ambient noise workflow:
@@ -567,3 +569,228 @@ def cross_correlation_full(data, ich1, ich2,
         f'(Nsel={n_sel}, Ntotal={n_total}, CClen={x_corr_len})'
     )
     return cc_out
+
+def daily_stack_ncf(output_root, daily_root='./data/ncf/stacks/daily'):
+    """
+    Compute daily stacked NCFs from per-file NCFs.
+
+    Input filenames (in output_root) are assumed to be like:
+        20210901_001000_cc_000.npy
+        20210901_011000_cc_000.npy
+        ...
+    Daily stacked outputs (in daily_root) will be:
+        20210901_cc_000.npy
+        20210901_cc_010.npy
+        ...
+
+    Stacking is done as a simple arithmetic mean over all time slices
+    available for that (date, virtual source) pair.
+    """
+    output_root = os.path.expanduser(output_root)
+    daily_root = os.path.expanduser(daily_root)
+    os.makedirs(daily_root, exist_ok=True)
+
+    # Find all NCF result files
+    groups = {} # (day_str, src_str) -> list of filepaths
+    for root, _, files in os.walk(output_root):
+        for fname in files:
+            if not fname.endswith('.npy'):
+                continue
+            if '_cc_' not in fname:
+                continue
+
+            stem = fname[:-4]   # remove .npy
+            # Example: 20210901_001000_cc_000
+            # day:  20210901
+            # src:  000
+            parts = stem.split('_cc_')
+            if len(parts) != 2:
+                continue
+
+            left, src_str = parts
+            day_str = left.split('_')[0]    # 20210901
+
+            key = (day_str, src_str)
+            fpath = os.path.join(root, fname)
+            groups.setdefault(key, []).append(fpath)
+
+    if not groups:
+        logger.info(f'No NCF files found in {output_root} for daily stacking.')
+        return
+    
+    logger.info(f'Found {len(groups)} (day, VS) groups for daily stacking.')
+    write_runlog(f'Daily stacking: {len(groups)} groups from root={output_root} → {daily_root}')
+
+    # Loop over groups and stack
+    for (day_str, src_str), flist in tqdm(groups.items(), desc='Daily stacking', leave=True):
+        # Decide output name: e.g., 20210901_cc_000.npy
+        out_name = f'{day_str}_cc_{src_str}.npy'
+        out_path = os.path.join(daily_root, out_name)
+
+        # Peek at first file to get shape
+        try: 
+            ref = np.load(flist[0])
+        except Exception as e:
+            logger.error(f'Failed to load reference file {flist[0]}: {e}')
+            continue
+
+        expected_shape = ref.shape
+
+        # Auto-resume for daily stacks: skip if already done and shape matches
+        if check_existing_output(out_path, expected_shape):
+            logger.info(f'[Daily] Skip existing: {out_path}')
+            continue
+
+        acc = np.zeros_like(ref, dtype=np.float64)
+        count = 0
+
+        for fpath in flist:
+            try:
+                arr = np.load(fpath)
+            except Exception as e:
+                logger.warning(f'Failed to load {fpath}, skipping. Error: {e}')
+                continue
+
+            if arr.shape != expected_shape:
+                logger.warning(f'Shape mismatch in {fpath}: {arr.shape} != {expected_shape}, skipping.')
+                continue
+
+            acc += arr.astype(np.float64)
+            count += 1
+        
+        if count == 0:
+            logger.warning(f'No valid NCF arrays to stack for ({day_str}, {src_str}). Skipping.')
+            continue
+
+        stacked = (acc / count).astype(np.float32)
+        np.save(out_path, stacked)
+        logger.info(f'[Daily] Saved stacked NCF → {out_path} (n_files={count}, shape={stacked.shape})')
+        write_runlog(f'[Daily] {day_str}, VS={src_str}: n_files={count}, saved={out_path}')
+
+def stack_ncf_window(daily_root, out_root, window_days=7):
+    """
+    Sliding-window stacking of daily NCFs.
+
+    Example directory layout:
+        daily_root = './data/ncf/stacks/daily'
+        out_root   = './data/ncf/stacks/7d'
+
+    Output filename format:
+        YYYYMMDDstart-YYYYMMDDend_cc_000.npy
+
+    :param daily_root: Directory containing daily NCFs (from daily_stack_ncf).
+    :type daily_root: str
+    :param out_root: Directory to save sliding-window stacks.
+    :type out_root: str
+    :param window_days: Number of days in window (7, 15, 30, ...)
+    :type window_days: int
+    """
+    daily_root = os.path.expanduser(daily_root)
+    out_root = os.path.expanduser(out_root)
+    os.makedirs(out_root, exist_ok=True)
+
+    logger.info(f'Sliding-window stacking: window={window_days} days')
+    write_runlog(f'Sliding-window stacking: {window_days} days → {out_root}')
+
+    # Parse available daily files
+    pattern = re.compile(r'(\d{8})_cc_(\d{3})\.npy$')
+    daily_files = []
+
+    for fname in os.listdir(daily_root):
+        m = pattern.match(fname)
+        if m:
+            day = m.group(1)
+            src = m.group(2)
+            daily_files.append((day, src, fname))
+    
+    if not daily_files:
+        logger.warning(f'No daily NCF files found in: {daily_root}')
+        return
+    
+    # Extract unique days and VS IDs
+    all_days = sorted({d for d, _, _ in daily_files})
+    all_srcs = sorted({s for _, s, _ in daily_files})
+
+    logger.info(f'Found {len(all_days)} days, {len(all_srcs)} virtual sources.')
+    write_runlog(
+        f'stack_ncf_window | days={len(all_days)} | '
+        f'src_count={len(all_srcs)} | window_days={window_days}')
+    
+    # Slide window over available days
+    for w_start in tqdm(range(0, len(all_days) - window_days + 1),
+                        desc=f'{window_days}d-window'):
+
+        days_window = all_days[w_start : w_start + window_days]
+        day_start = days_window[0]
+        day_end   = days_window[-1]
+
+        # For each virtual source
+        for src_str in all_srcs:
+
+            # Expected output path
+            out_name = f'{day_start}-{day_end}_cc_{src_str}.npy'
+            out_path = os.path.join(out_root, out_name)
+
+            # Collect files in this window
+            file_list = [
+                os.path.join(daily_root, f'{day}_cc_{src_str}.npy')
+                for day in days_window
+                if os.path.exists(os.path.join(daily_root, f'{day}_cc_{src_str}.npy'))]
+
+            if len(file_list) == 0:
+                logger.warning(
+                    f'No files found for VS {src_str} in window {day_start}–{day_end}')
+                continue
+
+            # Peek for shape
+            try:
+                ref = np.load(file_list[0])
+            except Exception as e:
+                logger.error(f'Failed loading {file_list[0]}: {e}')
+                continue
+
+            expected_shape = ref.shape
+
+            # Auto-skip existing valid file
+            if os.path.exists(out_path):
+                try:
+                    arr = np.load(out_path)
+                    if arr.shape == expected_shape:
+                        logger.info(f'[Skip] Exists: {out_path}')
+                        continue
+                except Exception:
+                    pass  # re-generate corrupted output
+
+            # Accumulate stack
+            acc = np.zeros_like(ref, dtype=np.float64)
+            count = 0
+
+            for fpath in file_list:
+                try:
+                    arr = np.load(fpath)
+                    if arr.shape != expected_shape:
+                        logger.warning(
+                            f'Shape mismatch in {fpath}: {arr.shape} != {expected_shape}')
+                        continue
+
+                    acc += arr.astype(np.float64)
+                    count += 1
+
+                except Exception as e:
+                    logger.warning(f'Skipping {fpath}, read error: {e}')
+
+            if count == 0:
+                logger.warning(
+                    f'Window {day_start}–{day_end}, VS {src_str}: no valid files.')
+                continue
+
+            # Save stacked
+            stacked = (acc / count).astype(np.float32)
+            np.save(out_path, stacked)
+
+            logger.info(
+                f'[Stack {window_days}d] {day_start}-{day_end}, '
+                f'VS={src_str}, n_files={count}, saved: {out_path}')
+            write_runlog(
+                f'stack {window_days}d | {day_start}-{day_end} | '
+                f'VS={src_str} | n={count} | saved={out_path}')

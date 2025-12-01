@@ -8,7 +8,6 @@
           Cross-correlation workflow for NCF generation.
 """
 import os
-import json
 import argparse
 import logging
 import torch
@@ -20,156 +19,24 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 
-from src.utils import (load_data, 
+from utils import (load_data, 
                    convert_to_tensor, 
                    timeit,
                    write_runlog, 
                    gpu_memory, 
                    cpu_memory, 
-                   auto_np_pair_chunk)
+                   auto_np_pair_chunk, 
+                   check_existing_output, 
+                   load_resume_state, 
+                   save_resume_state)
 
-from ani import preprocess, TorchCrossCorrelation
+from ani import preprocess, TorchCrossCorrelation, daily_stack_ncf, stack_ncf_window
 
 logging.basicConfig(
     level=logging.INFO, 
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# AUTO-RESUME HELPERS
-# =====================================================
-def check_existing_output(out_path, expected_shape):
-    """Return True if output file exists, and shape is correct."""
-    if not os.path.exists(out_path):
-        return False
-    
-    try: 
-        arr = np.load(out_path)
-        if arr.shape == expected_shape:
-            return True
-        else:
-            logger.warning(f'Corrupt output detected at {out_path}, recomputing...')
-            return False
-    except Exception:
-        logger.warning(f'Failed to load {out_path}, recomputing...')
-        return False
-
-def load_resume_state(meta_path):
-    """Load .json resume state for completed VSs."""
-    if not os.path.exists(meta_path):
-        return set()
-    try: 
-        with open(meta_path, 'r') as f:
-            state = json.load(f)
-        return {int(x) for x in state.get('completed_src', [])}
-    except:
-        return set()
-    
-def save_resume_state(meta_path, completed_set):
-    """Save updated resume state."""
-    safe_list = [int(x) for x in completed_set]
-    with open(meta_path, 'w') as f:
-        json.dump({'completed_src': sorted(safe_list)}, f, indent=2)
-
-# DAILY STACKING
-# =====================================================
-@timeit 
-def daily_stack_ncf(output_root, daily_root='./data/ncf_daily'):
-    """
-    Compute daily stacked NCFs from per-file NCFs.
-
-    Input filenames (in output_root) are assumed to be like:
-        20210901_001000_cc_000.npy
-        20210901_011000_cc_000.npy
-        ...
-    Daily stacked outputs (in daily_root) will be:
-        20210901_cc_000.npy
-        20210901_cc_010.npy
-        ...
-
-    Stacking is done as a simple arithmetic mean over all time slices
-    available for that (date, virtual source) pair.
-    """
-    output_root = os.path.expanduser(output_root)
-    daily_root = os.path.expanduser(daily_root)
-    os.makedirs(daily_root, exist_ok=True)
-
-    # Find all NCF result files
-    groups = {} # (day_str, src_str) -> list of filepaths
-    for root, _, files in os.walk(output_root):
-        for fname in files:
-            if not fname.endswith('.npy'):
-                continue
-            if '_cc_' not in fname:
-                continue
-
-            stem = fname[:-4]   # remove .npy
-            # Example: 20210901_001000_cc_000
-            # day:  20210901
-            # src:  000
-            parts = stem.split('_cc_')
-            if len(parts) != 2:
-                continue
-
-            left, src_str = parts
-            day_str = left.split('_')[0]    # 20210901
-
-            key = (day_str, src_str)
-            fpath = os.path.join(root, fname)
-            groups.setdefault(key, []).append(fpath)
-
-    if not groups:
-        logger.info(f'No NCF files found in {output_root} for daily stacking.')
-        return
-    
-    logger.info(f'Found {len(groups)} (day, VS) groups for daily stacking.')
-    write_runlog(f'Daily stacking: {len(groups)} groups from root={output_root} → {daily_root}')
-
-    # Loop over groups and stack
-    for (day_str, src_str), flist in tqdm(groups.items(), desc='Daily stacking', leave=True):
-        # Decide output name: e.g., 20210901_cc_000.npy
-        out_name = f'{day_str}_cc_{src_str}.npy'
-        out_path = os.path.join(daily_root, out_name)
-
-        # Peek at first file to get shape
-        try: 
-            ref = np.load(flist[0])
-        except Exception as e:
-            logger.error(f'Failed to load reference file {flist[0]}: {e}')
-            continue
-
-        expected_shape = ref.shape
-
-        # Auto-resume for daily stacks: skip if already done and shape matches
-        if check_existing_output(out_path, expected_shape):
-            logger.info(f'[Daily] Skip existing: {out_path}')
-            continue
-
-        acc = np.zeros_like(ref, dtype=np.float64)
-        count = 0
-
-        for fpath in flist:
-            try:
-                arr = np.load(fpath)
-            except Exception as e:
-                logger.warning(f'Failed to load {fpath}, skipping. Error: {e}')
-                continue
-
-            if arr.shape != expected_shape:
-                logger.warning(f'Shape mismatch in {fpath}: {arr.shape} != {expected_shape}, skipping.')
-                continue
-
-            acc += arr.astype(np.float64)
-            count += 1
-        
-        if count == 0:
-            logger.warning(f'No valid NCF arrays to stack for ({day_str}, {src_str}). Skipping.')
-            continue
-
-        stacked = (acc / count).astype(np.float32)
-        np.save(out_path, stacked)
-        logger.info(f'[Daily] Saved stacked NCF → {out_path} (n_files={count}, shape={stacked.shape})')
-        write_runlog(f'[Daily] {day_str}, VS={src_str}: n_files={count}, saved={out_path}')
 
 # PROCESS ONE NPZ → MULTI NCF (virtual-source CC)
 # =====================================================
@@ -436,9 +303,25 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
 # MAIN MULTI-FILE EXECUTION
 # =====================================================
 @timeit
-def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=8, use_gpu=False, daily_stack=False, daily_root='./data/ncf_daily'):
+def main(
+    data_root='./data/preprocessed', 
+    output_root='./data/ncf', 
+    njobs=4, 
+    use_gpu=False, 
+    daily_stack=False, 
+    daily_root='./data/ncf/stacks/daily', 
+    stack_7d = False, 
+    stack_15d = False, 
+    stack_30d = False, 
+    stack_all = False):
     """
     Run ANI workflow across all .npz files in data_root.
+
+    Steps:
+      1. Cross-correlate each preprocessed file → per-file NCFs in output_root
+      2. Always compute daily-stacked NCFs → daily_root (e.g., ncf/stacks/daily)
+      3. Optionally compute sliding-window stacks (7d / 15d / 30d)
+         using daily stacks as input.
 
     :param data_root: Directory containing preprocessed DAS files (.npz).
     :type data_root: str
@@ -452,6 +335,14 @@ def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=8, use
     :type daily_stack: bool
     :param daily_root: Output directory for daily stacked NCF files.
     :type daily_root: str
+    :param stack_7d: If True, compute 7-day sliding-window stacks.
+    :type stack_7d: bool
+    :param stack_15d: If True, compute 15-day sliding-window stacks.
+    :type stack_15d: bool
+    :param stack_30d: If True, compute 30-day sliding-window stacks.
+    :type stack_15d: bool
+    :param stack_all: If True, compute all 7d/15d/30d stacks.
+    :type stack_all: bool
 
     :return: None
     """
@@ -487,11 +378,53 @@ def main(data_root='./data/preprocessed', output_root='./data/ncf', njobs=8, use
                 logger.error(f'Error processing file: {e}')
                 write_runlog(f'Error: {e}')
     
-    # Optional daily stacking
-    if daily_stack:
-        logger.info('\n--- Starting daily NCF stacking ---\n')
-        write_runlog('Starting daily NCF stacking.')
-        daily_stack_ncf(output_root=output_root, daily_root=daily_root)
+    # 1. Always compute daily stacking from per-file NCFs
+    logger.info('\n--- Starting daily NCF stacking ---\n')
+    write_runlog('Starting daily NCF stacking.')
+    daily_stack_ncf(output_root=output_root, daily_root=daily_root)
+
+    # 2. Optional sliding-window stacks from DAILY NCFs
+    #   - 7d / 15d / 30d
+    #   - filenames like: YYYYMMDD_7d_cc_000.npy, etc.
+
+    # Base 'stacks' root; if daily_root = ./data/ncf/stacks/daily,
+    # then stacks_root = ./data/ncf/stacks
+
+    stacks_root = os.path.dirname(daily_root)
+    os.makedirs(stacks_root, exist_ok=True)
+
+    do_7d = stack_all or stack_7d
+    do_15d = stack_all or stack_15d
+    do_30d = stack_all or stack_30d
+
+    if do_7d:
+        out_7d_root = os.path.join(stacks_root, '7d')
+        logger.info('\n--- Starting 7-day NCF stacking (sliding window) ---\n')
+        write_runlog('Starting 7-day stacking.')
+        stack_ncf_window(
+            daily_root=daily_root, 
+            out_root=out_7d_root, 
+            window_days=7)
+        
+    if do_15d:
+        out_15d_root = os.path.join(stacks_root, '15d')
+        logger.info('\n--- Starting 15-day NCF stacking (sliding window) ---\n')
+        write_runlog('Starting 15-day stacking.')
+        stack_ncf_window(
+            daily_root=daily_root, 
+            out_root=out_15d_root, 
+            window_days=15)
+        
+    if do_30d:
+        out_30d_root = os.path.join(stacks_root, '30d')
+        logger.info('\n--- Starting 30-day NCF stacking (sliding window) ---\n')
+        write_runlog('Starting 30-day stacking.')
+        stack_ncf_window(
+            daily_root=daily_root, 
+            out_root=out_30d_root, 
+            window_days=30)
+    
+    logger.info('\n--- ANI CC + stacking workflow completed. ---\n')
 
 # CLI
 # =====================================================
@@ -529,15 +462,30 @@ def parse_args():
         help='If set, attempt to use GPU for cross-correlation when available'
     )
     parser.add_argument(
-        '--daily_stack',
-        action='store_true',
-        help='If set, compute daily stacked NCFs after CC.'
-    )
-    parser.add_argument(
         '--daily_root',
         type=str,
-        default='./data/ncf_daily',
+        default='./data/ncf/stacks/daily',
         help='Output directory for daily stacked NCF files'
+    )
+    parser.add_argument(
+        '--stack_7d',
+        action='store_true',
+        help='If set, compute 7-day sliding-window NCF stacks from daily stacks.'
+    )
+    parser.add_argument(
+        '--stack_15d',
+        action='store_true',
+        help='If set, compute 15-day sliding-window NCF stacks from daily stacks.'
+    )
+    parser.add_argument(
+        '--stack_30d',
+        action='store_true',
+        help='If set, compute 30-day sliding-window NCF stacks from daily stacks.'
+    )
+    parser.add_argument(
+        '--stack_all',
+        action='store_true',
+        help='If set, compute 7d, 15d, and 30d sliding-window stacks.'
     )
     parser.add_argument(
         '--verbose',
@@ -562,10 +510,13 @@ if __name__ == '__main__':
         data_root   = args.data_root,
         output_root = args.output_root,
         njobs       = args.njobs,
-        use_gpu     = args.use_gpu,
-        daily_stack = args.daily_stack, 
-        daily_root  = args.daily_root
+        use_gpu     = args.use_gpu, 
+        daily_root  = args.daily_root, 
+        stack_7d    = args.stack_7d,
+        stack_15d   = args.stack_15d,
+        stack_30d   = args.stack_30d,
+        stack_all   = args.stack_all
     )
 
 # Example
-# python -m src.cc --data_root ./data/preprocessed --output_root ./data/ncf --njobs 4 --use_gpu --daily_stack --daily_root ./data/ncf_daily --verbose
+# python -m src.cc --data_root ./data/preprocessed --output_root ./data/ncf --njobs 4 --use_gpu --daily_root ./data/ncf/stacks/daily --stack_all --verbose

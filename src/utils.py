@@ -10,10 +10,12 @@ import os
 import sys
 import time
 import torch
+import json
 import psutil
 import logging
 import functools
 import numpy as np
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -333,12 +335,12 @@ def cpu_memory(prefix=""):
     rss = psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
     return f'{prefix}CPU RSS = {rss:.1f} MB'
 
+# 8. Auto batch-size selection
+# ==============================================================
 def auto_np_pair_chunk(nch, npts_seg, device, frac_mem=0.25, min_chunk=64, max_chunk=4096):
     """
     Heuristic to choose a safe GPU/CPU batch size for channel pairs.
     """
-    import psutil
-
     # Rough memory model
     bytes_per_pair = 64 * npts_seg
 
@@ -363,3 +365,38 @@ def auto_np_pair_chunk(nch, npts_seg, device, frac_mem=0.25, min_chunk=64, max_c
     npair_chunk = min(npair_chunk, nch)
 
     return int(max(npair_chunk, 1))
+
+# 9. Auto-resume helpers
+# ==============================================================
+def check_existing_output(out_path, expected_shape):
+    """Return True if output file exists, and shape is correct."""
+    if not os.path.exists(out_path):
+        return False
+    
+    try: 
+        arr = np.load(out_path)
+        if arr.shape == expected_shape:
+            return True
+        else:
+            logger.warning(f'Corrupt output detected at {out_path}, recomputing...')
+            return False
+    except Exception:
+        logger.warning(f'Failed to load {out_path}, recomputing...')
+        return False
+
+def load_resume_state(meta_path):
+    """Load .json resume state for completed VSs."""
+    if not os.path.exists(meta_path):
+        return set()
+    try: 
+        with open(meta_path, 'r') as f:
+            state = json.load(f)
+        return {int(x) for x in state.get('completed_src', [])}
+    except:
+        return set()
+    
+def save_resume_state(meta_path, completed_set):
+    """Save updated resume state."""
+    safe_list = [int(x) for x in completed_set]
+    with open(meta_path, 'w') as f:
+        json.dump({'completed_src': sorted(safe_list)}, f, indent=2)
