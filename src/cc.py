@@ -305,23 +305,11 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
 @timeit
 def main(
     data_root='./data/preprocessed', 
-    output_root='./data/ncf', 
+    output_root='./data/ncf_raw', 
     njobs=4, 
-    use_gpu=False, 
-    daily_stack=False, 
-    daily_root='./data/ncf/stacks/daily', 
-    stack_7d = False, 
-    stack_15d = False, 
-    stack_30d = False, 
-    stack_all = False):
+    use_gpu=False):
     """
     Run ANI workflow across all .npz files in data_root.
-
-    Steps:
-      1. Cross-correlate each preprocessed file → per-file NCFs in output_root
-      2. Always compute daily-stacked NCFs → daily_root (e.g., ncf/stacks/daily)
-      3. Optionally compute sliding-window stacks (7d / 15d / 30d)
-         using daily stacks as input.
 
     :param data_root: Directory containing preprocessed DAS files (.npz).
     :type data_root: str
@@ -331,18 +319,6 @@ def main(
     :type njobs: int
     :param use_gpu: Whether GPU is used for CC.
     :type use_gpu: bool
-    :param daily_stack: If True, compute daily-stacked NCFs into daily_root.
-    :type daily_stack: bool
-    :param daily_root: Output directory for daily stacked NCF files.
-    :type daily_root: str
-    :param stack_7d: If True, compute 7-day sliding-window stacks.
-    :type stack_7d: bool
-    :param stack_15d: If True, compute 15-day sliding-window stacks.
-    :type stack_15d: bool
-    :param stack_30d: If True, compute 30-day sliding-window stacks.
-    :type stack_15d: bool
-    :param stack_all: If True, compute all 7d/15d/30d stacks.
-    :type stack_all: bool
 
     :return: None
     """
@@ -378,54 +354,6 @@ def main(
                 logger.error(f'Error processing file: {e}')
                 write_runlog(f'Error: {e}')
     
-    # 1. Always compute daily stacking from per-file NCFs
-    logger.info('\n--- Starting daily NCF stacking ---\n')
-    write_runlog('Starting daily NCF stacking.')
-    daily_stack_ncf(output_root=output_root, daily_root=daily_root)
-
-    # 2. Optional sliding-window stacks from DAILY NCFs
-    #   - 7d / 15d / 30d
-    #   - filenames like: YYYYMMDD_7d_cc_000.npy, etc.
-
-    # Base 'stacks' root; if daily_root = ./data/ncf/stacks/daily,
-    # then stacks_root = ./data/ncf/stacks
-
-    stacks_root = os.path.dirname(daily_root)
-    os.makedirs(stacks_root, exist_ok=True)
-
-    do_7d = stack_all or stack_7d
-    do_15d = stack_all or stack_15d
-    do_30d = stack_all or stack_30d
-
-    if do_7d:
-        out_7d_root = os.path.join(stacks_root, '7d')
-        logger.info('\n--- Starting 7-day NCF stacking (sliding window) ---\n')
-        write_runlog('Starting 7-day stacking.')
-        stack_ncf_window(
-            daily_root=daily_root, 
-            out_root=out_7d_root, 
-            window_days=7)
-        
-    if do_15d:
-        out_15d_root = os.path.join(stacks_root, '15d')
-        logger.info('\n--- Starting 15-day NCF stacking (sliding window) ---\n')
-        write_runlog('Starting 15-day stacking.')
-        stack_ncf_window(
-            daily_root=daily_root, 
-            out_root=out_15d_root, 
-            window_days=15)
-        
-    if do_30d:
-        out_30d_root = os.path.join(stacks_root, '30d')
-        logger.info('\n--- Starting 30-day NCF stacking (sliding window) ---\n')
-        write_runlog('Starting 30-day stacking.')
-        stack_ncf_window(
-            daily_root=daily_root, 
-            out_root=out_30d_root, 
-            window_days=30)
-    
-    logger.info('\n--- ANI CC + stacking workflow completed. ---\n')
-
 # CLI
 # =====================================================
 def parse_args():
@@ -462,38 +390,11 @@ def parse_args():
         help='If set, attempt to use GPU for cross-correlation when available'
     )
     parser.add_argument(
-        '--daily_root',
-        type=str,
-        default='./data/ncf/stacks/daily',
-        help='Output directory for daily stacked NCF files'
-    )
-    parser.add_argument(
-        '--stack_7d',
-        action='store_true',
-        help='If set, compute 7-day sliding-window NCF stacks from daily stacks.'
-    )
-    parser.add_argument(
-        '--stack_15d',
-        action='store_true',
-        help='If set, compute 15-day sliding-window NCF stacks from daily stacks.'
-    )
-    parser.add_argument(
-        '--stack_30d',
-        action='store_true',
-        help='If set, compute 30-day sliding-window NCF stacks from daily stacks.'
-    )
-    parser.add_argument(
-        '--stack_all',
-        action='store_true',
-        help='If set, compute 7d, 15d, and 30d sliding-window stacks.'
-    )
-    parser.add_argument(
         '--verbose',
         action='store_true',
         help='Enable debug/verbose logging output'
     )
     return parser.parse_args()
-
 
 if __name__ == '__main__':
     import multiprocessing
@@ -510,13 +411,7 @@ if __name__ == '__main__':
         data_root   = args.data_root,
         output_root = args.output_root,
         njobs       = args.njobs,
-        use_gpu     = args.use_gpu, 
-        daily_root  = args.daily_root, 
-        stack_7d    = args.stack_7d,
-        stack_15d   = args.stack_15d,
-        stack_30d   = args.stack_30d,
-        stack_all   = args.stack_all
-    )
+        use_gpu     = args.use_gpu)
 
 # Example
-# python -m src.cc --data_root ./data/preprocessed --output_root ./data/ncf --njobs 4 --use_gpu --daily_root ./data/ncf/stacks/daily --stack_all --verbose
+# python -m src.cc --data_root ./data/preprocessed --output_root ./data/ncf_raw --njobs 4 --use_gpu --verbose
