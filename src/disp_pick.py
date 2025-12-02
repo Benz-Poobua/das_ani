@@ -16,8 +16,8 @@ from glob import glob
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from utils import convert_to_numpy, timeit
-from disp import compute_dispersion_from_ncf
+from src.utils import convert_to_numpy, timeit
+from src.disp import compute_dispersion_from_ncf
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -193,16 +193,17 @@ if __name__ == '__main__':
     )
 
 # Example
-# python -m src.disp_main \
-#     --ncf_root data/ncf_stacks/daily \
-#     --results_root results/dispersion \
+# python -m src.disp_pick \
+#     --ncf_root ./data/ncf_stacks/daily \
+#     --results_root ./results/dispersion \
 #     --stack_window daily \
 #     --dx 8.16 --fs 250 \
-#     --njobs 8 \
-#     --vmin 200 --vmax 4000 --dv 10 \
-#     --fmin 0.1 --fmax 40
+#     --njobs 4 \
+#     --vmin 200 --vmax 4000 --dv 10 \ 
+#     --fmin 0.1 --fmax 40            
 
-# python -m src.disp_main \
-#     --ncf_root data/ncf_stacks/30d \
+# python -m src.disp_pick \
+#     --ncf_root ./data/ncf_stacks/30d \
+#     --results_root ./results/dispersion \
 #     --stack_window 30d \
 #     --njobs 12

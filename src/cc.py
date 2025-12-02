@@ -16,10 +16,7 @@ from torch import nn
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-import sys
-sys.path.insert(0, os.path.dirname(__file__))
-
-from utils import (load_data, 
+from src.utils import (load_data, 
                    convert_to_tensor, 
                    timeit,
                    write_runlog, 
@@ -30,7 +27,7 @@ from utils import (load_data,
                    load_resume_state, 
                    save_resume_state)
 
-from ani import preprocess, TorchCrossCorrelation, daily_stack_ncf, stack_ncf_window
+from src.ani import preprocess, TorchCrossCorrelation 
 
 logging.basicConfig(
     level=logging.INFO, 
@@ -327,7 +324,6 @@ def main(
     # Expand user (~) and normalize paths
     data_root = os.path.expanduser(data_root)
     output_root = os.path.expanduser(output_root)
-    daily_root = os.path.expanduser(daily_root)
 
     os.makedirs(output_root, exist_ok=True)
 

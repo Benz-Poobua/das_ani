@@ -12,7 +12,7 @@ import json
 import logging 
 import torch
 import numpy as np
-from utils import convert_to_tensor, convert_to_numpy, nextpow2, timeit
+from src.utils import convert_to_tensor, convert_to_numpy, nextpow2, timeit
 
 logger = logging.getLogger(__name__)
 
