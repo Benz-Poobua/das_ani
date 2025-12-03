@@ -12,7 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 
-from utils import convert_to_numpy
+from src.utils import convert_to_numpy
 
 # Global Plotly style
 PLOTLY_FONT_FAMILY = "Helvetica"

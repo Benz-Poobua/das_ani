@@ -1,0 +1,14 @@
+{
+    "ncf_path": "./data/ncf_stacks/daily/20210901_daily.npy",
+    "fs": 250.0,
+    "dx": 8.16,
+    "stack_window": "daily",
+    "ncf_shape": [
+        350,
+        501
+    ],
+    "fv_shape": [
+        381,
+        81
+    ]
+}
