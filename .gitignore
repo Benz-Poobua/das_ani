@@ -20,10 +20,12 @@ __pycache__/
 *.npy
 *.npz
 *.h5
+*.json
 
 # Ignore everything inside these folders
 geometry/*
 data/*
+results/*
 
 # But keep the placeholder file so the folder exists in Git
 !geometry/.gitkeep
