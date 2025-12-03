@@ -7,6 +7,7 @@
 :purpose: Stacking workflows for DAS ambient-noise NCFs.
           Supports daily stacking and sliding-window stacks (7d, 15d, 30d).
 """
+import re
 import os
 import logging
 import numpy as np
@@ -21,38 +22,54 @@ logging.basicConfig(level=logging.INFO,
 
 # Helper
 # ==============================================================
-def _extract_date(fname):
+def _parse_date_vs(fname):
     """
-    Extract YYYYMMDD from file name, e.g.:
+    Extract (date, virtual-source index) from filename.
 
-        20210901_001000_cc_005.npy  →  20210901
+    Expected filename pattern:
+        YYYYMMDD_HHMMSS_cc_###.npy
+    or    YYYYMMDD_*_cc_###.npy
 
     :param fname: filename string
-    :type fname: str
-    :return: datetime.date object
+    :return: (date: datetime.date, vs: int)
     """
     base = os.path.basename(fname)
-    digits = ''.join([c for c in base if c.isdigit()])
+
+    # Extract date from first 8 digits
+    digits = ''.join(c for c in base if c.isdigit())
+    if len(digits) < 8:
+        raise ValueError(f'Cannot extract date from: {base}')
+
     date_str = digits[:8]
-    return datetime.strptime(date_str, '%Y%m%d').date()
+    date = datetime.strptime(date_str, '%Y%m%d').date()
 
+    # Extract VS index from pattern '_cc_###.npy'
+    m = re.search(r'_cc_(\d+)\.npy$', base)
+    if m is None:
+        raise ValueError(f'Cannot extract VS index from: {base}')
 
-# DAILY STACKING
+    vs = int(m.group(1))
+    return date, vs
+
+# DAILY STACKING: stack over time per (date, VS)
 # ==============================================================
 @timeit
 def daily_stack_ncf(ncf_root, out_daily):
     """
-    Create daily-average NCF for each day.
+    Create daily NCF stacks *per virtual source index*.
 
-    :param ncf_root: Directory containing raw NCFs (.npy) from cc.py
-    :type ncf_root: str
-    :param out_daily: Output directory for daily stacks (data/ncf_stacks/daily)
-    :type out_daily: str
+    For each combination of (date, vs_id):
+        stack = mean of all segments for that (date, vs_id)
+
+    Output naming:
+        YYYYMMDD_cc_###_daily.npy
+
+    :param ncf_root: directory containing raw NCF files (.npy)
+    :param out_daily: directory for output daily stacks
     """
-
     os.makedirs(out_daily, exist_ok=True)
 
-    # Collect all files
+    # Collect all .npy files under ncf_root
     all_files = sorted(
         os.path.join(root, f)
         for root, _, files in os.walk(ncf_root)
@@ -61,76 +78,99 @@ def daily_stack_ncf(ncf_root, out_daily):
 
     logger.info(f'Found {len(all_files)} raw NCF slices.')
 
-    # Group by day
-    day_dict = {}
+    # Group by (date, VS)
+    groups = {}
     for path in all_files:
-        d = _extract_date(path)
-        day_dict.setdefault(d, []).append(path)
+        date, vs = _parse_date_vs(path)
+        groups.setdefault((date, vs), []).append(path)
 
-    logger.info(f'Found {len(day_dict)} days to stack.')
+    logger.info(f'Found {len(groups)} (date, VS) groups for stacking.')
 
-    # Stack day by day
-    for d, flist in tqdm(day_dict.items(), desc='Daily stack'):
-        arrs = [np.load(f) for f in flist]
+    # Stack each group
+    for (date, vs), filelist in tqdm(groups.items(), desc='Daily stack'):
+        arrs = [np.load(f) for f in filelist]
         stack = np.mean(arrs, axis=0)
 
-        out_path = os.path.join(out_daily, f"{d.strftime('%Y%m%d')}_daily.npy")
-        np.save(out_path, stack)
+        outname = f"{date.strftime('%Y%m%d')}_cc_{vs:03d}_daily.npy"
+        outpath = os.path.join(out_daily, outname)
 
-        logger.info(f'Saved daily stack: {out_path}')
+        np.save(outpath, stack)
+        logger.info(f'Saved daily stack: {outpath}')
 
-# MULTI-DAY SLIDING WINDOW STACKING
+# MULTI-DAY SLIDING WINDOW STACKING: per VS separately
 # ==============================================================
 @timeit
 def stack_ncf_window(daily_root, out_root, window_days):
     """
-    Create sliding-window stack (7d, 15d, 30d).
+    Sliding-window stacking (7d, 15d, 30d) per VS.
 
-    Example: window_days = 7 → 
-        For each day D, stack all daily NCFs from D-6 ... D.
+    For each VS:
+        For each date D:
+            stack all daily NCFs from (D - window_days + 1) ... D
 
-    :param daily_root: Directory with daily stacks (data/ncf_stacks/daily)
-    :type daily_root: str
-    :param out_root: Directory to store sliding stacks
-    :type out_root: str
-    :param window_days: window length in days
-    :type window_days: int
+    Output naming:
+        YYYYMMDD_cc_###_<window_days>d.npy
+
+    :param daily_root: directory containing daily stacks
+    :param out_root: directory for sliding-window stacks
+    :param window_days: number of days in the window (e.g., 7, 15, 30)
     """
-
     os.makedirs(out_root, exist_ok=True)
 
-    # Collect daily stacks
-    files = sorted([f for f in os.listdir(daily_root) if f.endswith('.npy')])
-    dates = [_extract_date(f) for f in files]
-
-    if len(files) == 0:
-        logger.warning(f'No daily stacks found in {daily_root}.')
+    # Collect all daily stack files
+    daily_files = sorted(
+        f for f in os.listdir(daily_root) if f.endswith('_daily.npy')
+    )
+    if len(daily_files) == 0:
+        logger.warning(f'No daily stacks in {daily_root}.')
         return
 
-    for i in tqdm(range(len(files)), desc=f'{window_days}d sliding stack'):
-        end_date = dates[i]
-        start_date = end_date - timedelta(days=window_days - 1)
-
-        # Collect files inside window
-        fwin = [
-            os.path.join(daily_root, files[j])
-            for j in range(len(files))
-            if start_date <= dates[j] <= end_date
-        ]
-
-        if len(fwin) == 0:
+    # Parse (date, VS)
+    records = []
+    for f in daily_files:
+        try:
+            date, vs = _parse_date_vs(f)
+            records.append((date, vs, f))
+        except:
             continue
 
-        # Load and stack
-        arrs = [np.load(p) for p in fwin]
-        stack = np.mean(arrs, axis=0)
+    # Group by VS
+    vs_groups = {}
+    for date, vs, fname in records:
+        vs_groups.setdefault(vs, []).append((date, fname))
 
-        out_path = os.path.join(
-            out_root,
-            f"{end_date.strftime('%Y%m%d')}_{window_days}d.npy"
-        )
-        np.save(out_path, stack)
-        logger.info(f'Saved {window_days}d stack: {out_path}')
+    logger.info(f'Found {len(vs_groups)} virtual sources for sliding stacks.')
+
+    # Process each VS
+    for vs, items in tqdm(vs_groups.items(), desc=f'{window_days}d stacks'):
+        # Sort by date
+        items = sorted(items, key=lambda x: x[0])
+        dates = [d for d, _ in items]
+        fnames = [f for _, f in items]
+
+        for i in range(len(items)):
+            end_date = dates[i]
+            start_date = end_date - timedelta(days=window_days - 1)
+
+            # files inside window
+            fwin = [
+                os.path.join(daily_root, fnames[j])
+                for j in range(len(items))
+                if start_date <= dates[j] <= end_date
+            ]
+            if len(fwin) == 0:
+                continue
+
+            arrs = [np.load(p) for p in fwin]
+            stack = np.mean(arrs, axis=0)
+
+            outname = (
+                f"{end_date.strftime('%Y%m%d')}_cc_{vs:03d}_{window_days}d.npy"
+            )
+            outpath = os.path.join(out_root, outname)
+            np.save(outpath, stack)
+
+            logger.info(f'Saved {window_days}d stack: {outpath}')
 
 # MASTER STACK WORKFLOW (used for CLI)
 # ==============================================================
@@ -140,22 +180,21 @@ def run_all_stacks(
     do_daily=True,
     do_7d=True,
     do_15d=True,
-    do_30d=True
+    do_30d=True,
 ):
     """
     Full stacking workflow:
         daily → 7d → 15d → 30d
-    
-    :param raw_root: raw CC directory
-    :param stacks_root: where stacks are saved
-    """
+    All operations are done **per virtual source index**.
 
+    :param raw_root: directory with raw NCFs
+    :param stacks_root: base directory for stacks
+    """
     daily_dir = os.path.join(stacks_root, 'daily')
 
     if do_daily:
         daily_stack_ncf(raw_root, daily_dir)
 
-    # Multi-window stacks
     if do_7d:
         stack_ncf_window(daily_dir, os.path.join(stacks_root, '7d'), 7)
     if do_15d:
@@ -167,7 +206,7 @@ def run_all_stacks(
 # ==============================================================
 def parse_args():
     import argparse
-    p = argparse.ArgumentParser(description='NCF stacking tool')
+    p = argparse.ArgumentParser(description='NCF stacking tool (per virtual source)')
 
     p.add_argument('--raw_root', type=str, default='data/ncf_raw')
     p.add_argument('--stacks_root', type=str, default='data/ncf_stacks')
@@ -188,7 +227,7 @@ if __name__ == '__main__':
         do_daily=not args.no_daily,
         do_7d=not args.no_7d,
         do_15d=not args.no_15d,
-        do_30d=not args.no_30d
+        do_30d=not args.no_30d,
     )
 
 # Example
