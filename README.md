@@ -74,8 +74,10 @@ Destination = current directory.
 │   └── .gitkeep             # originally stores: geometry_offset.csv, map_data.npy, map_data.txt
 │
 ├── data/
-│   ├── ncf/*.npy            # Noise cross-correlation results
-│   └── preprocessed         # Preprocessed DAS time windows
+│   ├── ncf_raw/*.npy            # Noise cross-correlation results
+│   ├── ncf_stacks               # Stacked noise cross-correlation results
+│   │   └──daily/*_daily.npz 
+│   └── preprocessed             # Preprocessed DAS time windows
 │       └──day/*.npz 
 ├── notebooks/
 │   ├── das_geometry.ipynb            # Fiber geometry visualization
@@ -85,14 +87,26 @@ Destination = current directory.
     ├── utils.py              # Helper functions for I/O, conversions, utilities
     ├── ani.py                # Ambient Noise Interferometry algorithms
     ├── cc.py                 # Cross-correlation workflow for DAS
-    └── fake.py (optional)    # Synthetic DAS generator (used for testing)
+    ├── stack.py              # Stacking algorithm
+    ├── disp.py               # Dispersion images and picking algorithms
+    ├── disp_pick.py          # Dispersion curves workflow
+    ├── plot.py               # Plotting utilities
+    └── fake.py (optional)    # Synthetic DAS generator (will be removed soon)
 ```
 ---
 ## Tutorial
 After downloading the data, ensure that the directory `./data/preprocessed` exists.
-You can then run the processing workflow with:
+You can then run the processing cross-correlation workflow with:
 ```bash
-python3 src/cc.py --data_root ./data/preprocessed --output_root ./data/ncf --njobs 10 --use_gpu --verbose
+python -m src.cc --data_root ./data/preprocessed --output_root ./data/ncf_raw --njobs 4 --use_gpu --verbose
+```
+Next, you can stack NCFs using: 
+```bash
+python -m src.stack --raw_root ./data/ncf_raw --stacks_root ./data/ncf_stacks
+```
+The last step is to compute dispersion images and pick dispersion curves from stacked NCFs:
+```bash
+python -m src.disp_pick --ncf_root ./data/ncf_stacks/daily --results_root ./results/dispersion --stack_window daily --njobs 4
 ```
 ---
 ## License
