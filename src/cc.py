@@ -72,9 +72,9 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
 
     # Set preprocessing parameters
     decimation  = 1                                 # decimation factor after filtering 
-    f1, f2      = 1.0, 40.0                         # bandpass filter corners
+    f1, f2      = 1.0, 5.0                         # bandpass filter corners
     diff        = False                             # whether to differentiate (strain → strain rate) 
-    ram_win     = 1.0                               # RAM window in seconds (0 → one-bit)
+    ram_win     = 0.0                               # RAM window in seconds (0 → one-bit)
     min_length  = 60.0                              # minimum segment length in seconds
     min_npts    = int(min_length * fs_raw)
     fs_proc     = fs_raw / decimation
@@ -82,8 +82,8 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
     # Set ambient noise cross-correlation parameters
     is_spectral_whitening   = True
     window_freq             = 0.0                   # 0 → aggressive whitening, else running mean in Hz
-    max_lag                 = 1.0                   # time lag in seconds
-    xcorr_seg               = 2.0                   # segment length in seconds for CC window
+    max_lag                 = 4.0                   # time lag in seconds
+    xcorr_seg               = 8.0                   # segment length in seconds for CC window
     npts_lag                = int(max_lag * fs_proc)               
     npts_seg                = int(xcorr_seg * fs_proc) 
     cc_out_len              = 2 * npts_lag + 1  # length of lag window

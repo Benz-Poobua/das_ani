@@ -201,9 +201,13 @@ def spectral_whitening(rfftdata, df, window_freq, f1, f2):
     device = rfftdata.device
     nch, nfreq = rfftdata.shape
 
-    # Frequency indices
+    # Compute freq indices
     idxf1 = int(f1 / df)
     idxf2 = int(torch.ceil(torch.tensor(f2/df, device=device)).item())  
+
+    # Clip to array bounds
+    idxf1 = max(0, min(idxf1, nfreq - 1))
+    idxf2 = max(0, min(idxf2, nfreq))
 
     if idxf1 < 0 or idxf2 > nfreq:
         raise ValueError('f1 or f2 exceed available frequency bins.')
@@ -223,6 +227,10 @@ def spectral_whitening(rfftdata, df, window_freq, f1, f2):
     # ========================================
     nwin = max(int(window_freq / df), 1)
 
+    # Ensure nwin is odd so conv1d output = input length
+    if nwin % 2 == 0:
+        nwin += 1
+
     amp = torch.abs(rfftdata)       # (nch, nfreq)
     phases = torch.angle(rfftdata)
 
@@ -238,7 +246,21 @@ def spectral_whitening(rfftdata, df, window_freq, f1, f2):
         amp_3d, 
         kernel, 
         padding=pad
-    ).squeeze(1)                    # (nch, nfreq)
+    ).squeeze(1)                    # (nch, nfreq or nfreq+1)
+
+    # Force shape match: crop or pad as needed
+    if amp_smooth.size(-1) > amp.size(-1):
+        amp_smooth = amp_smooth[..., :amp.size(-1)]
+    elif amp_smooth.size(-1) < amp.size(-1):
+        pad_amount = amp.size(-1) - amp_smooth.size(-1)
+        amp_smooth = torch.nn.functional.pad(amp_smooth, (0, pad_amount), mode='replicate')
+
+    # Recompute nfreq after convolution 
+    nfreq = amp_smooth.shape[-1]
+
+    # Reclip idxf1/idxf2 to new nfreq
+    idxf1 = min(idxf1, nfreq - 1)
+    idxf2 = min(idxf2, nfreq)
 
     # Avoid division by zero
     amp_smooth = torch.where(amp_smooth == 0, torch.tensor(1.0, device=device), amp_smooth)
