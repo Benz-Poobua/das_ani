@@ -72,7 +72,7 @@ def process_signal_file(file_path, output_cc, use_gpu=False):
 
     # Set preprocessing parameters
     decimation  = 1                                 # decimation factor after filtering 
-    f1, f2      = 1.0, 5.0                         # bandpass filter corners
+    f1, f2      = 1.0, 5.0                          # bandpass filter corners
     diff        = False                             # whether to differentiate (strain → strain rate) 
     ram_win     = 0.0                               # RAM window in seconds (0 → one-bit)
     min_length  = 60.0                              # minimum segment length in seconds

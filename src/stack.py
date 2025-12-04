@@ -24,31 +24,30 @@ logging.basicConfig(level=logging.INFO,
 # ==============================================================
 def _parse_date_vs(fname):
     """
-    Extract (date, virtual-source index) from filename.
+    Extract (date, virtual-source ID) from filename.
 
-    Expected filename pattern:
-        YYYYMMDD_HHMMSS_cc_###.npy
-    or    YYYYMMDD_*_cc_###.npy
+    Accepts filenames such as:
+        20210901_000000_cc_080.npy
+        20210901_cc_080_daily.npy
+        20210901_cc_080_7d.npy
 
-    :param fname: filename string
-    :return: (date: datetime.date, vs: int)
+    :param fname: input filename
+    :return: (date: datetime.date, vs_id: int)
     """
     base = os.path.basename(fname)
 
-    # Extract date from first 8 digits
-    digits = ''.join(c for c in base if c.isdigit())
-    if len(digits) < 8:
-        raise ValueError(f'Cannot extract date from: {base}')
+    # Extract leading date YYYYMMDD
+    m_date = re.match(r'(\d{8})', base)
+    if m_date is None:
+        raise ValueError(f'Cannot parse date from: {base}')
+    date = datetime.strptime(m_date.group(1), '%Y%m%d').date()
 
-    date_str = digits[:8]
-    date = datetime.strptime(date_str, '%Y%m%d').date()
+    # Extract VS index (### after "_cc_")
+    m_vs = re.search(r'_cc_(\d{3})', base)
+    if m_vs is None:
+        raise ValueError(f'Cannot parse VS index from: {base}')
+    vs = int(m_vs.group(1))
 
-    # Extract VS index from pattern '_cc_###.npy'
-    m = re.search(r'_cc_(\d+)\.npy$', base)
-    if m is None:
-        raise ValueError(f'Cannot extract VS index from: {base}')
-
-    vs = int(m.group(1))
     return date, vs
 
 # DAILY STACKING: stack over time per (date, VS)
@@ -81,8 +80,11 @@ def daily_stack_ncf(ncf_root, out_daily):
     # Group by (date, VS)
     groups = {}
     for path in all_files:
-        date, vs = _parse_date_vs(path)
-        groups.setdefault((date, vs), []).append(path)
+        try:
+            date, vs = _parse_date_vs(path)
+            groups.setdefault((date, vs), []).append(path)
+        except Exception as e:
+            logger.warning(f'Skipping {path}: {e}')
 
     logger.info(f'Found {len(groups)} (date, VS) groups for stacking.')
 
@@ -119,7 +121,7 @@ def stack_ncf_window(daily_root, out_root, window_days):
 
     # Collect all daily stack files
     daily_files = sorted(
-        f for f in os.listdir(daily_root) if f.endswith('_daily.npy')
+        f for f in os.listdir(daily_root) if f.endswith('.npy')
     )
     if len(daily_files) == 0:
         logger.warning(f'No daily stacks in {daily_root}.')
@@ -158,7 +160,9 @@ def stack_ncf_window(daily_root, out_root, window_days):
                 for j in range(len(items))
                 if start_date <= dates[j] <= end_date
             ]
-            if len(fwin) == 0:
+
+            # Require full window (e.g., 7 days)
+            if len(fwin) < window_days:
                 continue
 
             arrs = [np.load(p) for p in fwin]
