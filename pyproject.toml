@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "das-ani"
+version = "0.1.0"
+description = "DAS Ambient Noise Interferometry (ANI) pipeline: preprocessing, cross-correlation, stacking, dispersion."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Benz Poobua" }
+]
+dependencies = [
+  "numpy>=1.24",
+  "tqdm>=4.66",
+  "psutil>=5.9",
+  "pyyaml>=6.0",
+  "scipy>=1.10",
+  # torch is platform-specific (CPU/CUDA/MPS). Keep version broad.
+  "torch>=2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.5",
+  "black>=24.4",
+  "mypy>=1.10",
+  "pytest>=8.2",
+  "types-PyYAML>=6.0.12.20240917",
+]
+viz = [
+  "matplotlib>=3.7",
+]
+notebooks = [
+  "jupyter>=1.0",
+  "ipykernel>=6.29",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src"]
+exclude = ["build", "dist", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
