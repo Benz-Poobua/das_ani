@@ -1,0 +1,44 @@
+paths:
+  data_root: ./data/preprocessed
+  output_root: ./data/ncf_raw
+
+runtime:
+  njobs: 4
+  use_gpu: true
+  mmap: true
+  frac_mem: 0.25
+  min_chunk: 64
+  max_chunk: 4096
+  torch_compile: true
+  compile_mode: max-autotune
+
+data:
+  fs_raw: 250.0
+  first_chan: 399
+  last_chan: 748
+  dx: 8.16
+  src_stride: 10         # every 10th channel
+  min_length_sec: 60.0
+
+preprocess:
+  decimation: 1
+  f1: 1.0
+  f2: 5.0
+  diff: false
+  ram_win_sec: 0.0
+
+xcorr:
+  is_spectral_whitening: true
+  window_freq_hz: 0.0
+  max_lag_sec: 4.0
+  xcorr_seg_sec: 8.0
+
+stacking:
+  enabled: true
+  raw_root: ./data/ncf_raw
+  stacks_root: ./data/ncf_stacks
+  overwrite: false
+  windows:
+    7d: true
+    15d: false
+    30d: false
