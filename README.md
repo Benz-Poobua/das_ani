@@ -1,50 +1,55 @@
 # DAS-ANI: Distributed Acoustic Sensing Preprocessing & Ambient Noise Interferometry Tools
 
-## Purpose
+## Overview
 
-This repository contains tools, workflows, and utilities for preprocessing and processing **Distributed Acoustic Sensing (DAS)** data.  
-The focus is on **shallow subsurface imaging** using **ambient noise interferometry (ANI)**. This project also introduces a new framework for compressing DAS data and evaluating its impact on virtual source gathers (VSGs) and dispersion curve construction.
+This repository provides a modular, configuration-driven framework for **Distributed Acoustic Sensing (DAS)** preprocessing and **Ambient Noise Interferometry (ANI)** workflows.
+
+The primary goals are:
+
+- Preprocessing large-scale DAS datasets
+
+- Efficient computation of noise cross-correlations (NCFs)
+
+- Temporal stacking of NCFs (daily, 7d, 15d, 30d)
+
+- Dispersion imaging (f–v panels) and dispersion curve picking
+
+- Exploration of data compression strategies (e.g., sketching, low-rank methods) and their impact on virtual source gathers and dispersion results
 
 ---
 
 ## Installation
 
-You may install dependencies using **pip** or **conda**.
-
-### **Using pip**
-
+### **Option 1: Install as editable package (pip)**
 ```bash
-# Create a virtual environment
-python -m venv venv
-source venv/bin/activate     # On Windows: venv\Scripts\activate
-
-# Install packages
-pip install -r requirements.txt
+pip install -e .
 ```
-### **Using conda**
+
+### **Option 2: Conda environment (recommended)**
 ```bash
-# Create the environment from YAML
+# Create environment 
 conda env create -f environment.yml
 
-# Activate the environment
+# Activate 
 conda activate das_ani-env
 ```
 ---
 
 ## Downloading DAS Data from Google Cloud
 
-To download large datasets (e.g., preprocessed DAS windows or NCF results), you need:
+Large DAS datasets (e.g., preprocessed windows or NCF products) are typically hosted on Google Cloud Storage (GCS).
 
-- gsutil installed
-- Google Cloud authentication (with proper permissions)
+### **Requirements**
+- `gsutil` installed
+- Authenticated GCP account with read permission
   
 Official documentation: https://cloud.google.com/storage/docs/gsutil
 
-### Example: Download DAS data from a GCS bucket
+### Example
 ```bash
 gsutil -m cp -n -r gs://path/to/data .
 ```
-### Explanation of flags
+### Flag explanation
 1. `gsutil`
 Google Cloud Storage command-line tool.
 2. `-m` (multi-threading)
@@ -68,45 +73,85 @@ Destination = current directory.
 ├── LICENSE
 ├── README.md
 ├── environment.yml
-├── requirements.txt
+├── pyproject.toml
+├── Makefile
+├── configs/                     # YAML configuration files
+│   ├── cc.yaml                  # Cross-correlation parameters
+│   └── disp.yaml                # Dispersion + picking parameters
 │
 ├── geometry/
-│   └── .gitkeep             # originally stores: geometry_offset.csv, map_data.npy, map_data.txt
+│   └── .gitkeep                 # Geometry-related inputs (offsets, maps)
 │
 ├── data/
-│   ├── ncf_raw/*.npy            # Noise cross-correlation results
-│   ├── ncf_stacks               # Stacked noise cross-correlation results
-│   │   └──daily/*_daily.npz 
-│   └── preprocessed             # Preprocessed DAS time windows
-│       └──day/*.npz 
+│   ├── preprocessed/            # Preprocessed DAS time windows (.npz)
+│   ├── ncf_raw/                 # Raw noise cross-correlations (.npy)
+│   └── ncf_stacks/              # Stacked NCFs (.npy)
+│       ├── daily/
+│       ├── 7d/
+│       ├── 15d/
+│       └── 30d/
+│
 ├── notebooks/
-│   ├── das_geometry.ipynb            # Fiber geometry visualization
-│   └── das_processing_demo.ipynb     # End-to-end DAS processing demo
+│   ├── geometry.ipynb        # Fiber geometry visualization
+│   ├── processing.ipynb      # End-to-end DAS processing demo
+│   ├── dispersion.ipynb      # Dispersion imaging & picking
+│   └── kernel.ipynb          # Tensor Sketch / kernel demos
 │
 └── src/
-    ├── utils.py              # Helper functions for I/O, conversions, utilities
-    ├── ani.py                # Ambient Noise Interferometry algorithms
-    ├── cc.py                 # Cross-correlation workflow for DAS
-    ├── stack.py              # Stacking algorithm
-    ├── disp.py               # Dispersion images and picking algorithms
-    ├── disp_pick.py          # Dispersion curves workflow
-    ├── plot.py               # Plotting utilities
-    └── fake.py (optional)    # Synthetic DAS generator (will be removed soon)
+    ├── utils.py                 # I/O, config helpers, diagnostics
+    ├── ani.py                   # ANI preprocessing + correlation kernels
+    ├── cc.py                    # Cross-correlation workflow
+    ├── stack.py                 # NCF stacking (daily, multi-day)
+    ├── disp.py                  # Dispersion imaging + picking algorithms
+    ├── disp_pick.py             # Dispersion workflow (main script)
+    └── plot.py                  # Plotting utilities
 ```
 ---
-## Tutorial
-After downloading the data, ensure that the directory `./data/preprocessed` exists.
-You can then run the processing cross-correlation workflow with:
+## Workflow Overview
+All scripts are config-driven via YAML files in configs/.
+You generally do not need to modify Python code for parameter changes.
+### 1. Cross-correlation (NCF generation)
 ```bash
-python -m src.cc --data_root ./data/preprocessed --output_root ./data/ncf_raw --njobs 4 --use_gpu --verbose
+make cc_only
 ```
-Next, you can stack NCFs using: 
+Produces:
 ```bash
-python -m src.stack --raw_root ./data/ncf_raw --stacks_root ./data/ncf_stacks
+data/ncf_raw/*.npy
 ```
-The last step is to compute dispersion images and pick dispersion curves from stacked NCFs:
+Raw NCFs can be large. It is safe to delete them after stacking if storage is limited.
+### 2. Stacking (daily, 7d, 15d, 30d)
 ```bash
-python -m src.disp_pick --ncf_root ./data/ncf_stacks/daily --results_root ./results/dispersion --stack_window daily --njobs 4
+make stack_only
+```
+Produces:
+```bash
+data/ncf_stacks/<window>/*.npy
+```
+Stack windows are controlled in configs/cc.yaml.
+### 3. Dispersion imaging & picking
+```bash
+make disp_only
+```
+Produces:
+```bash
+results/dispersion/<window>/VS_xxx/
+```
+Each virtual source folder contains:
+- f–v panel
+- frequency & velocity axes
+- picked dispersion curve
+- metadata (`.json`)
+To process multiple windows:
+```bash
+make disp_only DISP_WINDOWS="daily 7d 15d 30d" NJOBS=12
+```
+### 4. Full pipeline
+```bash
+make all
+```
+Runs:
+```bash
+cc → stack → dispersion
 ```
 ---
 ## License

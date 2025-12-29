@@ -229,43 +229,67 @@ def main(cfg: Dict[str, Any]) -> None:
     """
     ncf_root = Path(get_cfg(cfg, ["io", "ncf_root"], "data/ncf_stacks")).expanduser()
     results_root = Path(get_cfg(cfg, ["io", "results_root"], "results/dispersion")).expanduser()
-    stack_window = str(get_cfg(cfg, ["io", "stack_window"], "daily"))
-
     njobs = int(get_cfg(cfg, ["runtime", "njobs"], 4))
+    vs_subdir = bool(get_cfg(cfg, ["io", "vs_subdir"], True))
 
-    in_dir = ncf_root / stack_window
-    if not in_dir.exists():
-        raise FileNotFoundError(f"Input directory not found: {in_dir}")
+    # List of stack windows (default: ["daily"])
+    stack_windows = get_cfg(cfg, ["io", "stack_windows"], None)
+    if stack_windows is None:
+        # Backward-compatible: if user still has io.stack_window
+        stack_windows = [str(get_cfg(cfg, ["io", "stack_window"], "daily"))]
+    if isinstance(stack_windows, str):
+        stack_windows = [stack_windows]
+    stack_windows = [str(s) for s in stack_windows]
 
     results_root.mkdir(parents=True, exist_ok=True)
 
-    filelist = sorted(in_dir.glob("*.npy"))
-    logger.info(f"Input:  {in_dir} | files={len(filelist)}")
-    logger.info(f"Output: {results_root / stack_window} (vs_subdir={bool(get_cfg(cfg, ['io','vs_subdir'], True))})")
-    logger.info(f"Runtime: njobs={njobs}")
+    logger.info(f"NCF root:     {ncf_root}")
+    logger.info(f"Results root: {results_root}")
+    logger.info(f"Runtime:      njobs={njobs}")
+    logger.info(f"Layout:       vs_subdir={vs_subdir}")
+    logger.info(f"Windows:      {stack_windows}")
 
-    if not filelist:
-        logger.warning("No NCF files found. Abort.")
-        return
-    
-    # Multiprocessing: pass only JSON-serializable objects to workers
-    with ProcessPoolExecutor(max_workers=njobs) as ex:
-        futures = [ex.submit(process_one_ncf, str(p), cfg) for p in filelist]
+    # Process each window sequentially; inside each, parallelize over files
+    for stack_window in stack_windows:
+        # Set current window into cfg so worker can read it
+        cfg.setdefault("io", {})
+        cfg["io"]["stack_window"] = stack_window
 
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Dispersion"):
-            try:
-                outp = fut.result()
-                if outp:
-                    logger.info(f"Done → {outp}")
-            except Exception as e:
-                logger.error(f"Worker error: {e}")
+        in_dir = ncf_root / stack_window
+        if not in_dir.exists():
+            logger.warning(f"[SKIP] Input directory not found: {in_dir}")
+            continue
+
+        filelist = sorted(in_dir.glob("*.npy"))
+        logger.info(f"[{stack_window}] Input: {in_dir} | files={len(filelist)}")
+        logger.info(f"[{stack_window}] Output: {results_root / stack_window}")
+
+        if not filelist:
+            logger.warning(f"[{stack_window}] No NCF files found. Skipping.")
+            continue
+
+        # Multiprocessing: cfg must be picklable/JSON-ish (dict of primitives/lists)
+        with ProcessPoolExecutor(max_workers=njobs) as ex:
+            futures = [ex.submit(process_one_ncf, str(p), cfg) for p in filelist]
+
+            for fut in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f"Dispersion [{stack_window}]",
+            ):
+                try:
+                    outp = fut.result()
+                    if outp:
+                        logger.info(f"[{stack_window}] Done → {outp}")
+                except Exception as e:
+                    logger.error(f"[{stack_window}] Worker error: {e}")
 
 # =====================================================
 # CLI
 # =====================================================
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Dispersion imaging + picking from stacked NCF files (config-driven)"
+        description="Dispersion imaging + picking from stacked NCF files"
     )
     p.add_argument(
         "--config",
@@ -274,11 +298,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to YAML config file (default: disp.yaml)",
     )
     p.add_argument(
-        "--stack_window",
+        "--stack_windows",
         type=str,
-        default=None,
+        nargs="+",
         choices=["daily", "7d", "15d", "30d"],
-        help="Override io.stack_window in config",
+        default=None,
+        help="Override io.stack_windows in config (e.g., --stack_windows daily 7d 15d)",
     )
     p.add_argument(
         "--njobs",
@@ -294,12 +319,19 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 def _override_cfg(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
-    if args.stack_window is not None:
+    """
+    Apply CLI overrides without editing YAML.
+    """
+    if args.stack_windows is not None:
         cfg.setdefault("io", {})
-        cfg["io"]["stack_window"] = args.stack_window
+        cfg["io"]["stack_windows"] = list(args.stack_windows)
+        # Keep io.stack_window consistent (use first) for any code that still reads it
+        cfg["io"]["stack_window"] = str(args.stack_windows[0])
+
     if args.njobs is not None:
         cfg.setdefault("runtime", {})
         cfg["runtime"]["njobs"] = int(args.njobs)
+
     return cfg
 
 if __name__ == "__main__":
@@ -310,11 +342,14 @@ if __name__ == "__main__":
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    cfg = load_config(args.config)
+    cfg_path = Path(args.config).expanduser().resolve()
+    logger.info(f"Loading config: {cfg_path}")
+
+    cfg = load_config(cfg_path)
     cfg = _override_cfg(cfg, args)
 
     main(cfg)
 
 # Example
-# python -m src.disp_pick --config disp.yaml
-# python -m src.disp_pick --config disp.yaml --stack_window 30d --njobs 12 --verbose
+# python -m src.disp_pick --config configs/disp.yaml
+# python -m src.disp_pick --config configs/disp.yaml --stack_window 30d --njobs 12 --verbose
