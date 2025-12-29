@@ -7,121 +7,133 @@
 :purpose: Dispersion imaging (f–v transform) and dispersion curve picking
           for DAS ambient noise interferometry.
 """
-import os
-import json
+from __future__ import annotations
+
 import logging 
 import torch
 import numpy as np
+
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
 from src.utils import convert_to_tensor, convert_to_numpy, nextpow2, timeit
 
 logger = logging.getLogger(__name__)
 
+ArrayLike = Union[np.ndarray, torch.Tensor]
+
+# =====================================================
 # 1. Dispersion image (f-v panel) via phase-shift method
-# ================================================================================
+# =====================================================
 @timeit
-def dispersion_curve(data, 
-                     offset, 
-                     t,
-                     vmin=200.0, 
-                     vmax=4000.0, 
-                     dv=10.0, 
-                     fmin=0.1, 
-                     fmax=50.0, 
-                     normalize=True, 
-                     device=None, 
-                     batch_size_v=None):
-    
+@torch.no_grad()
+def dispersion_curve(
+    data: ArrayLike,
+    offset: ArrayLike,
+    t: ArrayLike,
+    *,
+    vmin: float = 200.0,
+    vmax: float = 4000.0,
+    dv: float = 10.0,
+    fmin: float = 0.1,
+    fmax: float = 50.0,
+    normalize: bool = True,
+    device: Optional[torch.device] = None,
+    batch_size_v: Optional[int] = None,
+    empty_cache: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute the f-v (frequency-velocity) dispersion image using the phase-shift method (Park et al., 1998).
+    Compute the f-v (frequency-velocity) dispersion image using the phase-shift method.
 
-    This function is designed for DAS gathers or NCF virtual-source gathers with receivers along a 1D array.
-
-    :param data: Seismic/DAS gather (nrec × nt). Each row is one channel.
-    :type data: numpy.ndarray or torch.Tensor
-    :param offset: Receiver offsets in meters, shape (nrec,).
-    :type offset: numpy.ndarray or torch.Tensor
-    :param t: Time axis in seconds, shape (nt,).
-    :type t: numpy.ndarray or torch.Tensor
-    :param vmin: Minimum phase velocity to search (m/s).
-    :type vmin: float
-    :param vmax: Maximum phase velocity to search (m/s).
-    :type vmax: float
+    :param data: Gather (nrec, nt).
+    :param offset: Offsets (nrec,).
+    :param t: Time axis (nt,).
+    :param vmin: Minimum phase velocity (m/s).
+    :param vmax: Maximum phase velocity (m/s).
     :param dv: Velocity sampling interval (m/s).
-    :type dv: float
-    :param fmin: Minimum frequency for analysis (Hz).
-    :type fmin: float
-    :param fmax: Maximum frequency for analysis (Hz).
-    :type fmax: float
-    :param normalize: If True, normalize each frequency slice by its max.
-    :type normalize: bool
-    :param device: Torch device ('cuda', 'cpu', 'mps'). If None, auto-select.
-    :type device: torch.device or None
-    :param batch_size_v: Number of velocities per batch in the phase-shift
-                         integration. If None, choose a heuristic based on nv.
-    :type batch_size_v: int or None
+    :param fmin: Minimum frequency (Hz).
+    :param fmax: Maximum frequency (Hz).
+    :param normalize: Normalize each frequency slice by its max.
+    :param device: Torch device. If None, uses GPU if available.
+    :param batch_size_v: Velocities per batch. If None, heuristic.
+    :param empty_cache: If True and CUDA, empty cache between batches.
 
-    :return:
-        - **fv_panel** (*torch.Tensor*) -- dispersion image, shape (nv, nf)
-        - **f_axis** (*torch.Tensor*) -- frequency axis (Hz), shape (nf,)
-        - **v_axis** (*torch.Tensor*) -- velocity axis (m/s), shape (nv,)
-    :rtype: tuple
+    :return: (fv_panel [nv,nf], f_axis [nf], v_axis [nv])
     """
-    logger.info('Computing dispersion curve (phase-shift) method with batching.')
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
 
-    # Select device
-    if device is None: 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  
-    logger.info(f'Using device: {device}') 
+    # Convert inputs
+    data_t = convert_to_tensor(data, device=device)
+    off_t = convert_to_tensor(offset, device=device)
+    t_t = convert_to_tensor(t, device=device)
 
-    # Convert input to tensors
-    data = convert_to_tensor(data, device=device)
-    offset = convert_to_tensor(offset, device=device)
-    t = convert_to_tensor(t,device=device)
-
-    if data.ndim != 2:
-        raise ValueError("'data' must be 2D: (nrec × nt).")
-    if offset.ndim != 1 or offset.shape[0] != data.shape[0]:
+    if data_t.ndim != 2:
+        raise ValueError("'data' must be 2D (nrec, nt).")
+    if off_t.ndim != 1 or off_t.numel() != data_t.shape[0]:
         raise ValueError("'offset' must be 1D with length nrec.")
-    if t.ndim != 1 or t.shape[0] != data.shape[1]:
+    if t_t.ndim != 1 or t_t.numel() != data_t.shape[1]:
         raise ValueError("'t' must be 1D with length nt.")
     
-    nrec, nt = data.shape
+    nrec, nt = int(data_t.shape[0]), int(data_t.shape[1])
+
     if nt < 2:
-        raise ValueError('Time axis must have at least 2 samples to compute dt.')
+        raise ValueError("Time axis must have at least 2 samples.")
 
-    dt = float(t[1] - t[0])
-    logger.debug(f'Gather shape: nrec={nrec}, nt={nt}, dt={dt:.6f}s')
+    dt = float((t_t[1] - t_t[0]).item())
+    if dt <= 0:
+        raise ValueError(f"Invalid dt={dt}. Check your time vector.")
 
-    # Build velocity 
+    # Velocity axis
+    if dv <= 0:
+        raise ValueError("dv must be > 0.")
+    if vmax <= vmin:
+        raise ValueError("vmax must be > vmin.")
     v_axis = torch.arange(vmin, vmax + dv, dv, device=device, dtype=torch.float32)
-    nv = v_axis.numel()
+    nv = int(v_axis.numel())
 
-    # FFT parameters
+    # FFT / frequency axis
     nfft = int(nextpow2(torch.tensor(nt, device=device)).item())
-    f_axis_full = torch.fft.rfftfreq(nfft, dt).to(device)
-    freq_mask = (f_axis_full >= fmin) & (f_axis_full <= fmax)
-    f_axis = f_axis_full[freq_mask]
-    nf = f_axis.numel()
+    f_full = torch.fft.rfftfreq(nfft, dt).to(device)
+    freq_mask = (f_full >= float(fmin)) & (f_full <= float(fmax))
+    f_axis = f_full[freq_mask]
+    nf = int(f_axis.numel())
+    if nf < 2:
+        raise ValueError(
+            f"Too few frequencies after masking: nf={nf}. "
+            f"Try adjusting fmin/fmax or check dt/nt."
+            )
 
-    logger.debug(f'Velocity axis: nv={nv}, vmin={v_axis.min().item():.1f}, vmax={v_axis.max().item():.1f}')
-    logger.debug(f'Frequency axis: nf={nf}, fmin={f_axis.min().item():.3f}, fmax={f_axis.max().item():.3f}')
+    logger.info(
+        f"[dispersion_curve] device={device} | nrec={nrec} nt={nt} dt={dt:.6f} | "
+        f"nv={nv} (v=[{vmin},{vmax}] dv={dv}) | nf={nf} (f=[{fmin},{fmax}])"
+        )
 
-    # FFT along time (receiver × frequency)
-    fft_data = torch.fft.rfft(data, n=nfft, dim=1)[:, freq_mask] # (nrec × nf)
+    # FFT along time: (nrec, nf)
+    fft_data = torch.fft.rfft(data_t, n=nfft, dim=1)[:, freq_mask]
 
-    # Phase-only normalization (avoid amplitude dominance)
-    amp   = torch.abs(fft_data)
-    phase = fft_data / (amp + 1e-8)  # (nrec × nf)
+    # Phase-only (avoid amplitude dominance)
+    amp = torch.abs(fft_data)
+    phase = fft_data / (amp + 1e-8)
 
-    # Batching velocities
+    # Velocity batching heuristic
     if batch_size_v is None:
-        # Heuristic: smaller batches on GPU, full nv on CPU
-        batch_size_v = 64 if device.type == 'cuda' else nv
-    batch_size_v = max(1, min(batch_size_v, nv))
-
-    logger.info(f'Using batch_size_v = {batch_size_v} (nv = {nv})')
+        # CUDA prefers smaller batches; CPU/MPS can tolerate larger
+        if device.type == "cuda":
+            batch_size_v = 64
+        else:
+            batch_size_v = nv
+    batch_size_v = int(max(1, min(batch_size_v, nv)))
 
     fv_panel = torch.zeros((nv, nf), device=device, dtype=torch.float32)
+
+    # Precompute common shapes
+    f_mat = f_axis.unsqueeze(0)  # (1, nf)
+    x = off_t.unsqueeze(0).unsqueeze(0)  # (1, 1, nrec)
 
     # Phase-shift integration, batched over velocities
     for v_start in range(0, nv, batch_size_v):
@@ -130,17 +142,13 @@ def dispersion_curve(data,
 
         # k = 2π f / v : shapes -> f_axis(1 × nf), v_batch(nv_b × 1)
         # Vectorized phase-shift integration
-        f_mat = f_axis.unsqueeze(0)             # (1 × nf)
         v_mat = v_batch.unsqueeze(1)            # (nv_b × 1)
         k = 2.0 * np.pi * f_mat / v_mat         # (nv_b × nf)
 
         # Phase kernel: exp(i k x); shapes:
         # x: (1, 1, nrec), k: (nv_b, nf, 1) -> kernel: (nv_b, nf, nrec)
-        x = offset.unsqueeze(0).unsqueeze(0)          # (1 × 1 × nrec)
         kernel = torch.exp(1j * k.unsqueeze(-1) * x)  
  
-        logger.debug(f'Velocity batch [{v_start}:{v_end}] -> kernel shape = {kernel.shape}')
-
         # Integrate over receivers: Σ_r kernel[v,f,r] * phase[r,f]
         fv = torch.einsum('vfr,rf->vf', kernel, phase) # (nv_b, nf)
 
@@ -148,23 +156,30 @@ def dispersion_curve(data,
         fv_panel[v_start:v_end, :] = torch.abs(fv)
 
         # Free some temporary tensors (helps on tight GPUs)
-        del kernel, fv, v_batch, f_mat, v_mat, k
-        if device.type == 'cuda':
+        del v_batch, v_mat, k, kernel, fv
+        if empty_cache and device.type == "cuda":
             torch.cuda.empty_cache()
 
     # Optional per-frequency normalization 
     if normalize:
-        logger.debug('Normalizing each frequency slice of f-v panel.')
         max_val = torch.amax(fv_panel, dim=0, keepdim=True)
-        max_val[max_val == 0] = 1.0
+        max_val = torch.where(max_val == 0, torch.ones_like(max_val), max_val)
         fv_panel = fv_panel / max_val
 
-    logger.info('Dispersion image computation completed.')
     return fv_panel, f_axis, v_axis
 
+# =====================================================
 # 2. Dispersion curve extraction (from f–v panel)
-# ================================================================================
-def extr_disp(f_axis, v_axis, fv_panel, f_ref_set=None, vmax_set=None, step=5):
+# =====================================================
+def extr_disp(
+    f_axis: ArrayLike,
+    v_axis: ArrayLike,
+    fv_panel: ArrayLike,
+    *,
+    f_ref_set: Optional[Sequence[float]] = None,
+    vmax_set: Optional[Sequence[float]] = None,
+    step: int = 5,
+    ) -> np.ndarray:
     """
     Extract a dispersion curve from a frequency–velocity image by tracking
     local maxima, following Huajian Yao's MATLAB picking approach.
@@ -172,99 +187,82 @@ def extr_disp(f_axis, v_axis, fv_panel, f_ref_set=None, vmax_set=None, step=5):
     This is a high-level wrapper that chooses between single-start
     (`AutoSearch`) and multi-start (`AutoSearchMultiplePoints`) picking.
 
-    :param f_axis: Frequency axis (Hz), length nf.
-    :type f_axis: numpy.ndarray or torch.Tensor
-    :param v_axis: Velocity axis (m/s), length nv.
-    :type v_axis: numpy.ndarray or torch.Tensor
-    :param fv_panel: Dispersion image, amplitude at each (v, f), shape (nv × nf).
-    :type fv_panel: numpy.ndarray or torch.Tensor
-    :param f_ref_set: List of reference frequencies for starting points.
-    :type f_ref_set: list[float] or None
-    :param vmax_set: List of max allowed velocities at corresponding f_ref_set.
-    :type vmax_set: list[float] or None
-    :param step: Vertical search step (in velocity-index units) for ridge tracking.
-    :type step: int
+    :param f_axis: Frequency axis (nf,).
+    :param v_axis: Velocity axis (nv,).
+    :param fv_panel: Dispersion image (nv, nf).
+    :param f_ref_set: Optional list of reference start frequencies.
+    :param vmax_set: Optional list of max velocities at corresponding f_ref_set.
+    :param step: Vertical search step (velocity-index units).
 
-    :return: 1D array of picked phase velocities vs frequency, shape (nf,).
-    :rtype: numpy.ndarray
+    :return: Picked phase-velocity curve (nf,), numpy array.
     """
-    logger.info('Extracting dispersion curve from f-v panel.')
-
     # Convert to numpy for picking logic 
     f = convert_to_numpy(f_axis)
     v = convert_to_numpy(v_axis)
     disp = convert_to_numpy(fv_panel)
-
+    
     nv, nf = disp.shape
-    if disp.shape != (nv, nf):
-        raise ValueError("'fv_panel' must have shape (nv, nf).")
-
+    if f.shape[0] != nf or v.shape[0] != nv:
+        raise ValueError("Axes mismatch: fv_panel must be (nv, nf) with matching v_axis/f_axis.")
+    
     if f_ref_set is None:
         # Default: start at lowest usable frequency
-        f_ref_set = [f[0]]
-
+        f_ref_set = [float(f[0])]
     if vmax_set is None:
         # Default: allow full velocity range
-        vmax_set = [v[-1]] * len(f_ref_set)
+        vmax_set = [float(v[-1])] * len(f_ref_set)
 
     if len(f_ref_set) != len(vmax_set):
-        raise ValueError("'f_ref_set' and 'vmax_set' must have same length.")
+        raise ValueError("'f_ref_set' and 'vmax_set' must have the same length.")
     
+    step = int(step)
+    if step < 1:
+        raise ValueError("step must be >= 1.")
+
     # Determine starting points (in index space)
-    xpt = []
-    ypt = []
-    for k in range(len(f_ref_set)):
-        f_ref = f_ref_set[k]
-        vmax = vmax_set[k]
+    xpt: List[int] = []
+    ypt: List[int] = []
+
+    for f_ref, vmax in zip(f_ref_set, vmax_set):
 
         # Find closest frequency index ≥ f_ref
-        idx_f = np.where(f >= f_ref)[0]
-        if len(idx_f) == 0:
-            raise ValueError(f'No frequencies >= f_ref = {f_ref} Hz.')
-        idx_f = idx_f[0]
+        idx_f_candidates = np.where(f >= float(f_ref))[0]
+        if idx_f_candidates.size == 0:
+            raise ValueError(f"No frequencies >= f_ref={f_ref} Hz.")
+        idx_f = int(idx_f_candidates[0])
 
-        f_ref_actual = f[idx_f]
         disp_ref = disp[:, idx_f]
 
         # Restrict velocities to v < vmax
-        mask_v = v < vmax
+        mask_v = v < float(vmax)
         if not np.any(mask_v):
-            raise ValueError(f'No velocities < vmax = {vmax} m/s.')
-        v_sub = v[mask_v]
+            raise ValueError(f"No velocities < vmax={vmax} m/s.")
+
         disp_sub = disp_ref[mask_v]
+        v_sub = v[mask_v]
 
         # Find velocity index of maximum energy with the restricted window
-        idx_v_local = np.argmax(disp_sub)
-        v_ref = v_sub[idx_v_local]
+        idx_v_local = int(np.argmax(disp_sub))
+        v_ref = float(v_sub[idx_v_local])
 
         # Convert to full velocity index
-        idx_v = np.abs(v - v_ref).argmin()
+        idx_v = int(np.abs(v - v_ref).argmin())
 
-        ypt.append(idx_v)
         xpt.append(idx_f)
+        ypt.append(idx_v)
 
-        logger.debug(
-            f'Start point {k}: f_ref={f_ref_actual:.3f} Hz, v_ref={v_ref:.1f} m/s '
-            f'(idx_f = {idx_f}, idx_v={idx_v})'
-        )
-    
-    xpt = np.array(xpt, dtype=int)
-    ypt = np.array(ypt, dtype=int)
+    xpt_arr = np.asarray(xpt, dtype=int)
+    ypt_arr = np.asarray(ypt, dtype=int)
 
     # Single-start or multi-start picking
     if len(xpt) == 1:
-        logger.debug('Using single-start AutoSearch for dispersion picking.')
-        arr_pt = AutoSearch(ypt[0], xpt[0], disp, step=step)
-    
+        arr_pt = AutoSearch(int(ypt_arr[0]), int(xpt_arr[0]), disp, step=step)
     else:
-        logger.debug('Using multi-start AutoSearchMultiplePoints for dispersion picking.')
-        arr_pt = AutoSearchMultiplePoints(ypt, xpt, disp, step=step)
+        arr_pt = AutoSearchMultiplePoints(ypt_arr, xpt_arr, disp, step=step)
     
-    voutput = v[arr_pt]
-    logger.info('Dispersion curve extraction completed.')
-    return voutput
+    return v[arr_pt]
 
-def AutoSearch(initial_y, initial_x, image_data, step=5):
+def AutoSearch(initial_y: int, initial_x: int, image_data: np.ndarray, step: int = 5) -> np.ndarray:
     """
     Track a dispersion ridge (local maxima) from a single starting point
     in a 2D f–v image (velocity × frequency).
@@ -273,78 +271,74 @@ def AutoSearch(initial_y, initial_x, image_data, step=5):
     search upward and downward in velocity to find the local maximum.
 
     :param initial_y: Initial velocity index (row index).
-    :type initial_y: int
-
     :param initial_x: Initial frequency index (column index).
-    :type initial_x: int
-
-    :param image_data: f–v image, shape (nv × nf).
-    :type image_data: numpy.ndarray
-
+    :param image_data: 2D image array (nv, nf).
     :param step: Vertical search step (velocity index increment).
-    :type step: int
 
-    :return: Indices of picked velocities for all frequencies, shape (nf,).
-    :rtype: numpy.ndarray
+    :return: Indices of picked velocities for all frequencies (nf,).
     """
-    YSize, XSize = image_data.shape
-    ArrPt = np.zeros(XSize, dtype=int)
+    y_size, x_size = image_data.shape
+    arr_pt = np.zeros(x_size, dtype=int)
 
     # 1. Scan upward in frequency (from initial_x to high frequencies)
-    current_y = initial_y
-    for i in range(initial_x, XSize):
+    current_y = int(initial_y)
+    for i in range(int(initial_x), x_size):
         point_left = current_y
         point_right = current_y
-        # search upward (toward smaller velocity index)
+
         while True:
-            point_left_new = max(0, point_left - step)
-            if image_data[point_left, i] < image_data[point_left_new, i]:
-                point_left = point_left_new
+            new_left = max(0, point_left - step)
+            if image_data[point_left, i] < image_data[new_left, i]:
+                point_left = new_left
             else:
-                point_left = point_left_new
+                point_left = new_left
                 break
+
         # search downward (toward larger velocity index)
         while True:
-            point_right_new = min(point_right + step, YSize - 1)
-            if image_data[point_right, i] < image_data[point_right_new, i]:
-                point_right = point_right_new
+            new_right = min(point_right + step, y_size - 1)
+            if image_data[point_right, i] < image_data[new_right, i]:
+                point_right = new_right
             else:
-                point_right = point_right_new
+                point_right = new_right
                 break
 
-        idx_local = np.argmax(image_data[point_left:point_right + 1, i])
-        ArrPt[i] = idx_local + point_left
-        current_y = ArrPt[i]
+        idx_local = int(np.argmax(image_data[point_left : point_right + 1, i]))
+        arr_pt[i] = idx_local + point_left
+        current_y = int(arr_pt[i])
 
     # 2. Scan downward in frequency (from initial_x back to low frequencies)
-    current_y = ArrPt[initial_x]
-    for i in range(initial_x - 1, -1, -1):
+    current_y = int(arr_pt[int(initial_x)])
+    for i in range(int(initial_x) - 1, -1, -1):
         point_left = current_y
         point_right = current_y
-        # search upward
+
         while True:
-            point_left_new = max(0, point_left - step)
-            if image_data[point_left, i] < image_data[point_left_new, i]:
-                point_left = point_left_new
+            new_left = max(0, point_left - step)
+            if image_data[point_left, i] < image_data[new_left, i]:
+                point_left = new_left
             else:
-                point_left = point_left_new
+                point_left = new_left
                 break
+
         # search downward
         while True:
-            point_right_new = min(point_right + step, YSize - 1)
-            if image_data[point_right, i] < image_data[point_right_new, i]:
-                point_right = point_right_new
+            new_right = min(point_right + step, y_size - 1)
+            if image_data[point_right, i] < image_data[new_right, i]:
+                point_right = new_right
             else:
-                point_right = point_right_new
+                point_right = new_right
                 break
 
-        idx_local = np.argmax(image_data[point_left:point_right + 1, i])
-        ArrPt[i] = idx_local + point_left
-        current_y = ArrPt[i]
+        idx_local = int(np.argmax(image_data[point_left : point_right + 1, i]))
+        arr_pt[i] = idx_local + point_left
+        current_y = int(arr_pt[i])
 
-    return ArrPt
+    return arr_pt
 
-def AutoSearchMultiplePoints(ptY, ptX, image_data, step=5):
+def AutoSearchMultiplePoints(
+    ptY: np.ndarray, ptX: np.ndarray, image_data: np.ndarray, step: int = 5
+    ) -> np.ndarray:
     """
     Track a dispersion ridge from multiple starting points in an f–v image,
     allowing extraction of more complex or multi-branch dispersion patterns.
@@ -352,255 +346,145 @@ def AutoSearchMultiplePoints(ptY, ptX, image_data, step=5):
     This generalizes AutoSearch by stitching together segments from
     several user-defined starting points.
 
-    :param ptY: Array of initial velocity indices (row indices).
-    :type ptY: numpy.ndarray
+    :param ptY: Initial velocity indices (npt,).
+    :param ptX: Initial frequency indices (npt,).
+    :param image_data: 2D image array (nv, nf).
+    :param step: Vertical search step.
 
-    :param ptX: Array of initial frequency indices (column indices).
-    :type ptX: numpy.ndarray
-
-    :param image_data: f–v image, shape (nv × nf).
-    :type image_data: numpy.ndarray
-
-    :param step: Vertical search step (velocity index increment).
-    :type step: int
-
-    :return: Indices of picked velocities for all frequencies, shape (nf,).
-    :rtype: numpy.ndarray
+    :return: Indices of picked velocities for all frequencies (nf,).
     """
     ptY = np.asarray(ptY, dtype=int)
     ptX = np.asarray(ptX, dtype=int)
 
-    nPt = len(ptX)
-    if nPt == 0:
-        raise ValueError('ptX/ptY must contain at least one point.')
+    n_pt = int(len(ptX))
+    if n_pt < 1:
+        raise ValueError("ptX/ptY must contain at least one point.")
     
     # Sort points by frequency index
     order = np.argsort(ptX)
     ptX = ptX[order]
     ptY = ptY[order]
 
-    YSize, XSize = image_data.shape
-    ArrPt = np.zeros(XSize, dtype=int)
+    y_size, x_size = image_data.shape
+    arr_pt = np.zeros(x_size, dtype=int)
 
     # 1. Scan from highest starting frequency to higher frequencies
-    initial_x = ptX[-1]
-    initial_y = ptY[-1]
-    current_y = initial_y
-    for i in range(initial_x, XSize):
+    initial_x = int(ptX[-1])
+    current_y = int(ptY[-1])
+    for i in range(initial_x, x_size):
         point_left = current_y
         point_right = current_y
+
         # Up
         while True:
-            point_left_new = max(0, point_left - step)
-            if image_data[point_left, i] < image_data[point_left_new, i]:
-                point_left = point_left_new
+            new_left = max(0, point_left - step)
+            if image_data[point_left, i] < image_data[new_left, i]:
+                point_left = new_left
             else:
-                point_left = point_left_new
+                point_left = new_left
                 break
+
         # Down
         while True:
-            point_right_new = min(point_right + step, YSize - 1)
-            if image_data[point_right, i] < image_data[point_right_new, i]:
-                point_right = point_right_new
+            new_right = min(point_right + step, y_size - 1)
+            if image_data[point_right, i] < image_data[new_right, i]:
+                point_right = new_right
             else:
-                point_right = point_right_new
+                point_right = new_right
                 break
         
-        idx_local = np.argmax(image_data[point_left:point_right + 1, i])
-        ArrPt[i] = idx_local + point_left
-        current_y = ArrPt[i]
+        idx_local = int(np.argmax(image_data[point_left : point_right + 1, i]))
+        arr_pt[i] = idx_local + point_left
+        current_y = int(arr_pt[i])
 
     # 2. Scan toward lower frequencies, stitching through intermediate points
-    initial_x = ptX[-1]
-    current_y = ArrPt[initial_x]
-    mid_idx = nPt - 2
-    if mid_idx >= 0:
-        midX = ptX[mid_idx]
-        midY = ptY[mid_idx]
-    else:
-        midX = ptX[0]
-        midY = ptY[0]
-
+    current_y = int(arr_pt[initial_x])
     kk = 0
+    mid_idx = n_pt - 2
+    midX = int(ptX[mid_idx]) if mid_idx >= 0 else int(ptX[0])
+    midY = int(ptY[mid_idx]) if mid_idx >= 0 else int(ptY[0])
+
     for i in range(initial_x, -1, -1):
         if i == midX:
             current_y = midY
             kk += 1
-            if (nPt - kk) > 1:
-                midX = ptX[nPt - kk - 2]
-                midY = ptY[nPt - kk - 2]
+            if (n_pt - kk) > 1:
+                midX = int(ptX[n_pt - kk - 2])
+                midY = int(ptY[n_pt - kk - 2])
 
         point_left = current_y
         point_right = current_y
 
         # Up
         while True:
-            point_left_new = max(0, point_left - step)
-            if image_data[point_left, i] < image_data[point_left_new, i]:
-                point_left = point_left_new
+            new_left = max(0, point_left - step)
+            if image_data[point_left, i] < image_data[new_left, i]:
+                point_left = new_left
             else:
-                point_left = point_left_new
+                point_left = new_left
                 break
 
         # Down
         while True:
-            point_right_new = min(point_right + step, YSize - 1)
-            if image_data[point_right, i] < image_data[point_right_new, i]:
-                point_right = point_right_new
+            new_right = min(point_right + step, y_size - 1)
+            if image_data[point_right, i] < image_data[new_right, i]:
+                point_right = new_right
             else:
-                point_right = point_right_new
+                point_right = new_right
                 break
 
-        idx_local = np.argmax(image_data[point_left:point_right + 1, i])
-        ArrPt[i] = idx_local + point_left
-        current_y = ArrPt[i]
+        idx_local = int(np.argmax(image_data[point_left : point_right + 1, i]))
+        arr_pt[i] = idx_local + point_left
+        current_y = int(arr_pt[i])
     
-    return ArrPt
+    return arr_pt
 
+# =====================================================
 # 3. Compute dispersion directly from NCF matrix
-# ================================================================================
-def compute_dispersion_from_ncf(ncf, fs, dx=8.16, **kwargs):
+# =====================================================
+@torch.no_grad()
+def compute_dispersion_from_ncf(
+    ncf: ArrayLike,
+    *,
+    fs: float,
+    dx: float = 8.16,
+    fv_kwargs: Optional[Dict[str, Any]] = None,
+    pick_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[np.ndarray]]:
     """
-    Compute the dispersion image and picked curve directly from a single
-    NCF (noise cross-correlation) matrix.
+    Build offset + time vectors from an NCF and compute:
+      - f–v panel
+      - optional picks (if pick_kwargs provided)
 
-    This is a convenience wrapper that builds the offset and time axes
-    from the NCF geometry and then calls :func:`dispersion_curve` and
-    :func:`extr_disp`.
+    :param ncf: NCF matrix (nrec, nlag), symmetric around zero lag.
+    :param fs: Sampling rate (Hz).
+    :param dx: Channel spacing (m).
+    :param fv_kwargs: kwargs forwarded to dispersion_curve().
+    :param pick_kwargs: kwargs forwarded to extr_disp(); if None -> no picking.
 
-    :param ncf: Cross-correlation matrix with shape (nrec, nlag), where
-                ``nrec`` is the number of channels and ``nlag`` is the
-                number of lag samples (symmetric around zero lag).
-    :type ncf: numpy.ndarray or torch.Tensor
-    :param fs: Sampling rate (Hz) of the original time series.
-    :type fs: float
-    :param dx: Channel spacing in meters (receiver spacing along the fiber).
-    :type dx: float
-    :param kwargs: Additional keyword arguments forwarded to
-                   :func:`dispersion_curve` (e.g., ``vmin``, ``vmax``,
-                   ``dv``, ``fmin``, ``fmax``, ``device``, etc.).
-    :type kwargs: dict
-
-    :return: Tuple ``(fv_panel, f_axis, v_axis, picks)`` where
-             - ``fv_panel`` is the dispersion image (nv, nf),
-             - ``f_axis`` is the frequency axis (Hz),
-             - ``v_axis`` is the velocity axis (m/s),
-             - ``picks`` is the picked phase-velocity curve (nf,).
-    :rtype: tuple[torch.Tensor, torch.Tensor, torch.Tensor, numpy.ndarray]
+    :return: (fv_panel, f_axis, v_axis, picks_or_None)
     """
     ncf_arr = convert_to_numpy(ncf)
     if ncf_arr.ndim != 2:
-        raise ValueError("'ncf' must be 2D with shape (nrec, nlag).")
+        raise ValueError("'ncf' must be 2D (nrec, nlag).")
     
     nrec, nlag = ncf_arr.shape
-    logger.info(f'Computing dispersion from NCF: nrec={nrec}, nlag={nlag}, fs={fs}, dx={dx}')
 
     # Build offset vector
     offset = np.arange(nrec, dtype=float) * float(dx)
 
-    # Build symmetric time vector centered at zero lag
+    # Build symmetric time vector centered at zero lag; assume nlag is odd and centered
     max_lag = (nlag - 1) // 2
-    t = np.linspace(-max_lag / fs, max_lag / fs, nlag, dtype=float)
+    t = np.linspace(-max_lag / float(fs), max_lag / float(fs), nlag, dtype=float)
 
     # Compute dispersion
-    fv_panel, f_axis, v_axis = dispersion_curve(data=ncf_arr, offset=offset, t=t, **kwargs)
+    fv_kwargs = fv_kwargs or {}
+    fv_panel, f_axis, v_axis = dispersion_curve(
+        data=ncf_arr, offset=offset, t=t, **fv_kwargs)
 
     # Pick fundamental dispersion curve
-    picks = extr_disp(f_axis, v_axis, fv_panel)
+    picks = None
+    if pick_kwargs is not None:
+        picks = extr_disp(f_axis, v_axis, fv_panel, **pick_kwargs)
 
     return fv_panel, f_axis, v_axis, picks
-
-# 4. Load NCF file, compute dispersion, and save results
-# ================================================================================
-def load_ncf_and_compute_dispersion(ncf_path, 
-                                    dx=8.16, 
-                                    stack_window='daily', # 'daily', '7d', '15d', '30d'
-                                    results_root='results/dispersion', 
-                                    fs=250, 
-                                    **disp_kwargs):
-    """
-    Load an NCF file from disk, compute the dispersion image and picked
-    dispersion curve, and save all outputs to disk.
-
-    The outputs are saved under::
-
-        <results_root>/<stack_window>/
-
-    with filenames derived from the input ``ncf_path`` base name.
-
-    Files generated:
-
-    - ``<base>_fv_panel.npy``  : dispersion image (nv, nf)
-    - ``<base>_f_axis.npy``    : frequency axis (nf,)
-    - ``<base>_v_axis.npy``    : velocity axis (nv,)
-    - ``<base>_pick.npy``      : picked dispersion curve (nf,)
-    - ``<base>_meta.json``     : metadata (paths, shapes, parameters)
-
-    :param ncf_path: Path to the input NCF file (.npy) of shape (nrec, nlag).
-    :type ncf_path: str
-    :param dx: Channel spacing in meters (receiver spacing along the fiber).
-    :type dx: float
-    :param stack_window: Label of stack window used for this NCF, e.g.
-                         ``'daily'``, ``'7d'``, ``'15d'``, ``'30d'``.
-                         Only used for organizing output directories.
-    :type stack_window: str
-    :param results_root: Root directory where dispersion results will be
-                         stored. Outputs are placed in a subdirectory
-                         ``results_root/stack_window/``.
-    :type results_root: str
-    :param fs: Sampling rate (Hz) of the original time series.
-    :type fs: float
-    :param disp_kwargs: Additional keyword arguments forwarded to
-                        :func:`compute_dispersion_from_ncf`, and then
-                        to :func:`dispersion_curve`.
-    :type disp_kwargs: dict
-
-    :return: Dictionary containing in-memory results and output directory:
-             ``{'fv_panel', 'f_axis', 'v_axis', 'picks', 'outdir'}``.
-    :rtype: dict
-    """
-    logger.info(
-        f'Loading NCF from {ncf_path} for dispersion analysis '
-        f'(stack_window={stack_window}, dx={dx}, fs={fs})'
-    )
-
-    ncf = np.load(ncf_path)
-
-    fv_panel, f_axis, v_axis, picks = compute_dispersion_from_ncf(ncf=ncf, fs=fs, dx=dx, **disp_kwargs)
-
-    # Prepare output directory
-    outdir = os.path.join(results_root, stack_window)
-    os.makedirs(outdir, exist_ok=True)
-
-    # Base name without extension
-    base = os.path.basename(ncf_path).replace('.npy', '')
-
-    # Save arrays
-    np.save(os.path.join(outdir, f'{base}_fv_panel.npy'), convert_to_numpy(fv_panel))
-    np.save(os.path.join(outdir, f'{base}_f_axis.npy'), convert_to_numpy(f_axis))
-    np.save(os.path.join(outdir, f'{base}_v_axis.npy'), convert_to_numpy(v_axis))
-    np.save(os.path.join(outdir, f'{base}_pick.npy'), picks)
-
-    # Metadata
-    meta = {
-        'ncf_path': os.path.abspath(ncf_path),
-        'dx': float(dx),
-        'stack_window': stack_window,
-        'shape_ncf': list(ncf.shape),
-        'shape_fv_panel': list(convert_to_numpy(fv_panel).shape),
-        'fs': float(fs),
-        'dispersion_kwargs': {k: repr(v) for k, v in disp_kwargs.items()},
-    }
-    meta_path = os.path.join(outdir, f'{base}_meta.json')
-    with open(meta_path, 'w') as f:
-        json.dump(meta, f, indent=4)
-
-    logger.info(f'Saved dispersion results → {outdir}')
-
-    return {
-        'fv_panel': fv_panel,
-        'f_axis': f_axis,
-        'v_axis': v_axis,
-        'picks': picks,
-        'outdir': outdir
-    }

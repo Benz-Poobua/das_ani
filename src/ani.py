@@ -7,103 +7,82 @@
 :purpose: DAS preprocessing (Bensen et al., 2007) + GPU-accelerated cross-correlation.
 :reference: Modified from Yan Yang (2022-07-10).
 """
-import re
-import os
-import torch
+from __future__ import annotations
+
 import logging
+import torch
 import numpy as np
-from torch import nn
 import scipy.signal as signal
-from tqdm import tqdm
-from scipy.signal import butter, filtfilt, convolve, detrend
-from src.utils import convert_to_numpy, convert_to_tensor, nextpow2, write_runlog, check_existing_output 
+
+from scipy.signal import butter, convolve, detrend, filtfilt
+from torch import nn
+from typing import Optional
+
+from src.utils import convert_to_numpy, convert_to_tensor, nextpow2
 
 logger = logging.getLogger(__name__)
 
-def bandpass_filter_tukey(data, fs, f1, f2, alpha=0.05):
+# ==============================================================
+# 1. Preprocessing utilities (numpy)
+# ==============================================================
+def bandpass_filter_tukey(
+    data: np.ndarray,
+    fs: float,
+    f1: float,
+    f2: float,
+    alpha: float = 0.05,
+    order: int = 4,
+    ) -> np.ndarray:
     """
-    Apply a Tukey-windowed bandpass filter to DAS data.
+    Tukey-taper + Butterworth bandpass along time axis.
 
-    :param data: 2D DAS array with shape (n_channels, n_samples)
-    :type data: numpy.ndarray
-    :param fs: sampling frequency in Hz
-    :type fs: float
-    :param f1: low-cut frequency in Hz
-    :type f1: float
-    :param f2: high-cut frequency in Hz
-    :type f2: float
-    :param alpha: Tukey window taper parameter (0–1), defaults to 0.05
-    :type alpha: float, optional
-
-    :return: filtered DAS array with same shape as input
-    :rtype: numpy.ndarray
-    """
-    # Input validation 
-    logger.debug(f'bandpass_filter_tukey(data.shape={data.shape}, fs={fs}, '
-                 f'f1={f1}, f2={f2}, alpha={alpha})')
-
+    :param data: 2D array (nch × nt).
+    :param fs: Sampling rate (Hz).
+    :param f1: Low-cut (Hz).
+    :param f2: High-cut (Hz).
+    :param alpha: Tukey window alpha in [0, 1].
+    :param order: Butterworth filter order.
+    :return: Filtered array float32 (nch × nt).
+    """ 
     if data.ndim != 2:
-        raise ValueError('bandpass_filter_tukey: data must be 2D.')
+        raise ValueError("bandpass_filter_tukey: data must be 2D (nch × nt).")
     
-    nyq = fs / 2
-    if not (0 < f1 < f2 < nyq):
-        raise ValueError('Invalid f1/f2: must satisfy 0 < f1 < f2 < Nyquist.')
+    nyq = fs / 2.0
+    if not (0.0 < f1 < f2 < nyq):
+        raise ValueError(f"Invalid f1/f2: require 0 < f1 < f2 < Nyquist={nyq}.")
     
     # Create Tukey window
-    n_samples = data.shape[1]
-    window = signal.windows.tukey(n_samples, alpha=alpha)
-    logger.debug(f'Tukey window generated (alpha={alpha}, length={n_samples})')
+    nt = int(data.shape[1])
+    window = signal.windows.tukey(nt, alpha=float(alpha))
 
-    # Butterworth bandpass filter
-    low = f1 / nyq 
+    low = f1 / nyq
     high = f2 / nyq
-    b, a = butter(4, [low, high], btype='bandpass')
-    logger.debug(f'Butterworth filter designed: order=4, low={low}, high={high}')
+    b, a = butter(int(order), [low, high], btype="bandpass")
 
-    # Apply tapered bandpass
-    try:
-        tapered = data * window     # broadcast over channels
-        filtered = filtfilt(b, a, tapered, axis=1)
-        logger.info(
-            f'Filtering completed: shape={filtered.shape}, '
-            f'band=[{f1}-{f2}] Hz'
-        )
+    # Broadcast Tukey window across channels
+    tapered = data * window
+    filtered = filtfilt(b, a, tapered, axis=1)
 
-    except Exception as e:
-        logger.error(f'Filtering failed: {e}')
-        raise
+    return filtered.astype(np.float32, copy=False)
 
-    return filtered.astype(np.float32)
-
-def running_absolute_mean(trace, nwin):
+def running_absolute_mean(trace: np.ndarray, nwin: int) -> np.ndarray:
     """
-    Compute a running absolute mean (RAM) of a 1D trace and return the trace
-    normalized by its RAM.
+    Running absolute mean (RAM) normalization for a 1D trace.
 
-    Padding strategy follows the NoisePy approach:
-    - The absolute trace is padded on both sides by repeating the first and 
-      last absolute values to avoid convolution edge effects.
-
-    :param trace: Input 1D time series.
-    :type trace: numpy.ndarray
-    :param nwin: Window length (in samples) for the moving average.
-    :type nwin: int
-
-    :return: Trace normalized by running absolute mean.
-    :rtype: numpy.ndarray
+    :param trace: 1D array (nt,).
+    :param nwin: Window length in samples (>1).
+    :return: RAM-normalized trace (nt,).
     """
     if trace.ndim != 1:
-        raise ValueError("Input 'trace' must be a 1D array.")
-    
+        raise ValueError("running_absolute_mean: 'trace' must be 1D.")
     if nwin <= 1:
-        logger.warning('nwin <= 1; returning original trace.') 
         return trace.copy()
     
-    npts = len(trace)
+    npts = int(trace.size)
     abs_trace = np.abs(trace)
 
     # Prepare padded array: length = npts + 2*nwin
-    padded = np.zeros(npts + 2 * nwin, dtype=trace.dtype)
+    padded = np.empty(npts + 2 * nwin, dtype=trace.dtype)
 
     # Insert the central region
     padded[nwin:-nwin] = abs_trace
@@ -113,118 +92,98 @@ def running_absolute_mean(trace, nwin):
     padded[-nwin:] = abs_trace[-1]
 
     # Moving average kernel 
-    kernel = np.ones(nwin) / nwin
+    kernel = np.ones(int(nwin), dtype=np.float64) / float(nwin)
 
     # Convolve and remove padding
-    ram = convolve(padded, kernel, mode='same')[nwin:-nwin]
+    ram = convolve(padded, kernel, mode="same")[nwin:-nwin]
 
-    # Handle zeros to avoid division issues
+    # Avoid division by zero
     ram = np.where(ram == 0, np.nan, ram)
 
     return np.nan_to_num(trace / ram, nan=0.0)
 
-def temporal_normalization(data, fs, window_time):
+def temporal_normalization(data: np.ndarray, fs: float, window_time: float) -> np.ndarray:
     """
-    Apply temporal normalization to multichannel data using either:
-    
-    - **One-bit normalization** (if ``window_time == 0``)
-    - **Running absolute mean (RAM) normalization** (if ``window_time > 0``)
+    Temporal normalization:
 
-    :param data: Multichannel time series array of shape (n_channels, n_samples).
-    :type data: numpy.ndarray
-    :param fs: Sampling frequency (Hz).
-    :type fs: float
-    :param window_time: Running window duration in seconds.  
-                        - If 0 → performs one-bit normalization.  
-                        - Recommended RAM window: ~½ of the longest period.
-    :type window_time: float
+    - window_time == 0 -> one-bit normalization (sign)
+    - window_time > 0  -> RAM normalization with window_time seconds
 
-    :return: Normalized data with the same shape as input.
-    :rtype: numpy.ndarray
+    :param data: 2D array (nch × nt).
+    :param fs: Sampling rate (Hz).
+    :param window_time: Window duration (s); 0 means one-bit.
+    :return: Normalized array (nch × nt).
     """
     if data.ndim != 2:
-        raise ValueError("Input 'data' must be 2D with shape (n_channels, n_samples).")
+        raise ValueError("temporal_normalization: data must be 2D (nch × nt).")
     
-    nch, npts = data.shape
-
-    # One-Bit Normalization 
-    if window_time == 0:
-        logger.info('Applying one-bit normalization.')
-        return np.sign(data)
+    # One-Bit Normalization
+    if float(window_time) == 0.0:
+        logger.info("Applying one-bit normalization.")
+        return np.sign(data).astype(np.float32, copy=False)
     
     # Running Absolute Mean (RAM) Normalization
-    nwin = int(fs * window_time)
+    nwin = int(round(fs * float(window_time)))
     if nwin < 1:
-        logger.warning(f'Computed nwin={nwin}. Forcing nwin=1.')
         nwin = 1
-
-    logger.info(f'Applying RAM normalization: window={window_time}s ({nwin} samples).')
+    logger.info("Applying RAM normalization: window=%.3fs (%d samples).", window_time, nwin)
 
     out = data.copy()
-    for i in range(nch):
+    for i in range(out.shape[0]):
         out[i, :] = running_absolute_mean(out[i, :], nwin)
 
-    return out
+    return out.astype(np.float32, copy=False)
 
-def spectral_whitening(rfftdata, df, window_freq, f1, f2):
+# ==============================================================
+# 2. Spectral whitening (torch)
+# ==============================================================
+def spectral_whitening(
+    rfftdata: torch.Tensor,
+    df: float,
+    window_freq: float,
+    f1: float,
+    f2: float,
+    ) -> torch.Tensor:
     """
-    GPU-accelerated spectral whitening. Supports two modes:
+    Spectral whitening on complex rFFT data (nch × nfreq).
 
-    - **Phase-only whitening** (if ``window_freq == 0``)  
-      → Keeps only phase, sets amplitude to 1.
+    Modes:
+    - window_freq == 0 : phase-only whitening (amp -> 1)
+    - window_freq > 0  : RAM smoothing of amplitude in frequency domain via conv1d
 
-    - **Running Absolute Mean (RAM) spectral whitening** (if ``window_freq > 0``)  
-      → Smooths amplitude using a moving window in the frequency domain.
+    Applies cosine taper outside [f1, f2].
 
-    Additionally, a cosine taper is applied outside the [f1, f2] passband.
-
-    :param rfftdata: Complex frequency-domain tensor of shape (nch, nfreq)
-                     Must already be on GPU (CUDA or MPS).
-    :type rfftdata: torch.Tensor
-    :param df: Frequency bin spacing (Hz)
-    :type df: float
-    :param window_freq: RAM window length (Hz). If 0 → phase-only whitening.
-    :type window_freq: float
-    :param f1: Low-cut frequency (Hz)
-    :type f1: float
-    :param f2: High-cut frequency (Hz)
-    :type f2: float
-    :return: Whitened spectra, same shape as input
-    :rtype: torch.Tensor
+    :param rfftdata: Complex tensor (nch × nfreq).
+    :param df: Frequency bin spacing (Hz).
+    :param window_freq: RAM window (Hz). 0 => phase-only.
+    :param f1: Low-cut (Hz).
+    :param f2: High-cut (Hz).
+    :return: Whitened rFFT tensor (nch × nfreq).
     """
-    if not torch.is_tensor(rfftdata):
-        raise TypeError('rfftdata must be a torch.Tensor.')
-    
+    if not isinstance(rfftdata, torch.Tensor):
+        raise TypeError("spectral_whitening: rfftdata must be torch.Tensor.")
     if not rfftdata.is_complex():
-        raise ValueError('rfftdata must be a complex-valued tensor.')
+        raise ValueError("spectral_whitening: rfftdata must be complex.")
 
     device = rfftdata.device
-    nch, nfreq = rfftdata.shape
+    nch, nfreq = int(rfftdata.shape[0]), int(rfftdata.shape[1])
 
     # Compute freq indices
-    idxf1 = int(f1 / df)
-    idxf2 = int(torch.ceil(torch.tensor(f2/df, device=device)).item())  
+    idxf1 = int(f1 / df) if df > 0 else 0
+    idxf2 = int(torch.ceil(torch.tensor(f2 / df, device=device)).item()) if df > 0 else nfreq  
 
     # Clip to array bounds
     idxf1 = max(0, min(idxf1, nfreq - 1))
     idxf2 = max(0, min(idxf2, nfreq))
 
-    if idxf1 < 0 or idxf2 > nfreq:
-        raise ValueError('f1 or f2 exceed available frequency bins.')
-    
-    mode = 'phase-only' if window_freq == 0 else 'RAM'
-    logger.info(
-        f'Spectral whitening ({mode}) | f1={f1}Hz f2={f2}Hz window={window_freq}Hz'
-    )
+    mode = "phase-only" if float(window_freq) == 0.0 else "RAM"
+    logger.info("Spectral whitening (%s) | f1=%.3fHz f2=%.3fHz window=%.3fHz", mode, f1, f2, window_freq)
 
-    # 1. Phase-only Whitening
-    # ========================================
-    if window_freq == 0:
-        phases = torch.angle(rfftdata)
-        return torch.exp(1j * phases)
+    # 1. Phase-only
+    if float(window_freq) == 0.0:
+        return torch.exp(1j * torch.angle(rfftdata))
     
-    # 2. Running Absolute Mean (RAM)
-    # ========================================
+    # 2. RAM amplitude smoothing
     nwin = max(int(window_freq / df), 1)
 
     # Ensure nwin is odd so conv1d output = input length
@@ -232,191 +191,167 @@ def spectral_whitening(rfftdata, df, window_freq, f1, f2):
         nwin += 1
 
     amp = torch.abs(rfftdata)       # (nch, nfreq)
-    phases = torch.angle(rfftdata)
+    phase = torch.angle(rfftdata)   # (nch, nfreq)
 
     # Running mean with 1D convolution (GPU)
     # conv1d expects shape (batch, channels, length)
     amp_3d = amp.unsqueeze(1)       # (nch, 1, nfreq)
 
-    kernel = torch.ones((1, 1, nwin), device=device) / nwin 
+    kernel = torch.ones((1, 1, nwin), device=device, dtype=amp.dtype) / float(nwin) 
 
     # Padding to maintain same length
     pad = nwin // 2
-    amp_smooth = torch.nn.functional.conv1d(
-        amp_3d, 
-        kernel, 
-        padding=pad
-    ).squeeze(1)                    # (nch, nfreq or nfreq+1)
 
-    # Force shape match: crop or pad as needed
-    if amp_smooth.size(-1) > amp.size(-1):
-        amp_smooth = amp_smooth[..., :amp.size(-1)]
-    elif amp_smooth.size(-1) < amp.size(-1):
-        pad_amount = amp.size(-1) - amp_smooth.size(-1)
-        amp_smooth = torch.nn.functional.pad(amp_smooth, (0, pad_amount), mode='replicate')
+    amp_smooth = torch.nn.functional.conv1d(amp_3d, kernel, padding=pad).squeeze(1)
 
-    # Recompute nfreq after convolution 
-    nfreq = amp_smooth.shape[-1]
+    # Force shape match (conv padding can create off-by-one depending on backend)
+    if amp_smooth.shape[-1] > amp.shape[-1]:
+        amp_smooth = amp_smooth[..., : amp.shape[-1]]
+    elif amp_smooth.shape[-1] < amp.shape[-1]:
+        amp_smooth = torch.nn.functional.pad(amp_smooth, (0, amp.shape[-1] - amp_smooth.shape[-1]), mode="replicate")
 
-    # Reclip idxf1/idxf2 to new nfreq
-    idxf1 = min(idxf1, nfreq - 1)
-    idxf2 = min(idxf2, nfreq)
+    amp_smooth = torch.where(amp_smooth == 0, torch.ones_like(amp_smooth), amp_smooth)
 
-    # Avoid division by zero
-    amp_smooth = torch.where(amp_smooth == 0, torch.tensor(1.0, device=device), amp_smooth)
-
-    # Rebuild whitened spectrum 
-    rfftdata = torch.exp(1j * phases) * (amp / amp_smooth)
+    rfft_out = torch.exp(1j * phase) * (amp / amp_smooth)
 
     # 3. Cosine Taper outside [f1, f2] 
-    # ========================================
     if idxf1 > 0:
-        taper1 = torch.cos(
-            torch.linspace(torch.pi/2, torch.pi, idxf1, device=device)
-        ) ** 2 
-        rfftdata[:, :idxf1] *= taper1
+        taper1 = torch.cos(torch.linspace(torch.pi / 2, torch.pi, idxf1, device=device)) ** 2
+        rfft_out[:, :idxf1] *= taper1
 
     if idxf2 < nfreq:
-        taper2 = torch.cos(
-            torch.linspace(torch.pi, torch.pi/2, nfreq - idxf2, device=device)
-        ) ** 2 
-        rfftdata[:, idxf2:] *= taper2
+        taper2 = torch.cos(torch.linspace(torch.pi, torch.pi / 2, nfreq - idxf2, device=device)) ** 2
+        rfft_out[:, idxf2:] *= taper2
 
-    return rfftdata
+    return rfft_out
 
-def preprocess(x, fs_raw, f1, f2, decimation, diff, ram_win):
+# ==============================================================
+# 3. Full preprocessing pipeline
+# ==============================================================
+def preprocess(
+    x: np.ndarray | torch.Tensor,
+    fs_raw: float,
+    f1: float,
+    f2: float,
+    decimation: int,
+    diff: bool,
+    ram_win: float,
+    ) -> np.ndarray | torch.Tensor:
     """
-    Preprocess a single DAS data chunk following the ambient noise workflow:
-    differentiation → detrend → bandpass filter → decimation → 
-    temporal normalization.
+    Ambient-noise preprocessing:
+      diff (optional) -> detrend -> bandpass (Tukey+Butter) -> decimate ->
+      remove median offset -> temporal normalization (one-bit/RAM)
 
-    :param x: Input DAS array of shape (n_channels × n_samples).
-    :type x: numpy.ndarray or torch.Tensor
-    :param fs_raw: Original sampling frequency (Hz).
-    :type fs_raw: float
-    :param f1: Low-cut frequency for bandpass filter (Hz).
-    :type f1: float
-    :param f2: High-cut frequency for bandpass filter (Hz).
-    :type f2: float
-    :param decimation: Decimation factor (integer > 0).
-    :type decimation: int
-    :param diff: Whether to take time derivative (∂/∂t).
-    :type diff: bool
-    :param ram_win: Window length (seconds) for running-absolute-mean
-                    temporal normalization. If 0 → one-bit normalization.
-    :type ram_win: float
+    Preserves input type: numpy in -> numpy out; torch in -> torch out (same device).
 
-    :return: Preprocessed DAS array (float32) with shape 
-             (n_channels × n_samples/decimation).
-    :rtype: numpy.ndarray
+    :param x: Input (nch × nt).
+    :param fs_raw: Sampling rate (Hz).
+    :param f1: Bandpass low-cut (Hz).
+    :param f2: Bandpass high-cut (Hz).
+    :param decimation: Decimation factor (>=1).
+    :param diff: If True, time-derivative (np.gradient * fs_raw).
+    :param ram_win: RAM window in seconds; 0 => one-bit.
+    :return: Preprocessed data, float32.
     """
+    if decimation < 1:
+        raise ValueError("preprocess: decimation must be >= 1.")
+    
+    is_tensor = isinstance(x, torch.Tensor)
+    orig_device: Optional[torch.device] = x.device if is_tensor else None
+
+    x_np = convert_to_numpy(x) if is_tensor else np.asarray(x)
+    
+    if x_np.ndim != 2:
+        raise ValueError(f"preprocess: expected 2D (nch × nt); got shape={x_np.shape}")
+
     logger.info(
-        f'Preprocess | shape={x.shape} | fs={fs_raw}Hz | '
-        f'band=[{f1}, {f2}] Hz | decim={decimation} | '
-        f'diff={diff} | RAM={ram_win}s'
-    )
+        "Preprocess | shape=%s | fs=%.2fHz | band=[%.2f, %.2f]Hz | decim=%d | diff=%s | RAM=%.3fs",
+        x_np.shape,
+        fs_raw,
+        f1,
+        f2,
+        decimation,
+        diff,
+        ram_win,
+        )
 
-    # Track initial type to decide final output type
-    is_tensor = torch.is_tensor(x)
-    orig_device = x.device if is_tensor else None
-
-    if is_tensor:
-        logger.debug('Input is torch.Tensor → converting to numpy')
-        x = convert_to_numpy(x) 
-
-    # 1. Differentiation
-    # ========================================
+    # 1. Differentiation (optional)
     if diff:
-        logger.debug('Applying time derivative (np.gradient)')
-        x = np.gradient(x, axis=-1) * fs_raw
+        x_np = np.gradient(x_np, axis=-1) * float(fs_raw)
 
     # 2. Detrend
-    # ========================================
-    logger.debug('Detrending time series')
-    x = detrend(x, axis=-1)
+    x_np = detrend(x_np, axis=-1)
 
     # 3. Bandpass filter (Butterworth + Tukey taper)
-    # ========================================
-    logger.debug(f'Applying bandpass filter: {f1}-{f2} Hz')
-    x = bandpass_filter_tukey(x, fs_raw, f1, f2)
+    x_np = bandpass_filter_tukey(x_np, fs_raw, f1, f2)
 
     # 4. Decimation
-    # ========================================
     if decimation > 1:
-        logger.debug(f'Decimation by factor {decimation}')
-        x = x[:, ::decimation]
+        x_np = x_np[:, :: int(decimation)]
 
-    fs_proc = fs_raw / decimation
+    fs_proc = float(fs_raw) / float(decimation)
 
-    # 5. Remove channel-wise DC offset
-    # ========================================
-    logger.debug('Remove median trace offset')
-    x -= np.median(x, axis=0)
+    # 5. Remove channel-wise DC offset (median across channels at each time sample)
+    x_np -= np.median(x_np, axis=0)
 
     # 6. Temporal normalization (one-bit or RAM)
-    # ========================================
-    logger.debug(f'Applying temporal normalization | RAM window={ram_win}s')
-    x = temporal_normalization(x, fs_proc, ram_win)
+    x_np = temporal_normalization(x_np, fs_proc, float(ram_win))
 
-    # 7. Return float32
-    # ========================================
-    x = x.astype(np.float32)
+    x_np = x_np.astype(np.float32, copy=False)
 
-    # 8. Optional return to torch
-    # ========================================
     if is_tensor:
-        return convert_to_tensor(x, device=orig_device)
+        assert orig_device is not None
+        return convert_to_tensor(x_np, device=orig_device)
     
-    return x
+    return x_np
 
-def cross_correlation(signal_1, signal_2, is_spectral_whitening=False, whitening_params=None):
+# ==============================================================
+# 4. Cross-correlation (torch) + module wrapper
+# ==============================================================
+@torch.no_grad()
+def cross_correlation(
+    signal_1: torch.Tensor,
+    signal_2: torch.Tensor,
+    *,
+    is_spectral_whitening: bool = False,
+    whitening_params: Optional[tuple[float, float, float, float]] = None,
+    ) -> torch.Tensor:
     """
-    Compute multi-channel cross-correlation using FFT (GPU-accelerated if inputs are GPU tensors).
+    Multi-channel cross-correlation via FFT (vectorized).
 
-    :param signal_1: First input signal array (n_channels × n_samples).
-    :type signal_1: torch.Tensor
-    :param signal_2: Second input signal array (n_channels × n_samples).
-    :type signal_2: torch.Tensor
-    :param is_spectral_whitening: Whether to apply spectral whitening before CC.
-    :type is_spectral_whitening: bool
-    :param whitening_params: Tuple (fs, window_freq, f1, f2) for whitening.
-    :type whitening_params: tuple or None
-    :return: Cross-correlation of shape (n_channels × (2*n_samples - 1))
-    :rtype: torch.Tensor
+    :param signal_1: Tensor (nch × nt).
+    :param signal_2: Tensor (nch × nt), same shape/device as signal_1.
+    :param is_spectral_whitening: If True, whiten both spectra before CC.
+    :param whitening_params: (fs, window_freq, f1, f2) used by spectral_whitening.
+    :return: CC tensor (nch × (2*nt-1)).
     """
-    # Input validation 
     if signal_1.ndim != 2 or signal_2.ndim != 2:
-        raise ValueError("Inputs must be 2D: (n_channels × n_samples).")
-    
+        raise ValueError("cross_correlation: inputs must be 2D (nch × nt).")
     if signal_1.shape != signal_2.shape:
-        raise ValueError('signal_1 and signal_2 must have the same shape.')
+        raise ValueError("cross_correlation: signal_1 and signal_2 must have same shape.")
+    if signal_1.device != signal_2.device:
+        raise ValueError("cross_correlation: signal_1 and signal_2 must be on the same device.")
     
-    nch, npts = signal_1.shape
-    device = signal_1.device
+    nch, npts = int(signal_1.shape[0]), int(signal_1.shape[1])
 
     # FFT size for full cross-correlation
     x_corr_len = 2 * npts - 1
 
-    # nextpow2 returns tensor → convert to python int
-    fast_length = int(nextpow2(x_corr_len).item())
+    # nextpow2() returns int for scalar
+    fast_length_raw = nextpow2(x_corr_len)
+    fast_length = int(fast_length_raw if isinstance(fast_length_raw, int) else int(fast_length_raw.item()))
 
-    logger.info(f'Cross-correlation | FFT size = {fast_length}')
-
-    # Forward FFTs
     fft_1 = torch.fft.rfft(signal_1, n=fast_length, dim=-1)
     fft_2 = torch.fft.rfft(signal_2, n=fast_length, dim=-1)
 
-    # Optional spectral whitening
     if is_spectral_whitening:
         if whitening_params is None:
-            raise ValueError('whitening_params must be provided when is_spectral_whitening=True')
-        
+            raise ValueError("cross_correlation: whitening_params required when whitening is enabled.")
         fs, window_freq, f1, f2 = whitening_params
-        df = fs / fast_length
+        df = float(fs) / float(fast_length)
 
-        logger.info('Applying spectral whitening before CC.')
-        fft_1 = spectral_whitening(fft_1, df, window_freq, f1, f2)
-        fft_2 = spectral_whitening(fft_2, df, window_freq, f1, f2)
+        fft_1 = spectral_whitening(fft_1, df, float(window_freq), float(f1), float(f2))
+        fft_2 = spectral_whitening(fft_2, df, float(window_freq), float(f1), float(f2))
 
     # Multiply with conjugate for CC spectrum 
     fft_prod = torch.conj(fft_1) * fft_2
@@ -424,7 +359,7 @@ def cross_correlation(signal_1, signal_2, is_spectral_whitening=False, whitening
     # Invert FFT → cross-correlation in time domain
     cc_full = torch.fft.irfft(fft_prod, n=fast_length, dim=-1)
  
-    # Center the cross-correlation
+    # Center zero lag
     cc_full = torch.roll(cc_full, shifts=fast_length // 2, dims=-1)
 
     start = fast_length // 2 - (x_corr_len // 2)
@@ -434,160 +369,112 @@ def cross_correlation(signal_1, signal_2, is_spectral_whitening=False, whitening
 
 class TorchCrossCorrelation(nn.Module):
     """
-    PyTorch module wrapper for GPU-accelerated multi-channel cross-correlation.
-
-    This class makes the `cross_correlation()` function behave like a PyTorch layer
-    that integrates seamlessly with `.to(device)`, model containers, and autograd.
-
-    :param is_spectral_whitening: Whether to apply spectral whitening.
-    :type is_spectral_whitening: bool
-    :param whitening_params: Whitening parameters (fs, window_freq, f1, f2).
-                             Required if ``is_spectral_whitening=True``.
-    :type whitening_params: tuple or None
+    Module wrapper around cross_correlation().
+    Intended for inference-only usage in the pipeline (use with torch.no_grad()).
     """
-    def __init__(self, *, is_spectral_whitening=False, whitening_params=None):
+    def __init__(
+        self,
+        *,
+        is_spectral_whitening: bool = False,
+        whitening_params: Optional[tuple[float, float, float, float]] = None,
+        ) -> None:
         super().__init__()
 
         if is_spectral_whitening and whitening_params is None:
-            raise ValueError(
-                'whitening_params must be provided when is_spectral_whitening=True'
-            )
-            
+            raise ValueError("TorchCrossCorrelation: whitening_params required when whitening enabled.")
+        self.is_spectral_whitening = bool(is_spectral_whitening)
+        self.whitening_params = whitening_params
+
         self.is_spectral_whitening = is_spectral_whitening
         self.whitening_params = whitening_params
 
         logger.info(
-            f'TorchCrossCorrelation initialized | '
-            f'whitening={is_spectral_whitening} | params={whitening_params}'
+            "TorchCrossCorrelation initialized | whitening=%s | params=%s",
+            self.is_spectral_whitening,
+            self.whitening_params,
         )
 
-    def forward(self, data1, data2):
-        """
-        Compute multi-channel cross-correlation using FFT.
+    def forward(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
+        return cross_correlation(
+            data1,
+            data2,
+            is_spectral_whitening=self.is_spectral_whitening,
+            whitening_params=self.whitening_params,
+            )
 
-        :param data1: First input signal of shape (n_channels × n_samples).
-        :type data1: torch.Tensor
-        :param data2: Second input signal, same shape as ``data1``.
-        :type data2: torch.Tensor
-        :return: Cross-correlation result with shape (n_channels × (2*n_samples - 1)).
-        :rtype: torch.Tensor
-        """
-        logger.debug(
-            f'Cross-correlation forward() | '
-            f'data1.shape={tuple(data1.shape)} | '
-            f'whitening={self.is_spectral_whitening}'
-        )
-
-        # Direct call to function 
-        cc = cross_correlation(
-            signal_1=data1, 
-            signal_2=data2, 
-            is_spectral_whitening=self.is_spectral_whitening, 
-            whitening_params=self.whitening_params
-        )
-
-        return cc
-    
-def cross_correlation_full(data, ich1, ich2, 
-                           is_spectral_whitening=False, 
-                           whitening_params=None):
+@torch.no_grad()    
+def cross_correlation_full(
+    data: torch.Tensor,
+    ich1: int,
+    ich2: int,
+    *,
+    is_spectral_whitening: bool = False,
+    whitening_params: Optional[tuple[float, float, float, float]] = None,
+    ) -> torch.Tensor:
     """
-    Compute multi-channel cross-correlation between a selected channel group 
-    and the entire DAS array using FFT (GPU-accelerated if inputs are GPU tensors).
+    Pairwise CC between selected channels [ich1:ich2] and all channels, via FFT broadcasting.
 
-    :param data: Full DAS matrix of shape (n_channels × n_samples).
-    :type data: torch.Tensor
-    :param ich1: Starting channel index for selection.
-    :type ich1: int
-    :param ich2: Ending channel index (exclusive).
-    :type ich2: int
-    :param is_spectral_whitening: Whether to apply spectral whitening.
-    :type is_spectral_whitening: bool
-    :param whitening_params: Whitening parameters (fs, window_freq, f1, f2).
-    :type whitening_params: tuple or None
+    Output shape: (Nsel × Ntotal × (2*nt-1))
 
-    :return: Cross-correlation output with shape 
-             (ich2 - ich1) × (2*n_samples - 1)
-    :rtype: torch.Tensor
+    :param data: Tensor (Ntotal × nt).
+    :param ich1: Start channel index (inclusive).
+    :param ich2: End channel index (exclusive).
+    :param is_spectral_whitening: If True, apply whitening.
+    :param whitening_params: (fs, window_freq, f1, f2) used by spectral_whitening.
+    :return: CC tensor (Nsel × Ntotal × (2*nt-1)).
     """
-    # Input validation
-    if not torch.is_tensor(data):
-        raise TypeError("Input 'data' must be a torch.Tensor.")
-    
+    if not isinstance(data, torch.Tensor):
+        raise TypeError("cross_correlation_full: data must be torch.Tensor.")
     if data.ndim != 2:
-        raise ValueError("Input 'data' must be 2D: (n_channels × n_samples).")
-    
-    if ich1 < 0 or ich2 > data.shape[0] or ich1 >= ich2:
-        raise ValueError("Invalid channel range ich1-ich2.")
-    
+        raise ValueError("cross_correlation_full: data must be 2D (Ntotal × nt).")
+    if ich1 < 0 or ich2 > int(data.shape[0]) or ich1 >= ich2:
+        raise ValueError("cross_correlation_full: invalid channel slice ich1:ich2.")
     if is_spectral_whitening and whitening_params is None:
-        raise ValueError('whitening_params must be provided when whitening=True.')
+        raise ValueError("cross_correlation_full: whitening_params required when whitening enabled.")
     
-    device = data.device
-    n_total, npts = data.shape
-    n_sel = ich2 - ich1
-
-    logger.info(
-        f'CrossCorrelationFull | data={tuple(data.shape)} | '
-        f'selected channels=({ich1}:{ich2}) → {n_sel} channels | '
-        f'whitening={is_spectral_whitening}'
-    )
-
-    # Select subset of channels
-    signal_sel = data[ich1:ich2, :]                                 # (Nsel × npts)
-    signal_all = data                                               # (Ntotal × npts)
+    n_total, npts = int(data.shape[0]), int(data.shape[1])
+    n_sel = int(ich2 - ich1)
 
     # FFT size for full CC
     x_corr_len = 2 * npts - 1
-    fast_length = int(nextpow2(x_corr_len).item())
-    logger.info(
-        f'FFT length: npts={npts} → xcorr_len={x_corr_len} → fast_length={fast_length}'
-    )
+    fast_length_raw = nextpow2(x_corr_len)
+    fast_length = int(fast_length_raw if isinstance(fast_length_raw, int) else int(fast_length_raw.item()))
+
+    # Select subset of channels
+    sig_sel = data[ich1:ich2, :]                                 # (Nsel × npts)
+    sig_all = data                                               # (Ntotal × npts)
 
     # Forward FFT
-    fft_sel  = torch.fft.rfft(signal_sel,  n=fast_length, dim=-1)   # (Nsel × Nfreq)
-    fft_all  = torch.fft.rfft(signal_all,  n=fast_length, dim=-1)   # (Ntotal × Nfreq)
-    logger.debug(
-        f'FFT shapes: fft_sel={fft_sel.shape}, fft_all={fft_all.shape}'
-    )
+    fft_sel = torch.fft.rfft(sig_sel, n=fast_length, dim=-1)     # (Nsel, Nfreq)
+    fft_all = torch.fft.rfft(sig_all, n=fast_length, dim=-1)     # (Ntotal, Nfreq)
 
     # Optional spectral whitening 
     if is_spectral_whitening:
+        assert whitening_params is not None
         fs, window_freq, f1, f2 = whitening_params
-        df = fs / fast_length
+        df = float(fs) / float(fast_length)
 
-        logger.info(
-            f'Applying spectral whitening | df={df:.6f} | '
-            f'f1={f1}Hz f2={f2}Hz | window_freq={window_freq}Hz'
-        )
-
-        fft_sel = spectral_whitening(fft_sel, df, window_freq, f1, f2)
-        fft_all = spectral_whitening(fft_all, df, window_freq, f1, f2)
+        fft_sel = spectral_whitening(fft_sel, df, float(window_freq), float(f1), float(f2))
+        fft_all = spectral_whitening(fft_all, df, float(window_freq), float(f1), float(f2))
 
     # Broadcasting for pairwise CC:
-    # (Nsel, 1, Nfreq) × (1, Ntotal, Nfreq)
-    fft_sel_exp  = fft_sel.unsqueeze(1)                             # (Nsel × 1 × Nfreq)
-    fft_all_exp  = fft_all.unsqueeze(0)                             # (1 × Ntotal × Nfreq)
-
-    # Multiply by conjugate for CC
-    fft_prod = torch.conj(fft_sel_exp) * fft_all_exp                # (Nsel × Ntotal × Nfreq)
-
-    logger.debug(f'fft_prod shape = {fft_prod.shape}')
-
-    # Back to time domain
+    # (Nsel, 1, Nfreq) * (1, Ntotal, Nfreq) -> (Nsel, Ntotal, Nfreq)
+    fft_prod = torch.conj(fft_sel.unsqueeze(1)) * fft_all.unsqueeze(0)
     cc_full = torch.fft.irfft(fft_prod, n=fast_length, dim=-1)
 
-    # Center the zero lag
     cc_full = torch.roll(cc_full, shifts=fast_length // 2, dims=-1)
 
-    # Slice only valid CC part
     start = fast_length // 2 - (x_corr_len // 2)
-    end   = start + x_corr_len
+    end = start + x_corr_len
 
-    cc_out = cc_full[:, :, start:end]
+    out = cc_full[:, :, start:end]
 
     logger.info(
-        f'Output CC shape = {tuple(cc_out.shape)} | '
-        f'(Nsel={n_sel}, Ntotal={n_total}, CClen={x_corr_len})'
-    )
-    return cc_out
+        "cross_correlation_full output shape=%s (Nsel=%d, Ntotal=%d, CClen=%d)",
+        tuple(out.shape),
+        n_sel,
+        n_total,
+        x_corr_len,
+        )
+
+    return out
