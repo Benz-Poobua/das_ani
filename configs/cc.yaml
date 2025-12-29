@@ -23,15 +23,15 @@ data:
 preprocess:
   decimation: 1
   f1: 1.0
-  f2: 5.0
+  f2: 10.0
   diff: false
   ram_win_sec: 0.0
 
 xcorr:
   is_spectral_whitening: true
   window_freq_hz: 0.0
-  max_lag_sec: 4.0
-  xcorr_seg_sec: 8.0
+  max_lag_sec: 2.0
+  xcorr_seg_sec: 4.0
 
 stacking:
   enabled: true

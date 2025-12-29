@@ -1,15 +1,45 @@
-name: das_ani-env
+name: das-ani
+
 channels:
   - pytorch
+  - nvidia
   - conda-forge
-  - defaults
 
 dependencies:
+  # -----------------------------
+  # Core language
+  # -----------------------------
   - python=3.10
-  - pytorch=2.6.0
-  - numpy=2.0.2
-  - scipy=1.16.0
-  - pip
-  - pip:
-      - tqdm==4.66.5
 
+  # -----------------------------
+  # Scientific stack (compiled)
+  # -----------------------------
+  - numpy
+  - scipy
+  - psutil
+  - tqdm
+  - pyyaml
+
+  # -----------------------------
+  # PyTorch (CPU by default)
+  # -----------------------------
+  - pytorch>=2.1
+  - torchvision
+  - torchaudio
+
+  # -----------------------------
+  # System / performance libs
+  # -----------------------------
+  - mkl
+  - fftw
+
+  # -----------------------------
+  # Pip bridge
+  # -----------------------------
+  - pip
+
+  # -----------------------------
+  # Install this project
+  # -----------------------------
+  - pip:
+      - -e .
