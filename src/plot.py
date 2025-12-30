@@ -7,6 +7,8 @@
 :purpose: Plotting utilities for dispersion imaging (f–v panels),
           dispersion curve picks, and related DAS diagnostics.
 """
+from __future__ import annotations
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -16,6 +18,93 @@ from src.utils import convert_to_numpy
 
 # Global Plotly style
 PLOTLY_FONT_FAMILY = "Helvetica"
+
+# 0. Plot NCF
+# ===========================================================================
+def plot_ncf_section(
+    ncf: np.ndarray,
+    lag_axis: np.ndarray,
+    distance_axis: np.ndarray,
+    mode: str = "all",
+    clip: float | None = 0.05,
+    pclip: float | None = None,
+    cmap: str = "seismic",
+    title: str | None = None,
+    filename: str | None = None,
+) -> None:
+    mode = mode.lower().strip()
+    if mode not in {"all", "causal", "acasual"}:
+        raise ValueError("mode must be one of: 'all', 'causal', 'acasual'")
+
+    ncf = np.asarray(ncf)
+    lag_axis = np.asarray(lag_axis)
+    distance_axis = np.asarray(distance_axis)
+
+    # Expect (n_distance, n_lag). Auto-fix common transpose.
+    if ncf.shape == (lag_axis.size, distance_axis.size):
+        ncf = ncf.T
+    if ncf.shape != (distance_axis.size, lag_axis.size):
+        raise ValueError(
+            f"Shape mismatch: ncf.shape={ncf.shape}, expected "
+            f"({distance_axis.size}, {lag_axis.size})."
+        )
+
+    # --- Select mode ---
+    if mode == "all":
+        y = lag_axis
+        data = ncf
+        ylabel = "Lag time (s)"
+    elif mode == "causal":
+        sel = lag_axis >= 0
+        y = lag_axis[sel]          # already 0..T
+        data = ncf[:, sel]
+        ylabel = "Lag time (s)"
+    else:  # acasual
+        sel = lag_axis <= 0
+        y = np.abs(lag_axis[sel])  # convert to positive
+        data = ncf[:, sel]
+        # ensure y goes 0..T (not T..0)
+        order = np.argsort(y)
+        y = y[order]
+        data = data[:, order]
+        ylabel = "|Lag time| (s)"
+
+    # --- Color clip ---
+    if pclip is not None:
+        c = np.percentile(np.abs(data), pclip)
+    elif clip is not None:
+        c = float(clip)
+    else:
+        c = np.max(np.abs(data)) if data.size else 1.0
+
+    # --- Title ---
+    if title is None:
+        base = os.path.basename(filename) if filename else ""
+        title = f"NCF {mode}: {base}".strip().rstrip(":")
+    else:
+        title = f"NCF {mode}: {title}"
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    img = ax.imshow(
+        data.T,
+        extent=[distance_axis[0], distance_axis[-1], y.min(), y.max()],
+        aspect="auto",
+        cmap=cmap,
+        vmin=-c, vmax=c,
+        interpolation="nearest",
+        origin="lower",   # keep it simple...
+    )
+
+    # ...then FORCE time increasing downward
+    ax.invert_yaxis()
+
+    fig.colorbar(img, ax=ax, label="Correlation amplitude")
+    ax.set_xlabel("Distance along array (m)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    fig.tight_layout()
+    plt.show()
 
 # 1. Matplotlib: f–v dispersion panel
 # ===========================================================================
@@ -154,6 +243,7 @@ def plot_fv_with_pick(
     return fig, ax
 
 # 3. Matplotlib: v(f) pick curve only
+# ===========================================================================
 def plot_pick_curve(
     f_axis,
     pick_curve,
@@ -1087,3 +1177,4 @@ def plot_power_spectrum_plotly(
 
     fig.show()
     return fig
+

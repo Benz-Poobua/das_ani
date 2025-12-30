@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import functools
 import psutil
@@ -20,7 +21,9 @@ import numpy as np
 
 from tqdm import tqdm
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar, Union, overload
+from scipy.ndimage import median_filter, gaussian_filter
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar, Tuple, Union, overload
+
 
 logger = logging.getLogger(__name__)
 
@@ -251,23 +254,187 @@ def fk_transform(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    x = convert_to_tensor(data, device=device)
+    # Convert to tensor and ensure contiguous memory
+    x = convert_to_tensor(data, device=device).contiguous()
+
     if x.ndim != 2:
         raise ValueError(f"'data' must be 2D (nch × nt); got shape={tuple(x.shape)}")
 
     nch, nt = int(x.shape[0]), int(x.shape[1])
     Ft = int(fast_len_t) if fast_len_t is not None else int(nextpow2(nt))
     Fx = int(fast_len_x) if fast_len_x is not None else int(nextpow2(nch))
-    
-    # 1. FFT along time axis (dim=1)
-    fft_t = torch.fft.rfft(data, n=Ft, dim=1)           # (nch, nfreq)
-    freqs = torch.fft.rfftfreq(Ft, dt).to(device)       # shape (nfreq,)
 
-    # 2. FFT along space axis (dim=0)
-    fk_spectrum = torch.fft.fft(fft_t, n=Fx, dim=0)     # (nk, nfreq)
-    wavenumbers = torch.fft.fftfreq(Fx, dx).to(device)  # shape (nk,)
+    # 1) FFT along time axis (lag axis)
+    fft_t = torch.fft.rfft(x, n=Ft, dim=1).contiguous()   # (nch, nfreq)
+    freqs = torch.fft.rfftfreq(Ft, dt).to(device)         # (nfreq,)
+
+    # 2) FFT along space axis
+    fk_spectrum = torch.fft.fft(fft_t, n=Fx, dim=0)       # (nk, nfreq)
+    fk_spectrum = fk_spectrum.contiguous()
+
+    wavenumbers = torch.fft.fftfreq(Fx, dx).to(device)   # (nk,)
 
     return freqs, wavenumbers, fk_spectrum
+
+@torch.no_grad()
+def fk_velocity_filter(
+    ncf: np.ndarray,
+    dt: float,
+    dx: float,
+    vmin: float = 200.0,
+    vmax: float = 2000.0,
+    taper_frac: float = 0.10, 
+    fast_len_t: int | None = None,
+    fast_len_x: int | None = None,
+    device: torch.device | None = None,
+    ) -> np.ndarray:
+    """
+    f–k velocity-cone filter for an NCF gather (nch × nt), with smooth taper.
+
+    Keeps energy consistent with velocities in [vmin, vmax] using v = f / |k|,
+    and applies cosine tapers to avoid ringing artifacts.
+    """
+    if ncf.ndim != 2:
+        raise ValueError(f"ncf must be 2D (nch × nt). Got {ncf.ndim}D.")
+
+    nch, nt = ncf.shape
+
+    # 1. Forward f–k transform 
+    freqs, ks, FK = fk_transform(
+        ncf,
+        dt=dt,
+        dx=dx,
+        fast_len_t=fast_len_t,
+        fast_len_x=fast_len_x,
+        device=device,
+    )
+    FK = FK.contiguous()
+
+    # Build velocity grid
+    # freqs: (nfreq,), ks: (nk,)
+    F = freqs[None, :]                 # (1, nfreq)
+    K = ks[:, None]                    # (nk, 1)
+    V = torch.abs(F / (torch.abs(K) + 1e-12))  # (nk, nfreq)
+
+    # 2. Smooth velocity mask 
+    # Define transition zones
+    dv = float(taper_frac)
+    vmin1, vmin2 = vmin * (1 - dv), vmin * (1 + dv)
+    vmax1, vmax2 = vmax * (1 - dv), vmax * (1 + dv)
+
+    w = torch.zeros_like(V)
+
+    # Passband
+    w[(V >= vmin2) & (V <= vmax1)] = 1.0
+
+    # Low-velocity transition
+    low_zone = (V >= vmin1) & (V < vmin2)
+    w[low_zone] = 0.5 * (
+        1 - torch.cos(np.pi * (V[low_zone] - vmin1) / (vmin2 - vmin1))
+    )
+
+    # High-velocity transition
+    high_zone = (V > vmax1) & (V <= vmax2)
+    w[high_zone] = 0.5 * (
+        1 + torch.cos(np.pi * (V[high_zone] - vmax1) / (vmax2 - vmax1))
+    )
+
+    # Remove DC and unstable k≈0 region
+    w[:, 0] = 0.0
+    w[torch.abs(K[:, 0]) < 1e-9, :] = 0.0
+
+    # Apply tapered mask
+    FK_filt = (FK * w).contiguous()
+
+    # 3. Inverse f–k transform 
+    ifft_x = torch.fft.ifft(FK_filt, dim=0).contiguous()
+
+    ntime = 2 * (ifft_x.shape[1] - 1)
+    x_t = torch.fft.irfft(ifft_x, n=ntime, dim=1).real
+
+    # Crop back to original size
+    x_t = x_t[:nch, :nt]
+
+    return x_t.detach().cpu().numpy().astype(np.float32, copy=False)
+
+def fv_filter(
+    fv_panel: np.ndarray,
+    f_axis: np.ndarray,
+    v_axis: np.ndarray,
+    fmin: float | None = None,
+    fmax: float | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    normalize: str = "per_f",      # "per_f", "global", or "none"
+    denoise: str = "median",       # "median", "gaussian", or "none"
+    denoise_size: int = 3,         # for median (odd int)
+    denoise_sigma: float = 1.0,    # for gaussian
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Filter/prepare an f–v dispersion panel for ridge picking.
+
+    Assumes fv_panel shape = (n_vel, n_freq) like your plot_fv_panel.
+
+    :return: (fv_filtered, f_filtered, v_filtered)
+    """
+    P = np.asarray(fv_panel)
+    f = np.asarray(f_axis)
+    v = np.asarray(v_axis)
+
+    if P.ndim != 2:
+        raise ValueError(f"fv_panel must be 2D; got shape={P.shape}")
+    if P.shape != (v.size, f.size):
+        raise ValueError(
+            f"Shape mismatch: fv_panel={P.shape}, expected (n_vel, n_freq)=({v.size}, {f.size})."
+        )
+
+    # --- crop masks ---
+    fmask = np.ones_like(f, dtype=bool)
+    vmask = np.ones_like(v, dtype=bool)
+
+    if fmin is not None:
+        fmask &= (f >= float(fmin))
+    if fmax is not None:
+        fmask &= (f <= float(fmax))
+    if vmin is not None:
+        vmask &= (v >= float(vmin))
+    if vmax is not None:
+        vmask &= (v <= float(vmax))
+
+    f2 = f[fmask]
+    v2 = v[vmask]
+    P2 = P[np.ix_(vmask, fmask)].copy()
+
+    # --- normalization ---
+    normalize = normalize.lower()
+    if normalize == "per_f":
+        # normalize each frequency column (good for picking)
+        colmax = np.max(np.abs(P2), axis=0, keepdims=True)
+        P2 = P2 / (colmax + eps)
+    elif normalize == "global":
+        P2 = P2 / (np.max(np.abs(P2)) + eps)
+    elif normalize == "none":
+        pass
+    else:
+        raise ValueError("normalize must be one of: 'per_f', 'global', 'none'")
+
+    # --- denoise ---
+    denoise = denoise.lower()
+    if denoise == "median":
+        # good for speckle / salt-and-pepper
+        k = int(denoise_size)
+        if k < 1 or k % 2 == 0:
+            raise ValueError("denoise_size must be an odd integer >= 1")
+        P2 = median_filter(P2, size=(k, k))
+    elif denoise == "gaussian":
+        P2 = gaussian_filter(P2, sigma=float(denoise_sigma))
+    elif denoise == "none":
+        pass
+    else:
+        raise ValueError("denoise must be one of: 'median', 'gaussian', 'none'")
+
+    return P2.astype(np.float32, copy=False), f2, v2
 
 # ==============================================================
 # 6. Runlog writer
@@ -470,3 +637,28 @@ def get_cfg(cfg: Mapping[str, Any], keys: Sequence[str], default: Any = None, *,
             return default
         cur = cur[k]
     return cur
+
+# ==============================================================
+# 11. Filename read helpers
+# ==============================================================
+def parse_ncf_filename(fname: str) -> Tuple[str, str, str]:
+    """
+    Parse NCF stacked filename of format:
+        YYYYMMDD_cc_XXX_<window>.npy
+
+    Example:
+        20210901_cc_080_daily.npy
+
+    :param fname: Path or filename of the NCF stack
+    :type fname: str
+    :return: (date, vs, window)
+    :rtype: Tuple[str, str, str]
+    """
+    base = os.path.basename(fname)
+
+    m = re.match(r"(\d{8})_cc_(\d{3})_(\w+)\.npy", base)
+    if m is None:
+        raise ValueError(f"Filename not recognized: {fname}")
+    
+    date, vs, window = m.groups()
+    return date, vs, window
