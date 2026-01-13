@@ -33,5 +33,22 @@ results/*
 !data/ncf/.gitkeep
 !data/synthetic/.gitkeep
 
+# Virtual environments / local installs (CRITICAL)
+.venv/
+venv/
+env/
+ENV/
 
+# If we accidentally created a venv inside the repo root (common on mac)
+bin/
+lib/
+Lib/
+Scripts/
+pyvenv.cfg
 
+# If we created a venv inside your package folder
+das_ani/bin/
+das_ani/lib/
+das_ani/Lib/
+das_ani/Scripts/
+das_ani/pyvenv.cfg
