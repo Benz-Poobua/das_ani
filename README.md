@@ -48,6 +48,9 @@ Official documentation: https://cloud.google.com/storage/docs/gsutil
 ### Example
 ```bash
 gsutil -m cp -n -r gs://path/to/data .
+
+# or
+gsutil -m \ -o "GSUtil:parallel_process_count=1" \ -o "GSUtil:parallel_thread_count=16" \ cp -r "gs://path/to/data" .
 ```
 ### Flag explanation
 1. `gsutil`
