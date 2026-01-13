@@ -52,3 +52,7 @@ das_ani/lib/
 das_ani/Lib/
 das_ani/Scripts/
 das_ani/pyvenv.cfg
+
+# More accidental venv folders inside package
+das_ani/share/
+das_ani/include/
