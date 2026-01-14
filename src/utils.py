@@ -8,13 +8,15 @@
 """
 from __future__ import annotations
 
+import csv
+import functools
 import json
 import logging
+import math
 import os
+import psutil
 import re
 import time
-import functools
-import psutil
 import torch
 
 import numpy as np
@@ -453,6 +455,35 @@ def write_runlog(message: str, path: PathLike = _DEFAULT_RUNLOG_PATH) -> None:
     with p.open("a", encoding="utf-8") as f:
         f.write(message + "\n")
 
+def write_perf_row(
+    row: Mapping[str, Any],
+    path: PathLike,
+    *,
+    add_pid_suffix: bool = True,
+) -> None:
+    """
+    Append one row to a CSV file. Creates file + header if missing.
+
+    :param row: Dict-like row to write.
+    :param path: CSV path.
+    :param add_pid_suffix: If True, writes per-process CSV to avoid race in multiprocessing.
+    """
+    p = Path(path).expanduser()
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    if add_pid_suffix:
+        pid = os.getpid()
+        p = p.with_name(f"{p.stem}_{pid}{p.suffix}")
+
+    fieldnames = list(row.keys())
+    write_header = (not p.exists()) or (p.stat().st_size == 0)
+
+    with p.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            w.writeheader()
+        w.writerow(dict(row))
+
 # ==============================================================
 # 7. Memory diagnostics
 # ==============================================================
@@ -495,43 +526,63 @@ def auto_np_pair_chunk(
     frac_mem: float = 0.25,
     min_chunk: int = 64,
     max_chunk: int = 4096,
-    ) -> int:
+    *,
+    dtype: torch.dtype = torch.float32,
+    safety_factor: float = 3.0,
+    nworkers: int = 1, 
+) -> int:
     """
     Heuristic to choose a safe batch size for channel-pair processing.
 
+    Model (approx):
+      - We materialize data1 and data2: 2 * (batch * npts_seg) * bytes_per_sample
+      - We materialize CC output:
+          conventional: (2*npts_seg-1) per pair
+          v1: (2*M+1) per pair  (unknown here, so we conservatively assume conventional)
+      - FFT workspace / temporaries: handled via safety_factor
+
+    We do NOT force min_chunk if memory doesn't allow it.
+
     :param nch: Number of channels.
     :param npts_seg: Samples per segment.
-    :param device: Target device (cpu/cuda/mps).
+    :param device: Target device.
     :param frac_mem: Fraction of available memory to budget.
-    :param min_chunk: Minimum chunk size.
-    :param max_chunk: Maximum chunk size.
-    :return: npair_chunk (>=1).
+    :param min_chunk: Preferred minimum chunk size (used only if fits).
+    :param max_chunk: Hard cap on chunk size.
+    :param dtype: Data dtype used for tensors.
+    :param safety_factor: Multiplier to cover temporaries/workspace.
+    :param nworkers: Number of data loading workers (for CPU memory budgeting).
+    :return: npair_chunk in [1, min(nch, max_chunk)].
     """
     if nch <= 0:
         return 1
     if npts_seg <= 0:
-        return int(min(min_chunk, nch))
+        return max(1, min(nch, min_chunk))
     
-    # Rough model: two float32 traces + intermediate buffers (tunable constant)
-    bytes_per_pair = 64 * int(npts_seg)
+    bps = 2 if dtype == torch.float16 else 4 if dtype == torch.float32 else 8 if dtype == torch.float64 else 4
+    cc_len = 2 * int(npts_seg) - 1  # conservative for conventional
+    bytes_per_pair = (2 * npts_seg + cc_len) * bps
+    bytes_per_pair = int(math.ceil(bytes_per_pair * float(safety_factor)))
     if bytes_per_pair <= 0:
-        return int(min(min_chunk, nch))
+        return 1
 
     if device.type == "cuda" and torch.cuda.is_available():
-        free_bytes, _total_bytes = torch.cuda.mem_get_info()
-        budget = free_bytes * float(frac_mem)
+        free_bytes, _ = torch.cuda.mem_get_info()
+        avail = int(free_bytes)
     else:
-        budget = psutil.virtual_memory().available * float(frac_mem)
+        avail = int(psutil.virtual_memory().available)
 
-    max_pairs_by_mem = int(budget // bytes_per_pair)
+    # Divide by workers so total across processes respects frac_mem
+    nworkers = max(1, int(nworkers))
+    budget = int(avail * float(frac_mem) / nworkers)
+    if budget <= 0:
+        return 1
 
-    if max_pairs_by_mem < min_chunk:
-        npair_chunk = min_chunk
-    else:
-        npair_chunk = min(max_pairs_by_mem, max_chunk)
-
-    npair_chunk = min(int(npair_chunk), int(nch))
-    return int(max(npair_chunk, 1))
+    max_pairs_by_mem = max(1, int(budget // bytes_per_pair))
+    upper = min(int(nch), int(max_chunk), int(max_pairs_by_mem))
+    if upper <= 0:
+        return 1
+    return int(min_chunk) if min_chunk <= upper else int(upper)
 
 # ==============================================================
 # 9. Auto-resume helpers

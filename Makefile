@@ -12,7 +12,8 @@ DISP_CFG    ?= configs/disp.yaml
 # -----------------------
 # Python executable
 # -----------------------
-PYTHON      ?= python
+VENV        ?= das_ani
+PYTHON      ?= $(VENV)/bin/python
 
 # -----------------------
 # Defaults / overrides
@@ -111,7 +112,7 @@ disp_only:
 		$(PYTHON) -m src.disp_pick --config $(DISP_CFG) --stack_windows $(DISP_WINDOWS) --njobs $(NJOBS); \
 	fi
 
-disp: stack disp_onlys
+disp: stack disp_only
 
 # ============================================================
 # FULL PIPELINE

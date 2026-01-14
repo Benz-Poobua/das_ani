@@ -10,8 +10,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
+import os
+import time
 import torch
 import multiprocessing as mp
 import numpy as np
@@ -34,7 +35,8 @@ from src.utils import (
     timeit,
     write_runlog, 
     load_config, 
-    get_cfg
+    get_cfg, 
+    write_perf_row
     )
 
 from src.ani import preprocess, TorchCrossCorrelation 
@@ -78,6 +80,22 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     do_compile = bool(get_cfg(cfg, ["runtime", "torch_compile"], False))
     compile_mode = str(get_cfg(cfg, ["runtime", "compile_mode"], "max-autotune"))
 
+    njobs = int(get_cfg(cfg, ["runtime", "njobs"], 1))
+    njobs = max(1, njobs)
+
+    # ---- config ----
+    perf_enabled = bool(get_cfg(cfg, ["perf", "enabled"], False))
+    perf_out_path = str(get_cfg(cfg, ["perf", "out_path"], "./data/runlogs/perf_cc.csv"))
+    log_every_vs = bool(get_cfg(cfg, ["perf", "log_every_vs"], True))
+    log_every_chunk = bool(get_cfg(cfg, ["perf", "log_every_chunk"], False))
+
+    # Avoid CPU oversubscription: split cores across processes
+    ncores = os.cpu_count() or 1
+    threads_per_proc = max(1, ncores // njobs)
+    torch.set_num_threads(threads_per_proc)
+    logger.info("CPU threads per process: %d (total cores=%d, njobs=%d)",
+                threads_per_proc, ncores, njobs)
+
     # ---- data ----
     fs_raw = float(get_cfg(cfg, ["data", "fs_raw"], required=True))
     first_chan = int(get_cfg(cfg, ["data", "first_chan"], required=True))
@@ -105,9 +123,17 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     max_lag_sec = float(get_cfg(cfg, ["xcorr", "max_lag_sec"], 4.0))
     xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec"], 8.0))
 
+    # ---- mode ----
+    mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
+    if mode == "v1":
+        xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec_v1"], xcorr_seg_sec))
+
     npts_lag = int(max_lag_sec * fs_proc)
     npts_seg = int(xcorr_seg_sec * fs_proc)
     cc_out_len = 2 * npts_lag + 1
+
+    v1_fft_snap_pow2 = bool(get_cfg(cfg, ["xcorr", "v1_fft_snap_pow2"], True))
+    v1_fallback = str(get_cfg(cfg, ["xcorr", "v1_fallback"], "v1_2M"))
 
     # ---- virtual sources ----
     src_ch_all_num = np.arange(first_chan, last_chan + 1, src_stride, dtype=int)  # abs channel numbers
@@ -134,8 +160,20 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         logger.warning("Skipping %s because npts=%d < min_npts=%d", in_path, npts, min_npts)
         return None
     
+    if mode not in {"conventional", "v1"}:
+        raise ValueError(f"xcorr.mode must be 'conventional' or 'v1'; got {mode}")
+    
+    logger.info(
+    "XCORR config | mode=%s | v1_fft_snap_pow2=%s | v1_fallback=%s | "
+    "npts_seg=%d | max_lag_samples=%d | out_len=%d",
+    mode, v1_fft_snap_pow2, v1_fallback,
+    npts_seg, npts_lag, cc_out_len)
+
+    if v1_fallback not in {"v1_2M", "v1_Mp1"}:
+        raise ValueError(f"xcorr.v1_fallback must be 'v1_2M' or 'v1_Mp1'; got {v1_fallback}")
+    
     # ---- preprocess (CPU, numpy) ----
-    data_proc = preprocess(data_raw, fs_raw, f1, f2, decimation, diff, ram_win_sec)
+    data_proc = preprocess(data_raw, fs_raw, f1, f2, decimation, diff, ram_win_sec).astype(np.float32, copy=False)
     npts_proc = int(data_proc.shape[1])
 
     # ---- segmentation ----
@@ -169,8 +207,9 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         device=device, 
         frac_mem=frac_mem, 
         min_chunk=min_chunk, 
-        max_chunk=max_chunk
-    ) 
+        max_chunk=max_chunk, 
+        nworkers=njobs) 
+    
     logger.info("Using npair_chunk=%d (auto-selected)", npair_chunk)
     write_runlog(f"npair_chunk={npair_chunk} | nch={nch} | npts_seg={npts_seg}")
 
@@ -179,8 +218,12 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
 
     # ---- model ----
     model_conf = {
-        'is_spectral_whitening': is_spectral_whitening, 
-        'whitening_params': (float(fs_proc), float(window_freq_hz), float(f1), float(f2))
+        "mode": mode,
+        "max_lag_samples": int(npts_lag) if mode == "v1" else None,
+        "is_spectral_whitening": is_spectral_whitening,
+        "whitening_params": (float(fs_proc), float(window_freq_hz), float(f1), float(f2)),
+        "v1_fft_snap_pow2": v1_fft_snap_pow2,
+        "v1_fallback": v1_fallback,
     }
 
     model: nn.Module = TorchCrossCorrelation(**model_conf)
@@ -193,7 +236,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     else:
         model = model.to(device)
     
-    if do_compile and not multi_gpu:
+    if do_compile and (device.type == "cuda") and not multi_gpu:
         try:
             model = torch.compile(model, mode=compile_mode)
             logger.info("Enabled torch.compile() mode=%s", compile_mode)
@@ -209,7 +252,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     data_tensor = data_tensor.to(device, non_blocking=True)
     
     # ---- resume state ----
-    meta_path = out_dir / basename.replace(".npz", "_cc_state.json")
+    meta_path = out_dir / basename.replace(".npz", f"_cc_state_{mode}.json")
     completed_src = load_resume_state(meta_path)
 
     last_out: Optional[Path] = None
@@ -220,7 +263,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     for src_idx in vs_bar:
         src_idx = int(src_idx)
 
-        out_path = out_dir / basename.replace(".npz", f"_cc_{src_idx:03d}.npy")
+        out_path = out_dir / basename.replace(".npz", f"_cc_{src_idx:03d}_{mode}.npy")
         expected_shape = (nch, cc_out_len)
 
         if check_existing_output(out_path, expected_shape):
@@ -238,20 +281,33 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         write_runlog(f"Start VS {src_idx}: {gpu_memory() or ''} | {cpu_memory()}")
 
         # VS against all receivers
-        pair_ch1 = np.full(nch, src_idx, dtype=int)
-        pair_ch2 = np.arange(nch, dtype=int)
-        npair = int(pair_ch1.size)
-
-        # Chunking to avoid memory overflow 
-        nchunk  = int(np.ceil(npair / npair_chunk))
-        write_runlog(f"VS {src_idx}: npair={npair}, npair_chunk={npair_chunk}, nchunk={nchunk}")
+        npair = nch
+        nchunk = int(np.ceil(npair / npair_chunk))
+        write_runlog(f"XCORR mode={mode} | npts_seg={npts_seg} | M={npts_lag} | out_len={cc_out_len}")
 
         # Prepare output array 
         ccall = np.zeros((npair, cc_out_len), dtype=np.float32)
 
-        # Chunked correlation loop (GPU batching)
+        # Precompute lag slice once (only used in conventional)
+        lag_start = npts_seg - npts_lag - 1
+        lag_end = lag_start + cc_out_len
+
+        if mode == "conventional" and (lag_start < 0 or lag_end > 2 * npts_seg - 1):
+            raise ValueError(
+                f"Lag window out of bounds: lag_start={lag_start}, lag_end={lag_end}, "
+                f"valid=[0, {2*npts_seg-1}] (npts_seg={npts_seg}, npts_lag={npts_lag})"
+            )
+
+        # Precompute source trace once per VS
+        src_trace = data_tensor[src_idx:src_idx+1, :]   # (1, npts_new)
+
         chunk_bar = tqdm(range(nchunk), desc=f"VS {src_idx} batches", leave=False)
-        
+
+        is_cuda = (device.type == "cuda")
+        is_cpu = not is_cuda
+
+        t_vs0 = time.perf_counter()
+
         for ichunk in chunk_bar:
             if ichunk % 10 == 0 or ichunk == nchunk - 1:
                 chunk_bar.set_postfix_str(f"{ichunk+1}/{nchunk}")
@@ -259,17 +315,21 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             start_idx   = npair_chunk * ichunk
             end_idx     = min(start_idx + npair_chunk, npair)
             batch_len   = end_idx - start_idx
+            
+            rcv0, rcv1 = start_idx, end_idx
 
-            ich1 = pair_ch1[start_idx:end_idx]
-            ich2 = pair_ch2[start_idx:end_idx]
-
-            # Full-length traces for this batch: (batch_len, npts_new)
-            full1 = data_tensor[ich1, :]
-            full2 = data_tensor[ich2, :]
+            if is_cpu:
+                full1 = src_trace.repeat(batch_len, 1)         # contiguous
+            else:
+                full1 = src_trace.expand(batch_len, -1)        # view, no allocs
+                
+            full2 = data_tensor[rcv0:rcv1, :]
+            if is_cuda and not full2.is_contiguous():
+                full2 = full2.contiguous()
 
             # Reshape into segments: (batch_len * nseg, npts_seg)
             # Advanced indexing can yield non-contiguous tensors; contiguous helps CUDA kernels.
-            if device.type == 'cuda':
+            if is_cuda:
                 data1 = full1.reshape(batch_len * nseg, npts_seg).contiguous()
                 data2 = full2.reshape(batch_len * nseg, npts_seg).contiguous()
             else:
@@ -277,20 +337,21 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
                 data2 = full2.reshape(batch_len * nseg, npts_seg)
 
             # Run CC model (no autograd)
-            with torch.no_grad():
+            with torch.inference_mode():
                 cc_chunk = model(data1, data2)
 
-            cc_np = cc_chunk.detach().cpu().numpy()
+            cc_sum_t = cc_chunk.reshape(batch_len, nseg, -1).sum(dim=1)  # (batch_len, Lout_full or Lout_v1)
 
-            # Sum over segments
-            # cc_np shape: (batch_len * nseg, full_corr_len)
-            cc_sum = cc_np.reshape(batch_len, nseg, -1).sum(axis=1)
+            if mode == "v1" and cc_sum_t.shape[1] != cc_out_len:
+                raise RuntimeError(f"v1 output length mismatch: got {cc_sum_t.shape[1]}, expected {cc_out_len}")
 
-            # Extract lag window centered
-            lag_start = npts_seg - npts_lag - 1
-            lag_end = lag_start + cc_out_len
-
-            ccall[start_idx:end_idx, :] += cc_sum[:, lag_start:lag_end]
+            if mode == "conventional":
+                # slice on-device first (reduces PCIe + CPU work)
+                cc_win = cc_sum_t[:, lag_start:lag_end]
+                ccall[start_idx:end_idx, :] += cc_win.cpu().numpy()
+            else:
+                # v1 already returns (2M+1)
+                ccall[start_idx:end_idx, :] += cc_sum_t.cpu().numpy()
 
             # Log memory
             if ichunk % 5 == 0 or ichunk == nchunk - 1:
@@ -298,14 +359,31 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
                     f"Batch {ichunk+1}/{nchunk} | {gpu_memory('GPU:') or ''} | {cpu_memory('CPU:')}"
                 )
 
-            if device.type == "cuda" and ichunk % 3 == 0:
-                torch.cuda.empty_cache()
-
         # Normalize by number of segments
         ccall /= float(flag_mean)
 
         # Save
         np.save(out_path, ccall)
+
+        t_vs1 = time.perf_counter()
+        if perf_enabled and log_every_vs:
+            write_perf_row(
+                {
+                    "file": basename,
+                    "mode": mode,
+                    "vs_idx": int(src_idx),
+                    "nch": int(nch),
+                    "npts_seg": int(npts_seg),
+                    "nseg": int(nseg),
+                    "max_lag_samples": int(npts_lag),
+                    "npair_chunk": int(npair_chunk),
+                    "device": str(device),
+                    "seconds_vs": float(t_vs1 - t_vs0),
+                },
+                perf_out_path,
+                add_pid_suffix=True,   # keep True with njobs>1
+            )
+
         last_out = out_path
         logger.info("Saved output to %s", out_path)
         write_runlog(f"Completed VS {src_idx}, saved → {out_path}")
@@ -331,6 +409,11 @@ def main(config_path: str | Path) -> None:
 
     njobs = int(get_cfg(cfg, ["runtime", "njobs"], 4))
 
+    use_gpu = bool(get_cfg(cfg, ["runtime", "use_gpu"], False))
+    if use_gpu and torch.cuda.is_available() and njobs > 1:
+        logger.warning("use_gpu=True with njobs=%d may oversubscribe the GPU. Consider njobs=1.", njobs)
+
+
     filelist = sorted(data_root.rglob("*.npz"))
     logger.info("Found %d files in %s", len(filelist), data_root)
     write_runlog(f"Found {len(filelist)} input files in {data_root}.")
@@ -351,7 +434,6 @@ def main(config_path: str | Path) -> None:
             except Exception:
                 logger.exception("Error processing file")
                 write_runlog("Error: see stderr/logs for traceback.")
-
 
 # =====================================================    
 # CLI

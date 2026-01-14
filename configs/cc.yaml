@@ -3,13 +3,13 @@ paths:
   output_root: ./data/ncf_raw
 
 runtime:
-  njobs: 4
-  use_gpu: true
+  njobs: 1
+  use_gpu: false
   mmap: true
   frac_mem: 0.25
   min_chunk: 64
   max_chunk: 4096
-  torch_compile: true
+  torch_compile: false
   compile_mode: max-autotune
 
 data:
@@ -28,10 +28,29 @@ preprocess:
   ram_win_sec: 0.0
 
 xcorr:
+  # method switch
+  mode: conventional # conventional or v1 
+
+  # whitening
   is_spectral_whitening: true
   window_freq_hz: 0.0
+
+  # lags of interest
   max_lag_sec: 2.0
-  xcorr_seg_sec: 4.0
+
+  # window for benchmark and v1
+  xcorr_seg_sec: 60.0
+  xcorr_seg_sec_v1: 60.0
+
+  # v1 block settings
+  v1_fft_snap_pow2: true     # snap (K+2M) to power-of-two FFT length
+  v1_fallback: v1_2M         # "v1_2M" or "v1_Mp1"
+
+perf:
+  enabled: true
+  out_path: ./data/runlogs/perf_cc.csv   # append rows per run (mode/file/vs)
+  log_every_vs: true
+  log_every_chunk: false
 
 stacking:
   enabled: true

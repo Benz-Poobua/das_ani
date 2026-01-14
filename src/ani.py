@@ -10,15 +10,21 @@
 from __future__ import annotations
 
 import logging
+import math
 import torch
 import numpy as np
 import scipy.signal as signal
 
 from scipy.signal import butter, convolve, detrend, filtfilt
 from torch import nn
-from typing import Optional
+from typing import Optional, Literal, Any
 
 from src.utils import convert_to_numpy, convert_to_tensor, nextpow2
+
+try:
+    from scipy.special import lambertw  
+except Exception:   
+    lambertw = None
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +125,13 @@ def temporal_normalization(data: np.ndarray, fs: float, window_time: float) -> n
     
     # One-Bit Normalization
     if float(window_time) == 0.0:
-        logger.info("Applying one-bit normalization.")
+        logger.debug("Applying one-bit normalization.")
         return np.sign(data).astype(np.float32, copy=False)
     
     # Running Absolute Mean (RAM) Normalization
     nwin = int(round(fs * float(window_time)))
-    if nwin < 1:
-        nwin = 1
-    logger.info("Applying RAM normalization: window=%.3fs (%d samples).", window_time, nwin)
+    nwin = max(nwin, 1)
+    logger.debug("Applying RAM normalization: window=%.3fs (%d samples).", window_time, nwin)
 
     out = data.copy()
     for i in range(out.shape[0]):
@@ -135,8 +140,59 @@ def temporal_normalization(data: np.ndarray, fs: float, window_time: float) -> n
     return out.astype(np.float32, copy=False)
 
 # ==============================================================
-# 2. Spectral whitening (torch)
+# 2. Spectral whitening (torch) - (cached kernels/tapers)
 # ==============================================================
+
+class _WhiteningCache:
+    """
+    Tiny cache for spectral whitening tensors that are expensive to rebuild:
+      - conv1d kernel (depends on dtype/device/nwin)
+      - tapers (depends on dtype/device/idxf1/idxf2/nfreq)
+    """
+    __slots__ = ("kernel", "taper1", "taper2")
+
+    def __init__(self) -> None:
+        self.kernel: dict[tuple[Any, ...], torch.Tensor] = {}
+        self.taper1: dict[tuple[Any, ...], torch.Tensor] = {}
+        self.taper2: dict[tuple[Any, ...], torch.Tensor] = {}
+
+    @staticmethod
+    def _key(device: torch.device, dtype: torch.dtype, *rest: Any) -> tuple[Any, ...]:
+        # Device is hashable, dtype is hashable
+        return (device, dtype, *rest)
+    
+    def get_kernel(self, device: torch.device, dtype: torch.dtype, nwin: int) -> torch.Tensor:
+        key = self._key(device, dtype, nwin)
+        k = self.kernel.get(key)
+        if k is None:
+            # conv1d kernel shape: (out_ch=1, in_ch=1, k)
+            k = torch.ones((1, 1, nwin), device=device, dtype=dtype) / float(nwin)
+            self.kernel[key] = k
+        return k
+    
+    def get_taper1(self, device: torch.device, dtype: torch.dtype, idxf1: int) -> Optional[torch.Tensor]:
+        if idxf1 <= 0:
+            return None
+        key = self._key(device, dtype, idxf1)
+        t = self.taper1.get(key)
+        if t is None:
+            t = torch.cos(torch.linspace(torch.pi / 2, torch.pi, idxf1, device=device, dtype=dtype)) ** 2
+            self.taper1[key] = t
+        return t
+    
+    def get_taper2(self, device: torch.device, dtype: torch.dtype, nfreq: int, idxf2: int) -> Optional[torch.Tensor]:
+        if idxf2 >= nfreq:
+            return None
+        key = self._key(device, dtype, nfreq, idxf2)
+        t = self.taper2.get(key)
+        if t is None:
+            n = nfreq - idxf2
+            t = torch.cos(torch.linspace(torch.pi, torch.pi / 2, n, device=device, dtype=dtype)) ** 2
+            self.taper2[key] = t
+        return t
+        
+_WHITEN_CACHE = _WhiteningCache()
+
 def spectral_whitening(
     rfftdata: torch.Tensor,
     df: float,
@@ -166,62 +222,63 @@ def spectral_whitening(
         raise ValueError("spectral_whitening: rfftdata must be complex.")
 
     device = rfftdata.device
-    nch, nfreq = int(rfftdata.shape[0]), int(rfftdata.shape[1])
+    dtype_amp = rfftdata.real.dtype
+    B, nfreq = int(rfftdata.shape[0]), int(rfftdata.shape[1])
 
     # Compute freq indices
-    idxf1 = int(f1 / df) if df > 0 else 0
-    idxf2 = int(torch.ceil(torch.tensor(f2 / df, device=device)).item()) if df > 0 else nfreq  
+    if df <= 0:
+        idxf1, idxf2 = 0, nfreq
+    else: 
+        idxf1 = int(f1 / df) 
+        idxf2 = int(math.ceil(f2 / df))
 
     # Clip to array bounds
     idxf1 = max(0, min(idxf1, nfreq - 1))
     idxf2 = max(0, min(idxf2, nfreq))
 
-    mode = "phase-only" if float(window_freq) == 0.0 else "RAM"
-    logger.info("Spectral whitening (%s) | f1=%.3fHz f2=%.3fHz window=%.3fHz", mode, f1, f2, window_freq)
-
-    # 1. Phase-only
+    # Phase-only whitening
     if float(window_freq) == 0.0:
+        # exp(i*angle) keeps magnitude 1
         return torch.exp(1j * torch.angle(rfftdata))
     
-    # 2. RAM amplitude smoothing
-    nwin = max(int(window_freq / df), 1)
-
-    # Ensure nwin is odd so conv1d output = input length
+    # RAM amplitude smoothing
+    nwin = max(int(window_freq / df), 1) if df > 0 else 1
     if nwin % 2 == 0:
         nwin += 1
 
-    amp = torch.abs(rfftdata)       # (nch, nfreq)
-    phase = torch.angle(rfftdata)   # (nch, nfreq)
+    amp = torch.abs(rfftdata)       # (B, nfreq)
+    phase = torch.angle(rfftdata)   # (B, nfreq)
 
     # Running mean with 1D convolution (GPU)
     # conv1d expects shape (batch, channels, length)
-    amp_3d = amp.unsqueeze(1)       # (nch, 1, nfreq)
+    amp_3d = amp.unsqueeze(1)       # (B, 1, nfreq)
 
-    kernel = torch.ones((1, 1, nwin), device=device, dtype=amp.dtype) / float(nwin) 
+    kernel = _WHITEN_CACHE.get_kernel(device, dtype_amp, nwin)
 
     # Padding to maintain same length
     pad = nwin // 2
 
     amp_smooth = torch.nn.functional.conv1d(amp_3d, kernel, padding=pad).squeeze(1)
 
-    # Force shape match (conv padding can create off-by-one depending on backend)
-    if amp_smooth.shape[-1] > amp.shape[-1]:
-        amp_smooth = amp_smooth[..., : amp.shape[-1]]
-    elif amp_smooth.shape[-1] < amp.shape[-1]:
-        amp_smooth = torch.nn.functional.pad(amp_smooth, (0, amp.shape[-1] - amp_smooth.shape[-1]), mode="replicate")
+    # Safety: match length 
+    if amp_smooth.shape[-1] != amp.shape[-1]:
+        if amp_smooth.shape[-1] > amp.shape[-1]:
+            amp_smooth = amp_smooth[..., : amp.shape[-1]]
+        else:
+            amp_smooth = torch.nn.functional.pad(
+                amp_smooth, (0, amp.shape[-1] - amp_smooth.shape[-1]), mode="replicate")
 
     amp_smooth = torch.where(amp_smooth == 0, torch.ones_like(amp_smooth), amp_smooth)
-
     rfft_out = torch.exp(1j * phase) * (amp / amp_smooth)
 
     # 3. Cosine Taper outside [f1, f2] 
-    if idxf1 > 0:
-        taper1 = torch.cos(torch.linspace(torch.pi / 2, torch.pi, idxf1, device=device)) ** 2
-        rfft_out[:, :idxf1] *= taper1
+    t1 = _WHITEN_CACHE.get_taper1(device, dtype_amp, idxf1)
+    if t1 is not None:
+        rfft_out[:, :idxf1] *= t1
 
-    if idxf2 < nfreq:
-        taper2 = torch.cos(torch.linspace(torch.pi, torch.pi / 2, nfreq - idxf2, device=device)) ** 2
-        rfft_out[:, idxf2:] *= taper2
+    t2 = _WHITEN_CACHE.get_taper2(device, dtype_amp, nfreq, idxf2)
+    if t2 is not None:
+        rfft_out[:, idxf2:] *= t2
 
     return rfft_out
 
@@ -266,14 +323,7 @@ def preprocess(
 
     logger.info(
         "Preprocess | shape=%s | fs=%.2fHz | band=[%.2f, %.2f]Hz | decim=%d | diff=%s | RAM=%.3fs",
-        x_np.shape,
-        fs_raw,
-        f1,
-        f2,
-        decimation,
-        diff,
-        ram_win,
-        )
+        x_np.shape, fs_raw, f1, f2, decimation, diff, ram_win)
 
     # 1. Differentiation (optional)
     if diff:
@@ -332,7 +382,7 @@ def cross_correlation(
     if signal_1.device != signal_2.device:
         raise ValueError("cross_correlation: signal_1 and signal_2 must be on the same device.")
     
-    nch, npts = int(signal_1.shape[0]), int(signal_1.shape[1])
+    npts = int(signal_1.shape[1])
 
     # FFT size for full cross-correlation
     x_corr_len = 2 * npts - 1
@@ -369,112 +419,281 @@ def cross_correlation(
 
 class TorchCrossCorrelation(nn.Module):
     """
-    Module wrapper around cross_correlation().
-    Intended for inference-only usage in the pipeline (use with torch.no_grad()).
+    Module wrapper around cross_correlation(). 
     """
     def __init__(
         self,
         *,
+        mode: str = "conventional",  # "conventional" or "v1"
+        max_lag_samples: Optional[int] = None,
         is_spectral_whitening: bool = False,
         whitening_params: Optional[tuple[float, float, float, float]] = None,
+        v1_fft_snap_pow2: bool = True,
+        v1_fallback: str = "v1_2M",
         ) -> None:
         super().__init__()
 
-        if is_spectral_whitening and whitening_params is None:
-            raise ValueError("TorchCrossCorrelation: whitening_params required when whitening enabled.")
+        self.mode = str(mode).lower()
+        self.max_lag_samples = int(max_lag_samples) if max_lag_samples is not None else None
+
         self.is_spectral_whitening = bool(is_spectral_whitening)
         self.whitening_params = whitening_params
 
-        self.is_spectral_whitening = is_spectral_whitening
-        self.whitening_params = whitening_params
+        self.v1_fft_snap_pow2 = bool(v1_fft_snap_pow2)
+        self.v1_fallback = str(v1_fallback)
+
+        if self.mode not in {"conventional", "v1"}:
+            raise ValueError(f"Unknown mode={self.mode}. Use 'conventional' or 'v1'.")
+
+        if self.v1_fallback not in {"v1_2M", "v1_Mp1"}:
+            raise ValueError("v1_fallback must be 'v1_2M' or 'v1_Mp1'.")
+
+        if self.is_spectral_whitening and self.whitening_params is None:
+            raise ValueError("TorchCrossCorrelation: whitening_params required when whitening enabled.")
+
+        if self.mode == "v1" and self.max_lag_samples is None:
+            raise ValueError("TorchCrossCorrelation(mode='v1'): max_lag_samples is required.")
+        
+        # Conventional caching 
+        self._conv_fast_length: Optional[int] = None
+        self._conv_df: Optional[float] = None
+        self._conv_xcorr_len: Optional[int] = None
 
         logger.info(
-            "TorchCrossCorrelation initialized | whitening=%s | params=%s",
-            self.is_spectral_whitening,
-            self.whitening_params,
-        )
+            "TorchCrossCorrelation initialized | mode=%s | max_lag=%s | whitening=%s",
+            self.mode, self.max_lag_samples, self.is_spectral_whitening)
+        
+    def _conventional_cached(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
+        npts = int(data1.shape[1])
+        x_corr_len = 2 * npts - 1
+
+        if self._conv_fast_length is None or self._conv_xcorr_len != x_corr_len:
+            fast_length_raw = nextpow2(x_corr_len)
+            fast_length = int(fast_length_raw if isinstance(fast_length_raw, int) else int(fast_length_raw.item()))
+            self._conv_fast_length = fast_length
+            self._conv_xcorr_len = x_corr_len
+
+            if self.is_spectral_whitening:
+                assert self.whitening_params is not None
+                fs = float(self.whitening_params[0])
+                self._conv_df = fs / float(fast_length)
+            else:
+                self._conv_df = None
+        
+        fast_length = int(self._conv_fast_length)
+        fft_1 = torch.fft.rfft(data1, n=fast_length, dim=-1)
+        fft_2 = torch.fft.rfft(data2, n=fast_length, dim=-1)
+
+        if self.is_spectral_whitening:
+            assert self.whitening_params is not None
+            _, window_freq, f1, f2 = self.whitening_params
+            df = float(self._conv_df) if self._conv_df is not None else float(self.whitening_params[0]) / float(fast_length)
+            fft_1 = spectral_whitening(fft_1, df, float(window_freq), float(f1), float(f2))
+            fft_2 = spectral_whitening(fft_2, df, float(window_freq), float(f1), float(f2))
+
+        cc_full = torch.fft.irfft(torch.conj(fft_1) * fft_2, n=fast_length, dim=-1)
+        cc_full = torch.roll(cc_full, shifts=fast_length // 2, dims=-1)
+
+        x_corr_len = int(self._conv_xcorr_len)  # type: ignore[arg-type]
+        start = fast_length // 2 - (x_corr_len // 2)
+        end = start + x_corr_len
+        return cc_full[:, start:end]
 
     def forward(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
-        return cross_correlation(
+        if self.mode == "conventional":
+            return self._conventional_cached(data1, data2)
+
+        # v1 path (real-only)
+        if data1.is_complex() or data2.is_complex():
+            raise ValueError("TorchCrossCorrelation(mode='v1') expects real tensors.")
+        assert self.max_lag_samples is not None
+        return cross_correlation_v1_real(
             data1,
             data2,
+            max_lag_samples=self.max_lag_samples,
             is_spectral_whitening=self.is_spectral_whitening,
             whitening_params=self.whitening_params,
-            )
+            fft_snap_pow2=self.v1_fft_snap_pow2,
+            fallback=self.v1_fallback)
 
-@torch.no_grad()    
-def cross_correlation_full(
-    data: torch.Tensor,
-    ich1: int,
-    ich2: int,
+# ==============================================================
+# 5. Zhang (2025) Workflow
+# ==============================================================
+def choose_block_size_v2(
+    M: int,
     *,
+    fft_snap_pow2: bool = True,
+    fallback: Literal["v1_2M", "v1_Mp1"] = "v1_2M",
+    ) -> tuple[int, int]:
+    """
+    Choose block size K for the block-by-block short-lag correlation.
+    Returns (K, Lfft) where Lfft = K + 2M (possibly snapped to pow2).
+
+    v2 (from Zhang 2025) formula:
+        K* = 2M( -W_{-1}(-1/(4eM)) - 1 )
+
+    Fallback:
+        v1_2M  -> K = 2M
+        v1_Mp1 -> K = M+1
+    """
+    if M <= 0:
+        raise ValueError("choose_block_size_v2: M must be > 0")
+    
+    # Compute K* (v2) if Lambert W is available
+    K_star: Optional[float] = None
+    if lambertw is not None:
+        # Argument is negative and close to 0: valid for W_{-1}
+        z = -1.0 / (4.0 * math.e * float(M))
+        w = lambertw(z, k=-1)
+
+        # Use real part 
+        w_real = float(w.real)
+        K_star = 2.0 * float(M) * (-w_real - 1.0)
+
+        # Numerical guard
+        if not math.isfinite(K_star) or K_star <= 0.0:
+            K_star = None
+
+        logger.debug("LambertW available: using v2 block-size formula (M=%d).", M)
+    else:
+        logger.debug("LambertW not available: using fallback block-size rule (M=%d, fallback=%s).", M, fallback)
+
+    # Fallback if v2 unavailable
+    if K_star is None:
+        if fallback == "v1_2M":
+            K = int(2 * M)
+        elif fallback == "v1_Mp1":
+            K = int(M + 1)
+        else:
+            raise ValueError(f"Unknown fallback: {fallback}")
+    else:
+        K = int(max(1, round(K_star)))
+
+    # Choose FFT length
+    L = int(K + 2 * M)
+    if fft_snap_pow2:
+        Lpow2 = int(nextpow2(L))
+        L = Lpow2
+        K = int(L - 2*M)
+
+    # Final guards AFTER snap: enforce K>=M+1 by snapping L again if needed
+    if K < M + 1:
+        K = M + 1
+        L = int(K + 2*M)
+        if fft_snap_pow2:
+            L = int(nextpow2(L))
+            K = int(L - 2*M)
+    
+    return K, L
+
+@torch.no_grad()
+def cross_correlation_v1_real(
+    signal_1: torch.Tensor,
+    signal_2: torch.Tensor,
+    *,
+    max_lag_samples: int,
     is_spectral_whitening: bool = False,
     whitening_params: Optional[tuple[float, float, float, float]] = None,
-    ) -> torch.Tensor:
+    fft_snap_pow2: bool = True,
+    fallback: Literal["v1_2M", "v1_Mp1"] = "v1_2M",
+) -> torch.Tensor:
     """
-    Pairwise CC between selected channels [ich1:ich2] and all channels, via FFT broadcasting.
+    Real-valued block-by-block short-lag correlation.
+    Returns only lags in [-M, M], shape = (B, 2M+1).
 
-    Output shape: (Nsel × Ntotal × (2*nt-1))
-
-    :param data: Tensor (Ntotal × nt).
-    :param ich1: Start channel index (inclusive).
-    :param ich2: End channel index (exclusive).
-    :param is_spectral_whitening: If True, apply whitening.
-    :param whitening_params: (fs, window_freq, f1, f2) used by spectral_whitening.
-    :return: CC tensor (Nsel × Ntotal × (2*nt-1)).
+    signal_1, signal_2: (B, N) real tensors (float32 recommended) on same device.
     """
-    if not isinstance(data, torch.Tensor):
-        raise TypeError("cross_correlation_full: data must be torch.Tensor.")
-    if data.ndim != 2:
-        raise ValueError("cross_correlation_full: data must be 2D (Ntotal × nt).")
-    if ich1 < 0 or ich2 > int(data.shape[0]) or ich1 >= ich2:
-        raise ValueError("cross_correlation_full: invalid channel slice ich1:ich2.")
+    if signal_1.ndim != 2 or signal_2.ndim != 2:
+        raise ValueError("cross_correlation_v1_real: inputs must be 2D (B × N).")
+    if signal_1.shape != signal_2.shape:
+        raise ValueError("cross_correlation_v1_real: signal_1 and signal_2 must have same shape.")
+    if signal_1.dtype != signal_2.dtype:
+        raise ValueError("cross_correlation_v1_real: signal_1 and signal_2 must have same dtype.")
+    if signal_1.device != signal_2.device:
+        raise ValueError("cross_correlation_v1_real: signals must be on the same device.")
+    if max_lag_samples <= 0:
+        raise ValueError("cross_correlation_v1_real: max_lag_samples must be > 0.")
     if is_spectral_whitening and whitening_params is None:
-        raise ValueError("cross_correlation_full: whitening_params required when whitening enabled.")
+        raise ValueError("cross_correlation_v1_real: whitening_params required when whitening enabled.")
     
-    n_total, npts = int(data.shape[0]), int(data.shape[1])
-    n_sel = int(ich2 - ich1)
+    # Recommend float32 for speed
+    if signal_1.dtype not in (torch.float16, torch.float32, torch.float64):
+        raise TypeError(f"Expected real floating dtype; got {signal_1.dtype}")
 
-    # FFT size for full CC
-    x_corr_len = 2 * npts - 1
-    fast_length_raw = nextpow2(x_corr_len)
-    fast_length = int(fast_length_raw if isinstance(fast_length_raw, int) else int(fast_length_raw.item()))
+    M = int(max_lag_samples)
+    B, N = int(signal_1.shape[0]), int(signal_1.shape[1])
+    device = signal_1.device
 
-    # Select subset of channels
-    sig_sel = data[ich1:ich2, :]                                 # (Nsel × npts)
-    sig_all = data                                               # (Ntotal × npts)
+    # Choose block size (K) and FFT length (Lfft = K + 2M, possibly snapped)
+    K, Lfft = choose_block_size_v2(M, fft_snap_pow2=fft_snap_pow2, fallback=fallback)
 
-    # Forward FFT
-    fft_sel = torch.fft.rfft(sig_sel, n=fast_length, dim=-1)     # (Nsel, Nfreq)
-    fft_all = torch.fft.rfft(sig_all, n=fast_length, dim=-1)     # (Ntotal, Nfreq)
+    # Number of blocks
+    nblocks = int((N + K - 1) // K)  # ceil(N/K) without float
 
-    # Optional spectral whitening 
+    # Accumulator spectrum
+    nfreq = Lfft // 2 + 1
+    Rspec = torch.zeros((B, nfreq), dtype=torch.complex64, device=device)
+
+    # Preallocate time-domain buffers (reused each block)
+    # x_tilde: [x(lK-M : (l+1)K+M-1)] length K+2M, zero-padded outside [0,N)
+    # y_tilde: [0...0, y(lK:(l+1)K-1), 0...0] length K+2M
+    x_t = torch.zeros((B, Lfft), device=device, dtype=signal_1.dtype)
+    y_t = torch.zeros((B, Lfft), device=device, dtype=signal_2.dtype)
+
+    # Whitening constants
     if is_spectral_whitening:
-        assert whitening_params is not None
-        fs, window_freq, f1, f2 = whitening_params
-        df = float(fs) / float(fast_length)
+        fs, window_freq, f1, f2 = whitening_params  # type: ignore[misc]
+        df = float(fs) / float(Lfft)
+        window_freq = float(window_freq)
+        f1 = float(f1)
+        f2 = float(f2)
 
-        fft_sel = spectral_whitening(fft_sel, df, float(window_freq), float(f1), float(f2))
-        fft_all = spectral_whitening(fft_all, df, float(window_freq), float(f1), float(f2))
+    # Localize for tiny speed gains (Python-level)
+    rfft = torch.fft.rfft
+    irfft = torch.fft.irfft
 
-    # Broadcasting for pairwise CC:
-    # (Nsel, 1, Nfreq) * (1, Ntotal, Nfreq) -> (Nsel, Ntotal, Nfreq)
-    fft_prod = torch.conj(fft_sel.unsqueeze(1)) * fft_all.unsqueeze(0)
-    cc_full = torch.fft.irfft(fft_prod, n=fast_length, dim=-1)
+    for l in range(nblocks):
+        start = l * K
+        end = min(start + K, N)
+        klen = end - start  # may be < K for last block
 
-    cc_full = torch.roll(cc_full, shifts=fast_length // 2, dims=-1)
+        # Reuse buffers
+        x_t.zero_()
+        y_t.zero_()
 
-    start = fast_length // 2 - (x_corr_len // 2)
-    end = start + x_corr_len
+        # y_tilde: [0..0, y(start:end), 0..0]
+        y_t[:, M:M + klen] = signal_2[:, start:end]
 
-    out = cc_full[:, :, start:end]
+        # x_tilde: x[start-M : start+K+M) placed into x_t[0:K+2M], clipped to [0,N)
+        x0 = start - M
+        x1 = start + K + M
 
-    logger.info(
-        "cross_correlation_full output shape=%s (Nsel=%d, Ntotal=%d, CClen=%d)",
-        tuple(out.shape),
-        n_sel,
-        n_total,
-        x_corr_len,
-        )
+        # Intersection with [0, N)
+        ix0 = max(0, x0)
+        ix1 = min(N, x1)
 
-    return out
+        if ix1 > ix0:
+            # Where to place into x_t: offset by (ix0 - x0)
+            dst0 = ix0 - x0
+            dst1 = dst0 + (ix1 - ix0)
+            x_t[:, dst0:dst1] = signal_1[:, ix0:ix1]
+
+        # FFTs
+        X = rfft(x_t, n=Lfft, dim=-1)
+        Y = rfft(y_t, n=Lfft, dim=-1)
+
+        # Whitening per block (if enabled)
+        if is_spectral_whitening:
+            X = spectral_whitening(X, df, window_freq, f1, f2)
+            Y = spectral_whitening(Y, df, window_freq, f1, f2)
+
+        # Accumulate cross-spectrum conj(X)*Y
+        Rspec.addcmul_(X.conj(), Y)
+    
+    # Inverse FFT → circular correlation length Lfft
+    r = irfft(Rspec, n=Lfft, dim=-1)
+
+    # Extract [-M, M]
+    out = torch.cat([r[:, Lfft - M:Lfft], r[:, 0:M + 1]], dim=-1)
+
+    return out.to(dtype=torch.float32)
