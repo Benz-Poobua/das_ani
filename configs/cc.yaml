@@ -29,10 +29,10 @@ preprocess:
 
 xcorr:
   # method switch
-  mode: conventional # conventional or v1 
+  mode: v1 # conventional or v1 
 
   # whitening
-  is_spectral_whitening: true
+  is_spectral_whitening: true # means: do whitening, but now done in prewhiten stage
   window_freq_hz: 0.0
 
   # lags of interest

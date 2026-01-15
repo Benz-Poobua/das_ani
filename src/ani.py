@@ -201,20 +201,20 @@ def spectral_whitening(
     f2: float,
     ) -> torch.Tensor:
     """
-    Spectral whitening on complex rFFT data (nch × nfreq).
+    Spectral whitening on complex rFFT data (B × nfreq).
 
     Modes:
     - window_freq == 0 : phase-only whitening (amp -> 1)
     - window_freq > 0  : RAM smoothing of amplitude in frequency domain via conv1d
 
-    Applies cosine taper outside [f1, f2].
+    Applies cosine taper outside [f1, f2) (high-cut is exclusive).
 
-    :param rfftdata: Complex tensor (nch × nfreq).
+    :param rfftdata: Complex tensor (B × nfreq).
     :param df: Frequency bin spacing (Hz).
     :param window_freq: RAM window (Hz). 0 => phase-only.
     :param f1: Low-cut (Hz).
     :param f2: High-cut (Hz).
-    :return: Whitened rFFT tensor (nch × nfreq).
+    :return: Whitened rFFT tensor (B × nfreq).
     """
     if not isinstance(rfftdata, torch.Tensor):
         raise TypeError("spectral_whitening: rfftdata must be torch.Tensor.")
@@ -223,64 +223,116 @@ def spectral_whitening(
 
     device = rfftdata.device
     dtype_amp = rfftdata.real.dtype
-    B, nfreq = int(rfftdata.shape[0]), int(rfftdata.shape[1])
+    nfreq = int(rfftdata.shape[1])
 
-    # Compute freq indices
+    # freq indices for taper band
     if df <= 0:
         idxf1, idxf2 = 0, nfreq
     else: 
         idxf1 = int(f1 / df) 
         idxf2 = int(math.ceil(f2 / df))
 
-    # Clip to array bounds
-    idxf1 = max(0, min(idxf1, nfreq - 1))
+    # Clip to array bounds (idxf2 is exclusive end)
+    idxf1 = max(0, min(idxf1, nfreq)) 
     idxf2 = max(0, min(idxf2, nfreq))
 
+    if idxf2 <= idxf1:
+        return torch.zeros_like(rfftdata)
+
+    # Whitening core
+    phase = torch.angle(rfftdata)  # (B, nfreq)
+
+    df = float(df)
+    window_freq = float(window_freq)
+
     # Phase-only whitening
-    if float(window_freq) == 0.0:
+    if window_freq == 0.0:
         # exp(i*angle) keeps magnitude 1
-        return torch.exp(1j * torch.angle(rfftdata))
-    
-    # RAM amplitude smoothing
-    nwin = max(int(window_freq / df), 1) if df > 0 else 1
-    if nwin % 2 == 0:
-        nwin += 1
+        rfft_out = torch.exp(1j * phase)
+    else:
+        # RAM amplitude smoothing
+        nwin = max(int(window_freq / df), 1) if df > 0 else 1
+        if nwin % 2 == 0:
+            nwin += 1
 
-    amp = torch.abs(rfftdata)       # (B, nfreq)
-    phase = torch.angle(rfftdata)   # (B, nfreq)
+        amp = torch.abs(rfftdata)       # (B, nfreq)
 
-    # Running mean with 1D convolution (GPU)
-    # conv1d expects shape (batch, channels, length)
-    amp_3d = amp.unsqueeze(1)       # (B, 1, nfreq)
+        # Running mean with 1D convolution (GPU)
+        # conv1d expects shape (batch, channels, length)
+        amp_3d = amp.unsqueeze(1)       # (B, 1, nfreq)
 
-    kernel = _WHITEN_CACHE.get_kernel(device, dtype_amp, nwin)
+        kernel = _WHITEN_CACHE.get_kernel(device, dtype_amp, nwin)
 
-    # Padding to maintain same length
-    pad = nwin // 2
+        # Padding to maintain same length
+        pad = nwin // 2
 
-    amp_smooth = torch.nn.functional.conv1d(amp_3d, kernel, padding=pad).squeeze(1)
+        amp_smooth = torch.nn.functional.conv1d(amp_3d, kernel, padding=pad).squeeze(1)
 
-    # Safety: match length 
-    if amp_smooth.shape[-1] != amp.shape[-1]:
-        if amp_smooth.shape[-1] > amp.shape[-1]:
-            amp_smooth = amp_smooth[..., : amp.shape[-1]]
-        else:
-            amp_smooth = torch.nn.functional.pad(
-                amp_smooth, (0, amp.shape[-1] - amp_smooth.shape[-1]), mode="replicate")
+        # Safety: match length 
+        if amp_smooth.shape[-1] != amp.shape[-1]:
+            if amp_smooth.shape[-1] > amp.shape[-1]:
+                amp_smooth = amp_smooth[..., : amp.shape[-1]]
+            else:
+                amp_smooth = torch.nn.functional.pad(
+                    amp_smooth, (0, amp.shape[-1] - amp_smooth.shape[-1]), mode="replicate")
 
-    amp_smooth = torch.where(amp_smooth == 0, torch.ones_like(amp_smooth), amp_smooth)
-    rfft_out = torch.exp(1j * phase) * (amp / amp_smooth)
+        amp_smooth = torch.where(amp_smooth == 0, torch.ones_like(amp_smooth), amp_smooth)
+        rfft_out = torch.exp(1j * phase) * (amp / amp_smooth)
 
-    # 3. Cosine Taper outside [f1, f2] 
+    # Always apply cosine taper outside [f1, f2] 
     t1 = _WHITEN_CACHE.get_taper1(device, dtype_amp, idxf1)
-    if t1 is not None:
+    if t1 is not None and 0 < idxf1 < nfreq:
         rfft_out[:, :idxf1] *= t1
 
     t2 = _WHITEN_CACHE.get_taper2(device, dtype_amp, nfreq, idxf2)
-    if t2 is not None:
+    if t2 is not None and 0 <= idxf2 < nfreq:
         rfft_out[:, idxf2:] *= t2
 
     return rfft_out
+
+@torch.no_grad()
+def whiten_per_segment_torch(
+    x: torch.Tensor,                 # (nch, npts_new) float32 on CPU or GPU
+    *,
+    fs_proc: float,
+    npts_seg: int,
+    window_freq_hz: float,
+    f1: float,
+    f2: float,
+) -> torch.Tensor:
+    """
+    Spectral whitening applied per segment (FFT length = npts_seg), in torch.
+    Returns same shape/device as input: (nch, npts_new), float32.
+
+    Assumes x is already segmented cleanly: npts_new % npts_seg == 0.
+    """
+    if not isinstance(x, torch.Tensor):
+        raise TypeError("whiten_per_segment_torch: x must be a torch.Tensor")
+    if x.ndim != 2:
+        raise ValueError(f"whiten_per_segment_torch: expected 2D (nch, nt); got {tuple(x.shape)}")
+
+    nch, npts_new = int(x.shape[0]), int(x.shape[1])
+    if npts_seg <= 0:
+        raise ValueError(f"whiten_per_segment_torch: npts_seg must be > 0; got {npts_seg}")
+    if npts_new % npts_seg != 0:
+        raise ValueError(
+            "whiten_per_segment_torch: npts_new must be divisible by npts_seg; "
+            f"got npts_new={npts_new}, npts_seg={npts_seg}"
+        )
+
+    # Flatten segments into batch
+    nseg = npts_new // npts_seg
+    B = nch * nseg
+    df = float(fs_proc) / float(npts_seg)
+
+    x = x.to(dtype=torch.float32)
+    x2 = x.reshape(B, npts_seg)  # (B, npts_seg)
+
+    X = torch.fft.rfft(x2, n=npts_seg, dim=-1)  # (B, nfreq) complex
+    Xw = spectral_whitening(X, df, float(window_freq_hz), float(f1), float(f2))
+    xw = torch.fft.irfft(Xw, n=npts_seg, dim=-1).to(torch.float32)  # (B, npts_seg)
+
+    return xw.reshape(nch, npts_new)
 
 # ==============================================================
 # 3. Full preprocessing pipeline

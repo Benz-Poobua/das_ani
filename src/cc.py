@@ -39,7 +39,7 @@ from src.utils import (
     write_perf_row
     )
 
-from src.ani import preprocess, TorchCrossCorrelation 
+from src.ani import preprocess, TorchCrossCorrelation, whiten_per_segment_torch
 
 # =====================================================
 # Logging
@@ -209,6 +209,37 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     data_proc = data_proc[:, :npts_new]
     flag_mean = int(nseg)
 
+    # Whitening: do it once, per segment, before CC
+    prewhiten = bool(is_spectral_whitening)
+
+    if prewhiten:
+        logger.info(
+            "Whitening (per-segment, torch) | df=fs_proc/npts_seg=%.6f | window=%.3f Hz | band=[%.2f, %.2f] Hz",
+            fs_proc / npts_seg, window_freq_hz, f1, f2
+        )
+
+        # Convert ONCE to torch on target device
+        data_tensor = convert_to_tensor(data_proc, device=torch.device("cpu"))  # torch CPU
+        if device.type == "cuda":
+            data_tensor = data_tensor.pin_memory().to(device, non_blocking=True)
+        else:
+            data_tensor = data_tensor.to(device)
+
+        # Whiten in-place pipeline (returns torch tensor on same device)
+        data_tensor = whiten_per_segment_torch(
+            data_tensor,
+            fs_proc=fs_proc,
+            npts_seg=npts_seg,
+            window_freq_hz=window_freq_hz,
+            f1=f1,
+            f2=f2,
+        )
+    else:
+        data_tensor = convert_to_tensor(data_proc, device=torch.device("cpu"))
+        if device.type == "cuda":
+            data_tensor = data_tensor.pin_memory()
+        data_tensor = data_tensor.to(device, non_blocking=True)
+
     # Lag window (compute only after segmentation is valid) 
     if mode == "conventional":
         L_full = 2 * npts_seg - 1           # full CC length
@@ -241,14 +272,18 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         torch.cuda.empty_cache()
 
     # ---- model ----
+    # IMPORTANT: if prewhiten=True, disable whitening inside CC to avoid double whitening
+    is_spectral_whitening_cc = False if prewhiten else bool(is_spectral_whitening)
+    whitening_params_cc = None if prewhiten else (float(fs_proc), float(window_freq_hz), float(f1), float(f2))
+
     model_conf = {
         "mode": mode,
         "max_lag_samples": int(npts_lag) if mode == "v1" else None,
-        "is_spectral_whitening": is_spectral_whitening,
-        "whitening_params": (float(fs_proc), float(window_freq_hz), float(f1), float(f2)),
+        "is_spectral_whitening": is_spectral_whitening_cc,
+        "whitening_params": whitening_params_cc,
         "v1_fft_snap_pow2": v1_fft_snap_pow2,
         "v1_fallback": v1_fallback,
-    }
+        }
 
     model: nn.Module = TorchCrossCorrelation(**model_conf)
 
@@ -268,13 +303,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             logger.warning("torch.compile() not available or failed: %s", e)
     
     model.eval()
-    
-    # ---- data tensor (CPU -> pinned -> device) ----
-    data_tensor = convert_to_tensor(data_proc, device=torch.device("cpu"))    # always CPU first
-    if device.type == "cuda":
-        data_tensor = data_tensor.pin_memory()
-    data_tensor = data_tensor.to(device, non_blocking=True)
-    
+        
     # ---- resume state ----
     meta_path = out_dir / basename.replace(".npz", f"_cc_state_{mode}.json")
     completed_src = load_resume_state(meta_path)
@@ -338,7 +367,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             # data2 usually already contiguous; avoid copies unless needed
             if not full2.is_contiguous():
                 full2 = full2.contiguous()
-            data2 = full2.reshape(batch_len * nseg, npts_seg)
+            data2 = full2.view(batch_len * nseg, npts_seg)
 
             # Run CC model (no autograd)
             with torch.inference_mode():
