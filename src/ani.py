@@ -356,10 +356,10 @@ def preprocess(
     return x_np
 
 # ==============================================================
-# 4. Cross-correlation (torch) + module wrapper
+# 4. Cross-correlation (torch)
 # ==============================================================
 @torch.no_grad()
-def cross_correlation(
+def cross_correlation_full_linear(
     signal_1: torch.Tensor,
     signal_2: torch.Tensor,
     *,
@@ -367,7 +367,10 @@ def cross_correlation(
     whitening_params: Optional[tuple[float, float, float, float]] = None,
     ) -> torch.Tensor:
     """
-    Multi-channel cross-correlation via FFT (vectorized).
+    Full-lag linear cross-correlation with *standard lag ordering*:
+
+        lags = [-(N-1), ..., -1, 0, +1, ..., +(N-1)]
+        output length = 2N - 1
 
     :param signal_1: Tensor (nch × nt).
     :param signal_2: Tensor (nch × nt), same shape/device as signal_1.
@@ -376,50 +379,63 @@ def cross_correlation(
     :return: CC tensor (nch × (2*nt-1)).
     """
     if signal_1.ndim != 2 or signal_2.ndim != 2:
-        raise ValueError("cross_correlation: inputs must be 2D (nch × nt).")
+        raise ValueError("cross_correlation_full_linear: inputs must be 2D (B × N).")
     if signal_1.shape != signal_2.shape:
-        raise ValueError("cross_correlation: signal_1 and signal_2 must have same shape.")
+        raise ValueError("cross_correlation_full_linear: signal_1 and signal_2 must have same shape.")
     if signal_1.device != signal_2.device:
-        raise ValueError("cross_correlation: signal_1 and signal_2 must be on the same device.")
+        raise ValueError("cross_correlation_full_linear: signals must be on the same device.")
     
-    npts = int(signal_1.shape[1])
+    N = int(signal_1.shape[1])
 
-    # FFT size for full cross-correlation
-    x_corr_len = 2 * npts - 1
+    L_lin = 2 * N - 1
+    L_raw = nextpow2(L_lin)
+    L = int(L_raw if isinstance(L_raw, int) else int(L_raw.item()))
 
-    # nextpow2() returns int for scalar
-    fast_length_raw = nextpow2(x_corr_len)
-    fast_length = int(fast_length_raw if isinstance(fast_length_raw, int) else int(fast_length_raw.item()))
-
-    fft_1 = torch.fft.rfft(signal_1, n=fast_length, dim=-1)
-    fft_2 = torch.fft.rfft(signal_2, n=fast_length, dim=-1)
+    X = torch.fft.rfft(signal_1, n=L, dim=-1)
+    Y = torch.fft.rfft(signal_2, n=L, dim=-1)
 
     if is_spectral_whitening:
         if whitening_params is None:
-            raise ValueError("cross_correlation: whitening_params required when whitening is enabled.")
+            raise ValueError("cross_correlation_full_linear: whitening_params required when whitening enabled.")
         fs, window_freq, f1, f2 = whitening_params
-        df = float(fs) / float(fast_length)
+        df = float(fs) / float(L)
+        X = spectral_whitening(X, df, float(window_freq), float(f1), float(f2))
+        Y = spectral_whitening(Y, df, float(window_freq), float(f1), float(f2))
 
-        fft_1 = spectral_whitening(fft_1, df, float(window_freq), float(f1), float(f2))
-        fft_2 = spectral_whitening(fft_2, df, float(window_freq), float(f1), float(f2))
+    
+    r = torch.fft.irfft(torch.conj(X) * Y, n=L, dim=-1)  # circular corr (zero-lag at index 0)
 
-    # Multiply with conjugate for CC spectrum 
-    fft_prod = torch.conj(fft_1) * fft_2
+    # Assemble linear lag ordering:
+    # negative lags are at the end of r (wrapped), positives (and zero) at the front.
+    cc_full = torch.cat([r[:, L - (N - 1): L], r[:, :N]], dim=-1)  # (B, 2N-1)
 
-    # Invert FFT → cross-correlation in time domain
-    cc_full = torch.fft.irfft(fft_prod, n=fast_length, dim=-1)
- 
-    # Center zero lag
-    cc_full = torch.roll(cc_full, shifts=fast_length // 2, dims=-1)
+    return cc_full.to(dtype=torch.float32)
 
-    start = fast_length // 2 - (x_corr_len // 2)
-    end = start + x_corr_len
+@torch.no_grad()
+def cross_correlation(
+    signal_1: torch.Tensor,
+    signal_2: torch.Tensor,
+    *,
+    is_spectral_whitening: bool = False,
+    whitening_params: Optional[tuple[float, float, float, float]] = None, 
+    ) -> torch.Tensor:
+    """
+    Backward-compatible alias: conventional full-lag linear CC (2N-1) with standard ordering.
+    """
+    return cross_correlation_full_linear(
+        signal_1,
+        signal_2,
+        is_spectral_whitening=is_spectral_whitening,
+        whitening_params=whitening_params)
 
-    return cc_full[:, start:end]
-
+# ==============================================================
+# 5. Module wrapper
+# ==============================================================
 class TorchCrossCorrelation(nn.Module):
     """
-    Module wrapper around cross_correlation(). 
+    Wrapper supporting:
+      - mode="conventional": full-lag (2N-1), standard lag ordering
+      - mode="v1": short-lag (2M+1)
     """
     def __init__(
         self,
@@ -454,54 +470,51 @@ class TorchCrossCorrelation(nn.Module):
         if self.mode == "v1" and self.max_lag_samples is None:
             raise ValueError("TorchCrossCorrelation(mode='v1'): max_lag_samples is required.")
         
-        # Conventional caching 
-        self._conv_fast_length: Optional[int] = None
+        # Conventional caching: cache FFT length L and df for given N
+        self._conv_L: Optional[int] = None
+        self._conv_N: Optional[int] = None
         self._conv_df: Optional[float] = None
-        self._conv_xcorr_len: Optional[int] = None
 
         logger.info(
             "TorchCrossCorrelation initialized | mode=%s | max_lag=%s | whitening=%s",
             self.mode, self.max_lag_samples, self.is_spectral_whitening)
-        
-    def _conventional_cached(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
-        npts = int(data1.shape[1])
-        x_corr_len = 2 * npts - 1
 
-        if self._conv_fast_length is None or self._conv_xcorr_len != x_corr_len:
-            fast_length_raw = nextpow2(x_corr_len)
-            fast_length = int(fast_length_raw if isinstance(fast_length_raw, int) else int(fast_length_raw.item()))
-            self._conv_fast_length = fast_length
-            self._conv_xcorr_len = x_corr_len
+    def _conventional_full_cached(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
+        N = int(data1.shape[1])
+
+        if self._conv_L is None or self._conv_N != N:
+            L_lin = 2 * N - 1
+            L_raw = nextpow2(L_lin)
+            L = int(L_raw if isinstance(L_raw, int) else int(L_raw.item()))
+            self._conv_L = L
+            self._conv_N = N
 
             if self.is_spectral_whitening:
                 assert self.whitening_params is not None
                 fs = float(self.whitening_params[0])
-                self._conv_df = fs / float(fast_length)
+                self._conv_df = fs / float(L)
             else:
                 self._conv_df = None
-        
-        fast_length = int(self._conv_fast_length)
-        fft_1 = torch.fft.rfft(data1, n=fast_length, dim=-1)
-        fft_2 = torch.fft.rfft(data2, n=fast_length, dim=-1)
+
+        L = int(self._conv_L)
+        X = torch.fft.rfft(data1, n=L, dim=-1)
+        Y = torch.fft.rfft(data2, n=L, dim=-1)
 
         if self.is_spectral_whitening:
             assert self.whitening_params is not None
             _, window_freq, f1, f2 = self.whitening_params
-            df = float(self._conv_df) if self._conv_df is not None else float(self.whitening_params[0]) / float(fast_length)
-            fft_1 = spectral_whitening(fft_1, df, float(window_freq), float(f1), float(f2))
-            fft_2 = spectral_whitening(fft_2, df, float(window_freq), float(f1), float(f2))
+            df = float(self._conv_df) if self._conv_df is not None else float(self.whitening_params[0]) / float(L)
+            X = spectral_whitening(X, df, float(window_freq), float(f1), float(f2))
+            Y = spectral_whitening(Y, df, float(window_freq), float(f1), float(f2))
 
-        cc_full = torch.fft.irfft(torch.conj(fft_1) * fft_2, n=fast_length, dim=-1)
-        cc_full = torch.roll(cc_full, shifts=fast_length // 2, dims=-1)
+        r = torch.fft.irfft(torch.conj(X) * Y, n=L, dim=-1)
+        cc_full = torch.cat([r[:, L - (N - 1): L], r[:, :N]], dim=-1)  # (B, 2N-1)
+        return cc_full.to(dtype=torch.float32)
 
-        x_corr_len = int(self._conv_xcorr_len)  # type: ignore[arg-type]
-        start = fast_length // 2 - (x_corr_len // 2)
-        end = start + x_corr_len
-        return cc_full[:, start:end]
 
     def forward(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
         if self.mode == "conventional":
-            return self._conventional_cached(data1, data2)
+            return self._conventional_full_cached(data1, data2)
 
         # v1 path (real-only)
         if data1.is_complex() or data2.is_complex():
@@ -514,10 +527,11 @@ class TorchCrossCorrelation(nn.Module):
             is_spectral_whitening=self.is_spectral_whitening,
             whitening_params=self.whitening_params,
             fft_snap_pow2=self.v1_fft_snap_pow2,
-            fallback=self.v1_fallback)
+            fallback=self.v1_fallback,  # type: ignore[arg-type]
+            )
 
 # ==============================================================
-# 5. Zhang (2025) Workflow
+# 6. Zhang (2025) Workflow
 # ==============================================================
 def choose_block_size_v2(
     M: int,

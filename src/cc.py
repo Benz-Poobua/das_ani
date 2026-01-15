@@ -125,11 +125,26 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
 
     # ---- mode ----
     mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
+    if mode not in {"conventional", "v1"}:
+        raise ValueError(f"xcorr.mode must be 'conventional' or 'v1'; got {mode}")
+
     if mode == "v1":
         xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec_v1"], xcorr_seg_sec))
 
-    npts_lag = int(max_lag_sec * fs_proc)
-    npts_seg = int(xcorr_seg_sec * fs_proc)
+    npts_lag = int(round(max_lag_sec * fs_proc))
+    npts_seg = int(round(xcorr_seg_sec * fs_proc))
+
+    if npts_seg <= 0:
+        raise ValueError(f"xcorr_seg_sec too small -> npts_seg={npts_seg}")
+    if npts_lag <= 0:
+        raise ValueError(f"max_lag_sec too small -> npts_lag={npts_lag}")
+
+    if npts_lag >= npts_seg:
+        raise ValueError(
+            f"Require max_lag_sec < xcorr_seg_sec so that M < Nseg. "
+            f"Got npts_lag={npts_lag}, npts_seg={npts_seg}."
+        )
+
     cc_out_len = 2 * npts_lag + 1
 
     v1_fft_snap_pow2 = bool(get_cfg(cfg, ["xcorr", "v1_fft_snap_pow2"], True))
@@ -160,9 +175,6 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         logger.warning("Skipping %s because npts=%d < min_npts=%d", in_path, npts, min_npts)
         return None
     
-    if mode not in {"conventional", "v1"}:
-        raise ValueError(f"xcorr.mode must be 'conventional' or 'v1'; got {mode}")
-    
     logger.info(
     "XCORR config | mode=%s | v1_fft_snap_pow2=%s | v1_fallback=%s | "
     "npts_seg=%d | max_lag_samples=%d | out_len=%d",
@@ -180,18 +192,15 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     if npts_seg <= 0:
         logger.warning("Invalid npts_seg=%d; skipping %s", npts_seg, in_path)
         return None
-    
+        
     npts_new = (npts_proc // npts_seg) * npts_seg
     nseg = npts_new // npts_seg
     leftover = npts_proc - npts_new
 
     if leftover != 0:
         logger.warning(
-            "Preprocessed length %d not divisible by npts_seg=%d. Trimming %d samples.",
-            npts_proc,
-            npts_seg,
-            leftover,
-        )
+        "Preprocessed length %d not divisible by npts_seg=%d. Trimming %d samples.",
+        npts_proc, npts_seg, leftover)
 
     if npts_new <= 0 or nseg == 0:
         logger.warning("Too short after preprocessing/segmentation; skipping %s", in_path)
@@ -199,6 +208,21 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         
     data_proc = data_proc[:, :npts_new]
     flag_mean = int(nseg)
+
+    # Lag window (compute only after segmentation is valid) 
+    if mode == "conventional":
+        L_full = 2 * npts_seg - 1           # full CC length
+        center = npts_seg - 1               # lag 0 index
+        lag_start = center - npts_lag
+        lag_end = center + npts_lag + 1     # exclusive
+
+        if lag_start < 0 or lag_end > L_full:
+            raise ValueError(
+            f"Lag window out of bounds: lag_start={lag_start}, lag_end={lag_end} (exclusive). "
+            f"valid indices=[0, {L_full-1}], valid exclusive end <= {L_full} "
+            f"(npts_seg={npts_seg}, npts_lag={npts_lag})")
+    else:
+        lag_start = lag_end = 0 # dummy ints; not used in v1
     
     # ---- chunk size ----
     npair_chunk = auto_np_pair_chunk(
@@ -288,23 +312,10 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         # Prepare output array 
         ccall = np.zeros((npair, cc_out_len), dtype=np.float32)
 
-        # Precompute lag slice once (only used in conventional)
-        lag_start = npts_seg - npts_lag - 1
-        lag_end = lag_start + cc_out_len
-
-        if mode == "conventional" and (lag_start < 0 or lag_end > 2 * npts_seg - 1):
-            raise ValueError(
-                f"Lag window out of bounds: lag_start={lag_start}, lag_end={lag_end}, "
-                f"valid=[0, {2*npts_seg-1}] (npts_seg={npts_seg}, npts_lag={npts_lag})"
-            )
-
         # Precompute source trace once per VS
         src_trace = data_tensor[src_idx:src_idx+1, :]   # (1, npts_new)
 
         chunk_bar = tqdm(range(nchunk), desc=f"VS {src_idx} batches", leave=False)
-
-        is_cuda = (device.type == "cuda")
-        is_cpu = not is_cuda
 
         t_vs0 = time.perf_counter()
 
@@ -318,27 +329,23 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             
             rcv0, rcv1 = start_idx, end_idx
 
-            if is_cpu:
-                full1 = src_trace.repeat(batch_len, 1)         # contiguous
-            else:
-                full1 = src_trace.expand(batch_len, -1)        # view, no allocs
-                
+            full1 = src_trace.expand(batch_len, -1)  # view for both CPU and CUDA
             full2 = data_tensor[rcv0:rcv1, :]
-            if is_cuda and not full2.is_contiguous():
-                full2 = full2.contiguous()
 
-            # Reshape into segments: (batch_len * nseg, npts_seg)
-            # Advanced indexing can yield non-contiguous tensors; contiguous helps CUDA kernels.
-            if is_cuda:
-                data1 = full1.reshape(batch_len * nseg, npts_seg).contiguous()
-                data2 = full2.reshape(batch_len * nseg, npts_seg).contiguous()
-            else:
-                data1 = full1.reshape(batch_len * nseg, npts_seg)
-                data2 = full2.reshape(batch_len * nseg, npts_seg)
+            # data1 must be materialized (expand -> stride-0)
+            data1 = full1.contiguous().view(batch_len * nseg, npts_seg)
+
+            # data2 usually already contiguous; avoid copies unless needed
+            if not full2.is_contiguous():
+                full2 = full2.contiguous()
+            data2 = full2.reshape(batch_len * nseg, npts_seg)
 
             # Run CC model (no autograd)
             with torch.inference_mode():
                 cc_chunk = model(data1, data2)
+            
+            if mode == "conventional" and cc_chunk.shape[1] != 2 * npts_seg - 1:
+                raise RuntimeError(f"conventional output length mismatch: got {cc_chunk.shape[1]}, expected {2*npts_seg-1}")
 
             cc_sum_t = cc_chunk.reshape(batch_len, nseg, -1).sum(dim=1)  # (batch_len, Lout_full or Lout_v1)
 
