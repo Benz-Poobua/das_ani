@@ -11,16 +11,27 @@ Workflow:
 ---------
 Input folder:
     <io.ncf_root>/<io.stack_window>/
-        20210901_cc_000_daily.npy
-        ...
+        YYYYMMDD_cc_VVV_daily.npy
+        YYYYMMDD_cc_VVV_7d.npy
+        YYYYMMDD_cc_VVV_15d.npy
+        YYYYMMDD_cc_VVV_30d.npy
 
-Output folder (if io.vs_subdir=true):
-    <io.results_root>/<io.stack_window>/VS_000/
-        20210901_cc_000_daily_fv_panel.npy
-        20210901_cc_000_daily_f_axis.npy
-        20210901_cc_000_daily_v_axis.npy
-        20210901_cc_000_daily_pick.npy
-        20210901_cc_000_daily_meta.json
+Method-aware filenames (recommended):
+    If the stacked NCF filename includes a CC-method suffix (e.g., "_v1" or
+    "_conventional"), it will be preserved in all outputs:
+
+        YYYYMMDD_cc_VVV_daily_v1.npy
+        YYYYMMDD_cc_VVV_30d_conventional.npy
+
+Output layout
+-------------
+If io.vs_subdir=true:
+    <io.results_root>/<io.stack_window>/VS_VVV/
+        <base>_fv_panel.npy
+        <base>_f_axis.npy
+        <base>_v_axis.npy
+        <base>_pick.npy
+        <base>_meta.json
 
 If io.vs_subdir=false:
     <io.results_root>/<io.stack_window>/
@@ -45,9 +56,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 _VS_RE = re.compile(r"_cc_(\d+)")
+_KNOWN_CC_METHODS = {"v1", "conventional"}
 # =====================================================
 # Helpers
 # =====================================================
+def extract_cc_method(stem: str) -> Optional[str]:
+    """
+    Extract CC method suffix from filename stem.
+
+    Expected stems (examples):
+        20210901_cc_000_daily_v1            -> "v1"
+        20210901_cc_000_30d_conventional    -> "conventional"
+        20210901_cc_000_daily               -> None   (no method suffix)
+
+    Rule:
+        If the last underscore-separated token is in _KNOWN_CC_METHODS,
+        treat it as the CC method; otherwise return None.
+    """
+    last = stem.split("_")[-1].lower()
+    return last if last in _KNOWN_CC_METHODS else None
+
 def extract_vs_index(path_or_name: str) -> int:
     """Extract virtual source index from e.g. 20210901_cc_000_daily.npy -> 0."""
     m = _VS_RE.search(path_or_name)
@@ -92,6 +120,7 @@ def process_one_ncf(ncf_path: str, cfg: Dict[str, Any]) -> Optional[str]:
     """
     ncf_p = Path(ncf_path)
     base = ncf_p.stem
+    cc_method = extract_cc_method(base)
 
     # ---- cfg: io ----
     ncf_root = Path(get_cfg(cfg, ["io", "ncf_root"], "data/ncf_stacks")).expanduser()
@@ -159,7 +188,7 @@ def process_one_ncf(ncf_path: str, cfg: Dict[str, Any]) -> Optional[str]:
 
     sentinel = _sentinel_path(outdir, base, picking_enabled and save_pick)
     if sentinel.exists() and not overwrite:
-        logger.info(f"[SKIP] {base} already done → {sentinel}")
+        logger.info("[SKIP] %s already done \u2192 %s", base, sentinel)
         return None
     
     # Load NCF
@@ -192,6 +221,7 @@ def process_one_ncf(ncf_path: str, cfg: Dict[str, Any]) -> Optional[str]:
         meta = {
             "ncf_path": str(ncf_p.resolve()),
             "outdir": str(outdir.resolve()),
+            "cc_method": cc_method,
             "stack_window": stack_window,
             "vs_subdir": bool(vs_subdir),
             "geometry": {"fs": float(fs), "dx": float(dx)},
@@ -243,11 +273,11 @@ def main(cfg: Dict[str, Any]) -> None:
 
     results_root.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"NCF root:     {ncf_root}")
-    logger.info(f"Results root: {results_root}")
-    logger.info(f"Runtime:      njobs={njobs}")
-    logger.info(f"Layout:       vs_subdir={vs_subdir}")
-    logger.info(f"Windows:      {stack_windows}")
+    logger.info("NCF root:     %s", ncf_root)
+    logger.info("Results root: %s", results_root)
+    logger.info("Runtime:      njobs=%d", njobs)
+    logger.info("Layout:       vs_subdir=%s", vs_subdir)
+    logger.info("Windows:      %s", stack_windows)
 
     # Process each window sequentially; inside each, parallelize over files
     for stack_window in stack_windows:
@@ -257,15 +287,15 @@ def main(cfg: Dict[str, Any]) -> None:
 
         in_dir = ncf_root / stack_window
         if not in_dir.exists():
-            logger.warning(f"[SKIP] Input directory not found: {in_dir}")
+            logger.warning("[SKIP] Input directory not found: %s", in_dir)
             continue
 
         filelist = sorted(in_dir.glob("*.npy"))
-        logger.info(f"[{stack_window}] Input: {in_dir} | files={len(filelist)}")
-        logger.info(f"[{stack_window}] Output: {results_root / stack_window}")
+        logger.info("[%s] Input: %s | files=%d", stack_window, in_dir, len(filelist))
+        logger.info("[%s] Output: %s", stack_window, results_root / stack_window)
 
         if not filelist:
-            logger.warning(f"[{stack_window}] No NCF files found. Skipping.")
+            logger.warning("[%s] No NCF files found. Skipping.", stack_window)
             continue
 
         # Multiprocessing: cfg must be picklable/JSON-ish (dict of primitives/lists)
@@ -280,9 +310,9 @@ def main(cfg: Dict[str, Any]) -> None:
                 try:
                     outp = fut.result()
                     if outp:
-                        logger.info(f"[{stack_window}] Done → {outp}")
+                        logger.info("[%s] Done \u2192 %s", stack_window, outp)
                 except Exception as e:
-                    logger.error(f"[{stack_window}] Worker error: {e}")
+                    logger.error("[%s] Worker error: %s", stack_window, e)
 
 # =====================================================
 # CLI

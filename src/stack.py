@@ -38,6 +38,15 @@ logger = logging.getLogger(__name__)
 _DATE_RE = re.compile(r"(\d{8})")
 _VS_RE = re.compile(r"_cc_(\d{3})")
 
+# Matches method suffix for stacked outputs:
+#   YYYYMMDD_cc_###_daily[_METHOD].npy
+#   YYYYMMDD_cc_###_7d[_METHOD].npy
+#   YYYYMMDD_cc_###_15d[_METHOD].npy
+#   YYYYMMDD_cc_###_30d[_METHOD].npy
+# Also works for raw slices like:
+#   YYYYMMDD_000000_cc_###[_METHOD].npy   (method captured if present)
+_CC_METHOD_RE = re.compile(r"_cc_\d{3}(?:_(?:daily|\d+d))?(?:_([A-Za-z0-9]+))?\.npy$")
+
 def parse_date_vs(path: str | Path) -> Tuple[datetime.date, int]:
     """
     Extract (date, virtual-source ID) from filename.
@@ -68,16 +77,53 @@ def parse_date_vs(path: str | Path) -> Tuple[datetime.date, int]:
 
     return date, vs
 
+
+def parse_date_vs_method(path: str | Path) -> Tuple[datetime.date, int, Optional[str]]:
+    """
+    Extract (date, virtual-source ID, cc_method) from filename.
+
+    Backward compatible:
+        - If method suffix not present, returns method=None
+
+    Accepts (examples):
+        20210901_000000_cc_080.npy
+        20210901_000000_cc_080_v1.npy
+        20210901_000000_cc_080_conventional.npy
+
+        20210901_cc_080_daily.npy
+        20210901_cc_080_daily_v1.npy
+        20210901_cc_080_daily_conventional.npy
+
+        20210901_cc_080_7d.npy
+        20210901_cc_080_7d_v1.npy
+        20210901_cc_080_30d_conventional.npy
+
+    :param path: file path or file name
+    :return: (date, vs_id, method) where method may be None
+    """
+    name = Path(path).name
+
+    # Extract date + VS using existing logic (robust)
+    date, vs = parse_date_vs(name)
+
+    # Extract optional method suffix (last token after known parts)
+    m_method = _CC_METHOD_RE.search(name)
+    method = None if (m_method is None or m_method.group(1) is None) else m_method.group(1)
+
+    return date, vs, method
+
 # =====================================================
 # Stacking core
 # =====================================================
 @timeit
 def daily_stack_ncf(raw_root: str | Path, out_daily: str | Path, *, overwrite: bool = False) -> None:
     """
-    Create daily NCF stacks per (date, vs_id) by averaging all raw slices for that day.
+    Create daily NCF stacks per (date, vs_id, method) by averaging all raw slices for that day.
 
-    Output naming:
-        YYYYMMDD_cc_###_daily.npy
+    Output naming (method-aware):
+        YYYYMMDD_cc_###_daily.npy                  (if method missing)
+        YYYYMMDD_cc_###_daily_v1.npy
+        YYYYMMDD_cc_###_daily_conventional.npy
     """
     raw_root = Path(raw_root).expanduser().resolve()
     out_daily = Path(out_daily).expanduser().resolve()
@@ -87,26 +133,27 @@ def daily_stack_ncf(raw_root: str | Path, out_daily: str | Path, *, overwrite: b
     all_files = sorted(raw_root.rglob("*.npy"))
     logger.info("Found %d raw NCF slices under %s", len(all_files), raw_root)
 
-    # Group by (date, VS)
-    groups: Dict[Tuple[datetime.date, int], List[Path]] = {}
+    # Group by (date, VS, method)
+    groups: Dict[Tuple[datetime.date, int, Optional[str]], List[Path]] = {}
     for p in all_files:
         try:
-            date, vs = parse_date_vs(p)
-            groups.setdefault((date, vs), []).append(p)
+            date, vs, method = parse_date_vs_method(p)
+            groups.setdefault((date, vs, method), []).append(p)
         except Exception as e:
             logger.warning("Skipping %s: %s", p, e)
 
-    logger.info("Found %d (date, VS) groups for daily stacking.", len(groups))
+    logger.info("Found %d (date, VS, method) groups for daily stacking.", len(groups))
 
     # Stack each group
-    for (date, vs), filelist in tqdm(groups.items(), desc="Daily stack"):
-        outname = f"{date.strftime('%Y%m%d')}_cc_{vs:03d}_daily.npy"
+    for (date, vs, method), filelist in tqdm(groups.items(), desc="Daily stack"):
+        suffix = f"_{method}" if method else ""
+        outname = f"{date.strftime('%Y%m%d')}_cc_{vs:03d}_daily{suffix}.npy"
         outpath = out_daily / outname
 
         if outpath.exists() and not overwrite:
             continue
-        
-        # Average all raw pieces for that (date, vs)
+
+        # Average all raw pieces for that (date, vs, method)
         arrs = [np.load(f) for f in filelist]
         stack = np.mean(arrs, axis=0).astype(np.float32)
 
@@ -122,11 +169,16 @@ def stack_ncf_window(
     overwrite: bool = False,
     ) -> None:
     """
-    Sliding-window stacking per VS.
+    Sliding-window stacking per (VS, method).
 
-    For each VS, for each end date D:
+    For each (VS, method), for each end date D:
         stack all daily files from [D-window_days+1, ..., D]
     Requires full window (exactly window_days daily files).
+
+    Output naming (method-aware):
+        YYYYMMDD_cc_###_<Nd>.npy                   (if method missing)
+        YYYYMMDD_cc_###_<Nd>_v1.npy
+        YYYYMMDD_cc_###_<Nd>_conventional.npy
     """
     daily_root = Path(daily_root).expanduser().resolve()
     out_root = Path(out_root).expanduser().resolve()
@@ -137,24 +189,24 @@ def stack_ncf_window(
         logger.warning("No daily stacks in %s", daily_root)
         return
 
-    # Collect records (date, vs, path)
-    records: List[Tuple[datetime.date, int, Path]] = []
+    # Collect records (date, vs, method, path)
+    records: List[Tuple[datetime.date, int, Optional[str], Path]] = []
     for p in daily_files:
         try:
-            date, vs = parse_date_vs(p)
-            records.append((date, vs, p))
+            date, vs, method = parse_date_vs_method(p)
+            records.append((date, vs, method, p))
         except Exception:
             continue
 
-    # Group by VS
-    vs_groups: Dict[int, List[Tuple[datetime.date, Path]]] = {}
-    for date, vs, p in records:
-        vs_groups.setdefault(vs, []).append((date, p))
+    # Group by (VS, method)
+    vs_groups: Dict[Tuple[int, Optional[str]], List[Tuple[datetime.date, Path]]] = {}
+    for date, vs, method, p in records:
+        vs_groups.setdefault((vs, method), []).append((date, p))
 
-    logger.info("Found %d virtual sources for %dd window stacks.", len(vs_groups), window_days)
+    logger.info("Found %d (VS, method) groups for %dd window stacks.", len(vs_groups), window_days)
 
-    # Process each VS
-    for vs, items in tqdm(vs_groups.items(), desc=f"{window_days}d stacks"):
+    # Process each (VS, method)
+    for (vs, method), items in tqdm(vs_groups.items(), desc=f"{window_days}d stacks"):
         # Sort by date
         items = sorted(items, key=lambda x: x[0])
         dates = [d for d, _ in items]
@@ -164,7 +216,7 @@ def stack_ncf_window(
 
         for end_date in dates:
             start_date = end_date - timedelta(days=window_days - 1)
-            
+
             # Build contiguous window dates
             win_dates = [start_date + timedelta(days=k) for k in range(window_days)]
 
@@ -172,7 +224,8 @@ def stack_ncf_window(
             if not all(d in date_to_path for d in win_dates):
                 continue
 
-            outname = f"{end_date.strftime('%Y%m%d')}_cc_{vs:03d}_{window_days}d.npy"
+            suffix = f"_{method}" if method else ""
+            outname = f"{end_date.strftime('%Y%m%d')}_cc_{vs:03d}_{window_days}d{suffix}.npy"
             outpath = out_root / outname
 
             if outpath.exists() and not overwrite:
