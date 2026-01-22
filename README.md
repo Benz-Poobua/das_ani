@@ -22,10 +22,20 @@ The primary goals are:
 
 ### **Option 1: Install as editable package (pip)**
 ```bash
+# Create virtual environment "das_ani"
+python -m venv das_ani
+
+# Activate venv
+source das_ani/bin/activate
+
+# 3. Upgrade pip (recommend)
+pip install --upgrade pip
+
+# 4. Install as editable package
 pip install -e .
 ```
 
-### **Option 2: Conda environment (recommended)**
+### **Option 2: Conda environment**
 ```bash
 # Create environment 
 conda env create -f environment.yml
