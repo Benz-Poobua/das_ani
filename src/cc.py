@@ -212,6 +212,10 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     # Whitening: do it once, per segment, before CC
     prewhiten = bool(is_spectral_whitening)
 
+    nyq_proc = fs_proc / 2.0
+    if not (0.0 < f1 < f2 < nyq_proc):
+        raise ValueError(f"Whitening band invalid after decimation: f1={f1}, f2={f2}, Nyquist={nyq_proc}")
+
     if prewhiten:
         logger.info(
             "Whitening (per-segment, torch) | df=fs_proc/npts_seg=%.6f | window=%.3f Hz | band=[%.2f, %.2f] Hz",

@@ -37,6 +37,14 @@ NJOBS      ?= 4
 	clean clean_cc_raw clean_stacks clean_disp clean_all \
 	paths
 
+# -----------------------
+# Evaluation / reports
+# -----------------------
+EVAL_OUTDIR ?= data/runlogs/eval_modes
+EVAL_TITLE  ?=
+
+.PHONY: eval eval_only
+
 # ============================================================
 # HELP
 # ============================================================
@@ -145,3 +153,21 @@ clean_all:
 	@echo ">>> Removing output directories entirely"
 	@rm -rf data/ncf_raw data/ncf_stacks results/dispersion
 	@echo ">>> Removed. Recreate by running targets."
+
+# ============================================================
+# EVALUATION (runtime + correctness)
+# ============================================================
+eval_only:
+	@echo ">>> Evaluating modes (runtime + correctness) -> $(EVAL_OUTDIR)"
+	@mkdir -p $(EVAL_OUTDIR)
+	$(PYTHON) -m src.eval_modes \
+		--cc_config $(CC_CFG) \
+		--disp_config $(DISP_CFG) \
+		--outdir $(EVAL_OUTDIR) \
+		--mmap \
+		--plots \
+		--logy_runtime \
+		$(if $(strip $(EVAL_TITLE)),--title "$(EVAL_TITLE)",)
+
+# Run evaluation after pipeline outputs exist (cc/disp)
+eval: disp eval_only
