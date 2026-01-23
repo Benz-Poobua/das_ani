@@ -9,20 +9,31 @@ description = "DAS Ambient Noise Interferometry (ANI) pipeline: preprocessing, c
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+
 authors = [
   { name = "Benz Poobua" }
 ]
+
+# -----------------------
+# Core runtime deps
+# -----------------------
 dependencies = [
   "numpy>=1.24",
+  "scipy>=1.10",
   "tqdm>=4.66",
   "psutil>=5.9",
   "pyyaml>=6.0",
-  "scipy>=1.10",
-  # torch is platform-specific (CPU/CUDA/MPS). Keep version broad.
+
+  # torch is platform-specific (CPU/CUDA/MPS)
   "torch>=2.1",
 ]
 
+# -----------------------
+# Optional dependencies
+# -----------------------
 [project.optional-dependencies]
+
+# Development / QA
 dev = [
   "ruff>=0.5",
   "black>=24.4",
@@ -30,20 +41,33 @@ dev = [
   "pytest>=8.2",
   "types-PyYAML>=6.0.12.20240917",
 ]
+
+# Visualization & reporting (used by eval_modes + SSIM)
 viz = [
   "matplotlib>=3.7",
+  "pandas>=2.0",
+  "seaborn>=0.13",
+  "scikit-image>=0.22",
 ]
+
+# Jupyter / interactive work
 notebooks = [
   "jupyter>=1.0",
   "ipykernel>=6.29",
 ]
 
+# -----------------------
+# setuptools configuration
+# -----------------------
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# -----------------------
+# Ruff (linting)
+# -----------------------
 [tool.ruff]
 line-length = 100
 target-version = "py310"
@@ -54,16 +78,25 @@ exclude = ["build", "dist", ".venv"]
 select = ["E", "F", "W", "I", "B", "UP"]
 ignore = ["E501"]
 
+# -----------------------
+# Black (formatting)
+# -----------------------
 [tool.black]
 line-length = 100
 target-version = ["py310"]
 
+# -----------------------
+# MyPy (typing)
+# -----------------------
 [tool.mypy]
 python_version = "3.10"
 warn_unused_configs = true
 no_implicit_optional = true
 check_untyped_defs = true
 
+# -----------------------
+# Pytest
+# -----------------------
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
