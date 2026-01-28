@@ -18,6 +18,7 @@ What this script does:
 Notes:
 - Ranked runtime plots avoid putting 100+ filenames on axes.
 - Speedup row reports speedup for mean/median/p10/p90/total (not just median).
+- Parallel eval supported via --njobs (uses ProcessPoolExecutor; safe on macOS spawn).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -32,20 +34,20 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 # nice plots
+import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
-import matplotlib.pyplot as plt
 
-from src.utils import load_config, get_cfg
 from src.error import (
-    load_npy,
-    rel_frobenius,
-    max_abs_error,
     cosine_similarity_per_trace,
+    load_npy,
+    max_abs_error,
+    pick_diff,
+    rel_frobenius,
     spectral_compare,
     ssim_index,
-    pick_diff,
 )
+from src.utils import get_cfg, load_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -53,9 +55,7 @@ logger = logging.getLogger(__name__)
 # ----------------------------
 # Filename parsing / matching
 # ----------------------------
-_NCF_RE = re.compile(
-    r"^(?P<filebase>.+?)(?:\.npz)?_cc_(?P<vs>\d{3})_(?P<mode>conventional|v1)\.npy$"
-)
+_NCF_RE = re.compile(r"^(?P<filebase>[^.]+)(?:\.npz)?_cc_(?P<vs>\d{3})_(?P<mode>conventional|v1)\.npy$")
 
 
 def _scan_ncf_pairs(ncf_root: Path) -> List[Tuple[Path, Path, str, int]]:
@@ -96,28 +96,32 @@ def _scan_ncf_pairs(ncf_root: Path) -> List[Tuple[Path, Path, str, int]]:
 def _disp_paths(
     disp_root: Path,
     *,
+    filebase: str,
     vs_idx: int,
     window: str,
     mode: str,
 ) -> Tuple[Optional[Path], Optional[Path], Optional[Path]]:
     """
-    Try to build dispersion paths based on your current naming convention:
-
-      <date>_cc_<VS>_<window>_<mode>_fv_panel.npy
-      <date>_cc_<VS>_<window>_<mode>_pick.npy
-
-    Returns (fv_panel_path, pick_path, vs_dir_used)
+    Builds specific dispersion paths using the filebase to avoid incorrect pairing.
     """
     vs_dir = disp_root / f"VS_{vs_idx:03d}"
     if not vs_dir.exists():
         return None, None, None
+    
+    name_panel = f"{filebase}_cc_{vs_idx:03d}_{window}_{mode}_fv_panel.npy"
 
-    pat_panel = f"*cc_{vs_idx:03d}_{window}_{mode}_fv_panel.npy"
-    pat_pick = f"*cc_{vs_idx:03d}_{window}_{mode}_pick.npy"
+    # Replace wildcard '*' with the specific filebase
+    name_panel = f"{filebase}_cc_{vs_idx:03d}_{window}_{mode}_fv_panel.npy"
+    name_pick = f"{filebase}_cc_{vs_idx:03d}_{window}_{mode}_pick.npy"
 
-    panel = next(iter(vs_dir.glob(pat_panel)), None)
-    pick = next(iter(vs_dir.glob(pat_pick)), None)
-    return panel, pick, vs_dir
+    panel = vs_dir / name_panel
+    pick = vs_dir / name_pick
+
+    return (
+        panel if panel.exists() else None,
+        pick if pick.exists() else None,
+        vs_dir
+    )
 
 
 # ----------------------------
@@ -401,9 +405,6 @@ def plot_runtime_total_per_file(
     """
     Total runtime per file (sum over VS), ranked by total runtime.
     X-axis uses rank (1..top_k), NOT filenames.
-
-    :param top_k: plot only the slowest top_k files (after summing over VS)
-    :param annotate_top: annotate the top-N slowest file names (optional)
     """
     df = pd.DataFrame(perf_rows).copy()
     if df.empty or not {"file", "mode", "seconds_vs"}.issubset(df.columns):
@@ -435,7 +436,6 @@ def plot_runtime_total_per_file(
     if top_k is not None and top_k > 0:
         ref = ref.head(int(top_k))
 
-    # join rank back
     df_plot = df_tot.merge(ref[["file", "rank"]], on="file", how="inner")
 
     plt.figure(figsize=(12, 5))
@@ -453,7 +453,6 @@ def plot_runtime_total_per_file(
     ax.set_title(title or f"Total runtime per file (top {len(ref)} slowest)")
     ax.legend(title="mode", frameon=True, loc="best")
 
-    # annotate top few slowest file names near bar tops (optional)
     if annotate_top and annotate_top > 0:
         top_files = ref.head(int(annotate_top))
         for _, rr in top_files.iterrows():
@@ -515,7 +514,6 @@ def plot_runtime_cumulative(
     df_plot = df_tot.merge(ref[["file", "rank"]], on="file", how="inner")
     df_plot = df_plot.sort_values(["mode", "rank"]).reset_index(drop=True)
 
-    # build cumulative
     df_plot["cum_seconds"] = df_plot.groupby("mode")["total_seconds"].cumsum()
 
     plt.figure(figsize=(10, 5))
@@ -605,6 +603,101 @@ def plot_disp_ssim(
 
 
 # ----------------------------
+# Parallel worker
+# ----------------------------
+def _eval_one_pair_worker(args: tuple) -> tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    (
+        conv_path_s,
+        v1_path_s,
+        filebase,
+        vs_idx,
+        dt,
+        f1,
+        f2,
+        mmap,
+        disp_results_root_s,
+        disp_window,
+    ) = args
+
+    conv_path = Path(conv_path_s)
+    v1_path = Path(v1_path_s)
+
+    # --- NCF metrics ---
+    ncf_row: Dict[str, Any] = {
+        "file": str(filebase) + ".npz",
+        "vs_idx": int(vs_idx),
+        "conv_path": str(conv_path),
+        "v1_path": str(v1_path),
+    }
+    try:
+        metrics = eval_ncf_pair(conv_path, v1_path, dt=float(dt), f1=float(f1), f2=float(f2), mmap=bool(mmap))
+        ncf_row.update(metrics)
+    except Exception as e:
+        ncf_row["error"] = str(e)
+
+    disp_row: Optional[Dict[str, Any]] = None
+    pick_row: Optional[Dict[str, Any]] = None
+
+    # --- Dispersion (corrected pairing) ---
+    if disp_results_root_s is not None:
+        disp_root = Path(disp_results_root_s)
+
+        # Extract only the date (YYYYMMDD) from the filebase
+        # This turns "20210907_045000" into "20210907"
+        disp_filebase = filebase[:8]
+
+        try:
+            panel_conv, pick_conv, _ = _disp_paths(
+                disp_root, 
+                filebase=disp_filebase, # Use the date-only version here
+                vs_idx=int(vs_idx), 
+                window=str(disp_window), 
+                mode="conventional"
+            )
+            panel_v1, pick_v1, _ = _disp_paths(
+                disp_root, 
+                filebase=disp_filebase, # Use the date-only version here
+                vs_idx=int(vs_idx), 
+                window=str(disp_window), 
+                mode="v1"
+            )
+
+            if panel_conv and panel_v1:
+                try:
+                    D_ref = load_npy(panel_conv, mmap=bool(mmap))
+                    D_v1 = load_npy(panel_v1, mmap=bool(mmap))
+                    val = ssim_index(D_ref, D_v1)
+                    disp_row = {
+                        "file": filebase,
+                        "vs_idx": int(vs_idx),
+                        "window": str(disp_window),
+                        "panel_conv": str(panel_conv.name),
+                        "panel_v1": str(panel_v1.name),
+                        "ssim": float(val),
+                    }
+                except Exception as e:
+                    disp_row = {"file": filebase, "vs_idx": int(vs_idx), "error": f"SSIM error: {e}"}
+
+            if pick_conv and pick_v1:
+                try:
+                    P_ref = load_npy(pick_conv, mmap=bool(mmap))
+                    P_tst = load_npy(pick_v1, mmap=bool(mmap))
+                    pe = pick_diff(P_ref, P_tst)
+                    d = asdict(pe)
+                    d.update({
+                        "file": filebase,
+                        "vs_idx": int(vs_idx),
+                        "window": str(disp_window),
+                    })
+                    pick_row = d
+                except Exception as e:
+                    pick_row = {"file": filebase, "vs_idx": int(vs_idx), "error": f"Pick error: {e}"}
+        except Exception as e:
+            disp_row = {"file": filebase, "vs_idx": int(vs_idx), "error": str(e)}
+
+    return ncf_row, disp_row, pick_row
+
+# ----------------------------
 # Main
 # ----------------------------
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -618,6 +711,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--logy_runtime", action="store_true", help="Log-scale y-axis for per-VS runtime distribution")
     p.add_argument("--max_files_bar", type=int, default=50, help="Top-K slowest files to show in ranked bar plot")
     p.add_argument("--title", type=str, default="", help="Optional plot title prefix")
+    p.add_argument("--njobs", type=int, default=1, help="Parallel workers for pair eval (ProcessPool)")
     return p.parse_args(args=argv)
 
 
@@ -632,6 +726,7 @@ def main(
     logy_runtime: bool,
     max_files_bar: int,
     title: str,
+    njobs: int,
 ) -> None:
     cc_cfg = load_config(cc_config)
     disp_cfg = load_config(disp_config) if disp_config else {}
@@ -675,85 +770,54 @@ def main(
         logger.warning("No NCF pairs found in %s", ncf_root)
         return
 
-    # ---- Evaluate NCF errors ----
+    # ---- Evaluate pairs (parallel optional) ----
+    nj = max(1, int(njobs))
+    tasks = [
+        (
+            str(conv_path),
+            str(v1_path),
+            str(filebase).replace(".npz", ""),
+            int(vs_idx),
+            float(dt),
+            float(f1),
+            float(f2),
+            bool(mmap),
+            str(disp_results_root) if disp_results_root is not None else None,
+            str(disp_window),
+        )
+        for (conv_path, v1_path, filebase, vs_idx) in pairs
+    ]
+
     ncf_rows: List[Dict[str, Any]] = []
     disp_rows: List[Dict[str, Any]] = []
     pick_rows: List[Dict[str, Any]] = []
 
-    for conv_path, v1_path, filebase, vs_idx in pairs:
-        row: Dict[str, Any] = {
-            "file": filebase + ".npz",
-            "vs_idx": int(vs_idx),
-            "conv_path": str(conv_path),
-            "v1_path": str(v1_path),
-        }
-        try:
-            metrics = eval_ncf_pair(conv_path, v1_path, dt=dt, f1=f1, f2=f2, mmap=mmap)
-            row.update(metrics)
-        except Exception as e:
-            row["error"] = str(e)
-        ncf_rows.append(row)
+    if nj == 1:
+        for t in tasks:
+            ncf_row, disp_row, pick_row = _eval_one_pair_worker(t)
+            ncf_rows.append(ncf_row)
+            if disp_row:
+                disp_rows.append(disp_row)
+            if pick_row:
+                pick_rows.append(pick_row)
+    else:
+        logger.info("Parallel eval: njobs=%d over %d pairs", nj, len(tasks))
+        with ProcessPoolExecutor(max_workers=nj) as ex:
+            futs = [ex.submit(_eval_one_pair_worker, t) for t in tasks]
+            for fut in as_completed(futs):
+                ncf_row, disp_row, pick_row = fut.result()
+                ncf_rows.append(ncf_row)
+                if disp_row:
+                    disp_rows.append(disp_row)
+                if pick_row:
+                    pick_rows.append(pick_row)
 
-        # ---- Dispersion SSIM + pick diff (optional) ----
-        if disp_results_root is not None:
-            panel_conv, pick_conv, _ = _disp_paths(
-                disp_results_root, vs_idx=vs_idx, window=disp_window, mode="conventional"
-            )
-            panel_v1, pick_v1, _ = _disp_paths(
-                disp_results_root, vs_idx=vs_idx, window=disp_window, mode="v1"
-            )
+    # deterministic ordering for diffs
+    ncf_rows.sort(key=lambda r: (str(r.get("file", "")), int(r.get("vs_idx", -1))))
+    disp_rows.sort(key=lambda r: int(r.get("vs_idx", -1)))
+    pick_rows.sort(key=lambda r: int(r.get("vs_idx", -1)))
 
-            if panel_conv and panel_v1:
-                try:
-                    D_ref = load_npy(panel_conv, mmap=mmap)
-                    D_v1 = load_npy(panel_v1, mmap=mmap)
-                    val = ssim_index(D_ref, D_v1)
-                    disp_rows.append(
-                        {
-                            "vs_idx": int(vs_idx),
-                            "window": disp_window,
-                            "panel_conv": str(panel_conv),
-                            "panel_v1": str(panel_v1),
-                            "ssim": float(val),
-                        }
-                    )
-                except Exception as e:
-                    disp_rows.append(
-                        {
-                            "vs_idx": int(vs_idx),
-                            "window": disp_window,
-                            "panel_conv": str(panel_conv),
-                            "panel_v1": str(panel_v1),
-                            "error": str(e),
-                        }
-                    )
-
-            if pick_conv and pick_v1:
-                try:
-                    P_ref = load_npy(pick_conv, mmap=mmap)
-                    P_tst = load_npy(pick_v1, mmap=mmap)
-                    pe = pick_diff(P_ref, P_tst)
-                    d = asdict(pe)
-                    d.update(
-                        {
-                            "vs_idx": int(vs_idx),
-                            "window": disp_window,
-                            "pick_conv": str(pick_conv),
-                            "pick_v1": str(pick_v1),
-                        }
-                    )
-                    pick_rows.append(d)
-                except Exception as e:
-                    pick_rows.append(
-                        {
-                            "vs_idx": int(vs_idx),
-                            "window": disp_window,
-                            "pick_conv": str(pick_conv),
-                            "pick_v1": str(pick_v1),
-                            "error": str(e),
-                        }
-                    )
-
+    # ---- Write reports ----
     write_csv(outdir / "eval_ncf.csv", ncf_rows)
     if disp_rows:
         write_csv(outdir / "eval_disp.csv", disp_rows)
@@ -776,7 +840,6 @@ def main(
         plots_dir = outdir / "plots"
         prefix = (title.strip() + " | ") if title.strip() else ""
 
-        # runtime plots
         if perf_rows:
             plot_runtime_distribution(
                 perf_rows,
@@ -797,7 +860,6 @@ def main(
                 title=prefix + "Cumulative runtime (ranked)",
             )
 
-        # correctness plots
         plot_correctness_metrics(
             ncf_rows,
             plots_dir / "correctness_metrics_ranked.png",
@@ -828,6 +890,7 @@ if __name__ == "__main__":
         logy_runtime=bool(args.logy_runtime),
         max_files_bar=int(args.max_files_bar),
         title=str(args.title),
+        njobs=int(args.njobs),
     )
 
 # Example:
@@ -840,4 +903,5 @@ if __name__ == "__main__":
 #   --plots \
 #   --logy_runtime \
 #   --max_files_bar 50 \
-#   --title "GPU test"
+#   --title "GPU test" \
+#   --njobs 8
