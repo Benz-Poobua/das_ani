@@ -26,6 +26,9 @@ dependencies = [
 
   # torch is platform-specific (CPU/CUDA/MPS)
   "torch>=2.1",
+  
+  # C++ Extension Build Tools
+  "ninja>=1.10",  # <--- CRITICAL for fast PyTorch JIT compilation
 ]
 
 # -----------------------
@@ -60,6 +63,9 @@ notebooks = [
 # setuptools configuration
 # -----------------------
 [tool.setuptools]
+# If your code is directly inside 'src', this map is correct.
+# Often structure is src/das_ani/... but if you import src.cc, 
+# then mapping ""="src" makes "src" the root package.
 package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]

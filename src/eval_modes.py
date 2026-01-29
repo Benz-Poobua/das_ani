@@ -57,6 +57,14 @@ logger = logging.getLogger(__name__)
 # ----------------------------
 _NCF_RE = re.compile(r"^(?P<filebase>[^.]+)(?:\.npz)?_cc_(?P<vs>\d{3})_(?P<mode>conventional|v1)\.npy$")
 
+_DATE8_RE = re.compile(r"(?P<date>\d{8})")
+
+def _extract_date8(s: str) -> Optional[str]:
+    """
+    Extract first YYYYMMDD occurrence from a string; returns None if not found.
+    """
+    m = _DATE8_RE.search(str(s))
+    return m.group("date") if m else None
 
 def _scan_ncf_pairs(ncf_root: Path) -> List[Tuple[Path, Path, str, int]]:
     """
@@ -108,8 +116,6 @@ def _disp_paths(
     if not vs_dir.exists():
         return None, None, None
     
-    name_panel = f"{filebase}_cc_{vs_idx:03d}_{window}_{mode}_fv_panel.npy"
-
     # Replace wildcard '*' with the specific filebase
     name_panel = f"{filebase}_cc_{vs_idx:03d}_{window}_{mode}_fv_panel.npy"
     name_pick = f"{filebase}_cc_{vs_idx:03d}_{window}_{mode}_pick.npy"
@@ -281,7 +287,7 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     logger.info("Wrote %d rows -> %s", len(rows), path)
 
 
-def runtime_summary(rows: List[Dict[str, Any]], *, drop_first_vs: bool = True) -> List[Dict[str, Any]]:
+def runtime_summary(rows: List[Dict[str, Any]], *, drop_first_vs: bool = True, njobs_cc: int = 1) -> List[Dict[str, Any]]:
     """
     Summarize perf rows into per-mode statistics.
     If drop_first_vs=True, drop the minimum vs_idx per file+mode (warm-up).
@@ -324,6 +330,7 @@ def runtime_summary(rows: List[Dict[str, Any]], *, drop_first_vs: bool = True) -
                 "p10_seconds_vs": float(np.percentile(a, 10)),
                 "p90_seconds_vs": float(np.percentile(a, 90)),
                 "total_seconds_all_vs": float(np.sum(a)),
+                "cc_njobs": int(njobs_cc),
             }
         )
 
@@ -344,11 +351,11 @@ def runtime_summary(rows: List[Dict[str, Any]], *, drop_first_vs: bool = True) -
                 "p10_seconds_vs": safe_div(conv["p10_seconds_vs"], v1["p10_seconds_vs"]),
                 "p90_seconds_vs": safe_div(conv["p90_seconds_vs"], v1["p90_seconds_vs"]),
                 "total_seconds_all_vs": safe_div(conv["total_seconds_all_vs"], v1["total_seconds_all_vs"]),
+                "cc_njobs": int(njobs_cc),
             }
         )
 
     return out
-
 
 # ----------------------------
 # Plotting (seaborn)
@@ -589,14 +596,35 @@ def plot_disp_ssim(
     df = pd.DataFrame(disp_rows).copy()
     if df.empty or "ssim" not in df.columns:
         return
+
     df["ssim"] = pd.to_numeric(df["ssim"], errors="coerce")
     df = df.dropna(subset=["ssim"])
 
+    # Safety clip (SSIM ∈ [0, 1])
+    df["ssim"] = df["ssim"].clip(0.0, 1.0)
+
     plt.figure(figsize=(9, 5))
-    ax = sns.histplot(data=df, x="ssim", bins=30, kde=True)
+    ax = sns.histplot(
+        data=df,
+        x="ssim",
+        bins=15,             
+        kde=False,
+        fill=True,
+        element="bars",
+        color="red",
+        edgecolor="black",
+        linewidth=1.2,         
+        alpha=1.0,           
+        shrink=0.9,
+    )
+
     ax.set_title(title or "Dispersion panel SSIM (v1 vs conventional)")
     ax.set_xlabel("SSIM")
     ax.set_ylabel("count")
+
+    ax.set_xlim(0.0, 1.1)
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["0", "1"])
 
     sns.despine()
     _savefig(out_png)
@@ -617,6 +645,7 @@ def _eval_one_pair_worker(args: tuple) -> tuple[Dict[str, Any], Optional[Dict[st
         mmap,
         disp_results_root_s,
         disp_window,
+        njobs_cc,
     ) = args
 
     conv_path = Path(conv_path_s)
@@ -628,6 +657,7 @@ def _eval_one_pair_worker(args: tuple) -> tuple[Dict[str, Any], Optional[Dict[st
         "vs_idx": int(vs_idx),
         "conv_path": str(conv_path),
         "v1_path": str(v1_path),
+        "cc_njobs": int(njobs_cc),
     }
     try:
         metrics = eval_ncf_pair(conv_path, v1_path, dt=float(dt), f1=float(f1), f2=float(f2), mmap=bool(mmap))
@@ -642,9 +672,9 @@ def _eval_one_pair_worker(args: tuple) -> tuple[Dict[str, Any], Optional[Dict[st
     if disp_results_root_s is not None:
         disp_root = Path(disp_results_root_s)
 
-        # Extract only the date (YYYYMMDD) from the filebase
-        # This turns "20210907_045000" into "20210907"
-        disp_filebase = filebase[:8]
+        # Etracting YYYYMMDD robustly; fallback to original string
+        date8 = _extract_date8(filebase)
+        disp_filebase = date8 if date8 is not None else filebase
 
         try:
             panel_conv, pick_conv, _ = _disp_paths(
@@ -674,6 +704,7 @@ def _eval_one_pair_worker(args: tuple) -> tuple[Dict[str, Any], Optional[Dict[st
                         "panel_conv": str(panel_conv.name),
                         "panel_v1": str(panel_v1.name),
                         "ssim": float(val),
+                        "cc_njobs": int(njobs_cc),
                     }
                 except Exception as e:
                     disp_row = {"file": filebase, "vs_idx": int(vs_idx), "error": f"SSIM error: {e}"}
@@ -688,6 +719,7 @@ def _eval_one_pair_worker(args: tuple) -> tuple[Dict[str, Any], Optional[Dict[st
                         "file": filebase,
                         "vs_idx": int(vs_idx),
                         "window": str(disp_window),
+                        "cc_njobs": int(njobs_cc),
                     })
                     pick_row = d
                 except Exception as e:
@@ -731,6 +763,9 @@ def main(
     cc_cfg = load_config(cc_config)
     disp_cfg = load_config(disp_config) if disp_config else {}
 
+    # --- CC runtime parallelism (source of truth) ---
+    njobs_cc = int(get_cfg(cc_cfg, ["runtime", "njobs"], 1))
+
     outdir = Path(outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -754,10 +789,9 @@ def main(
     if disp_cfg:
         root = get_cfg(disp_cfg, ["io", "results_root"], required=False) or ""
         if str(root).strip():
-            disp_results_root = Path(root).expanduser().resolve()
             disp_window = str(get_cfg(disp_cfg, ["io", "stack_window"], "daily"))
-            if disp_results_root.exists():
-                disp_results_root = disp_results_root / disp_window
+            # Always set the intended root; existence can be checked per-file later
+            disp_results_root = Path(root).expanduser().resolve() / disp_window
 
     logger.info("NCF root: %s", ncf_root)
     if disp_results_root:
@@ -784,6 +818,7 @@ def main(
             bool(mmap),
             str(disp_results_root) if disp_results_root is not None else None,
             str(disp_window),
+            int(njobs_cc)
         )
         for (conv_path, v1_path, filebase, vs_idx) in pairs
     ]
@@ -814,9 +849,24 @@ def main(
 
     # deterministic ordering for diffs
     ncf_rows.sort(key=lambda r: (str(r.get("file", "")), int(r.get("vs_idx", -1))))
-    disp_rows.sort(key=lambda r: int(r.get("vs_idx", -1)))
-    pick_rows.sort(key=lambda r: int(r.get("vs_idx", -1)))
 
+    disp_rows.sort(key=lambda r: (str(r.get("file", "")), int(r.get("vs_idx", -1))))
+    pick_rows.sort(key=lambda r: (str(r.get("file", "")), int(r.get("vs_idx", -1))))
+
+    # ---- add run metadata columns to all outputs ----
+    run_meta = {
+        "njobs": int(njobs),
+        "mmap": bool(mmap),
+        "drop_first_vs": bool(drop_first_vs),
+    }
+
+    for r in ncf_rows:
+        r.update(run_meta)
+    for r in disp_rows:
+        r.update(run_meta)
+    for r in pick_rows:
+        r.update(run_meta)
+    
     # ---- Write reports ----
     write_csv(outdir / "eval_ncf.csv", ncf_rows)
     if disp_rows:
@@ -829,7 +879,11 @@ def main(
     perf_rows = load_perf_rows_glob(perf_csv)
 
     if perf_rows:
-        summ = runtime_summary(perf_rows, drop_first_vs=drop_first_vs)
+        summ = runtime_summary(perf_rows, drop_first_vs=drop_first_vs, njobs_cc=njobs_cc)
+        for r in summ:
+            r["njobs"] = int(njobs)
+            r["drop_first_vs"] = bool(drop_first_vs)
+
         write_csv(outdir / "runtime_summary.csv", summ)
     else:
         logger.warning("No perf rows loaded (perf_cc*.csv missing or empty).")
@@ -838,7 +892,10 @@ def main(
     if make_plots:
         _set_plot_style()
         plots_dir = outdir / "plots"
+        
+        cc_tag = f"cc_njobs={njobs_cc}"
         prefix = (title.strip() + " | ") if title.strip() else ""
+        prefix = prefix + cc_tag + " | "
 
         if perf_rows:
             plot_runtime_distribution(
@@ -847,13 +904,13 @@ def main(
                 title=prefix + "Per-VS runtime",
                 logy=bool(logy_runtime),
             )
-            plot_runtime_total_per_file(
-                perf_rows,
-                plots_dir / "runtime_total_per_file_ranked.png",
-                title=prefix + "Total per file (ranked)",
-                top_k=int(max_files_bar),
-                annotate_top=min(10, int(max_files_bar)),
-            )
+            # plot_runtime_total_per_file(
+            #     perf_rows,
+            #     plots_dir / "runtime_total_per_file_ranked.png",
+            #     title=prefix + "Total per file (ranked)",
+            #     top_k=int(max_files_bar),
+            #     annotate_top=min(10, int(max_files_bar)),
+            # )
             plot_runtime_cumulative(
                 perf_rows,
                 plots_dir / "runtime_cumulative_ranked.png",

@@ -2,99 +2,97 @@
 #include <torch/extension.h>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 
-// Helper to confirm inputs are contiguous/correct device
-void check_input(const torch::Tensor& x) {
+static inline void check_input(const torch::Tensor& x) {
+    TORCH_CHECK(x.defined(), "Input tensor is undefined");
+    TORCH_CHECK(x.device().is_cpu(), "Input tensor must be on CPU for this CPP path");
     TORCH_CHECK(x.is_contiguous(), "Input tensor must be contiguous");
-    TORCH_CHECK(x.device().is_cpu(), "Input tensor must be on CPU for this optimized CPP path");
+    TORCH_CHECK(x.dim() == 2, "Input tensor must be 2D (B, N)");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "Input tensor must be float32 for this CPP path");
 }
 
 torch::Tensor correlation_v1_cpp(
-    torch::Tensor signal_1,   // (B, N)
-    torch::Tensor signal_2,   // (B, N)
+    torch::Tensor signal_1,   // (B, N) float32 CPU contiguous
+    torch::Tensor signal_2,   // (B, N) float32 CPU contiguous
     int64_t M,                // max_lag_samples
     int64_t K,                // block_size (calculated in Python)
     int64_t Lfft              // fft_length (calculated in Python)
-){
+) {
     check_input(signal_1);
     check_input(signal_2);
 
-    auto B = signal_1.size(0);
-    auto N = signal_1.size(1);
+    TORCH_CHECK(signal_1.sizes() == signal_2.sizes(), "signal_1 and signal_2 must have same shape");
+    TORCH_CHECK(M > 0, "M must be > 0");
+    TORCH_CHECK(K > 0, "K must be > 0");
+    TORCH_CHECK(Lfft > 0, "Lfft must be > 0");
+    TORCH_CHECK(Lfft >= (K + 2 * M), "Lfft must be >= K + 2M");
 
-    // Output accumulator in frequency domain (Complex)
-    // Size: (B, Lfft/2 + 1)
-    auto nfreq = Lfft / 2 + 1;
+    const int64_t B = signal_1.size(0);
+    const int64_t N = signal_1.size(1);
+    const int64_t nfreq = Lfft / 2 + 1;
 
-    // Initialize accumulator with zeros
-    auto options_complex = torch::TensorOptions().dtype(torch::kComplexFloat).device(signal_1.device());
-    auto Rspec = torch::zeros({B, nfreq}, options_complex);
+    auto opts_c = torch::TensorOptions().dtype(torch::kComplexFloat).device(signal_1.device());
+    auto opts_f = torch::TensorOptions().dtype(torch::kFloat32).device(signal_1.device());
 
-    // Pre-allocate time-domain buffers to avoid re-malloc inside loop
-    // These will hold the zero-padded segments
-    auto options_float = torch::TensorOptions().dtype(signal_1.dtype()).device(signal_1.device());
-    auto x_t = torch::zeros({B, Lfft}, options_float);
-    auto y_t = torch::zeros({B, Lfft}, options_float);
+    auto Rspec = torch::zeros({B, nfreq}, opts_c);
 
-    // Slice helpers
-    using namespace torch::indexing;
+    // Allocate once
+    auto x_t = torch::zeros({B, Lfft}, opts_f);
+    auto y_t = torch::zeros({B, Lfft}, opts_f);
 
-    // Calculate number of blocks
-    // integer division ceiling: (N + K - 1) / K
-    int64_t nblocks = (N + K - 1) / K;
+    const int64_t nblocks = (N + K - 1) / K;
 
-    for (int64_t l=0; l < nblocks; ++l) {
-        int64_t start = l * K;
-        int64_t end = std::min(start + K, N);
-        int64_t klen = end - start;
+    for (int64_t l = 0; l < nblocks; ++l) {
+        const int64_t start = l * K;
+        const int64_t end   = std::min(start + K, N);
+        const int64_t klen  = end - start;
 
-        // 1. Zero out buffers (reuse memory)
+        // Fast + safe on CPU: one contiguous memset each
         x_t.zero_();
         y_t.zero_();
 
-        // 2. Fill Y buffer (center block)
-        // y_t[:, M : M + klen] = signal_2[:, start:end]
-        y_t.index_put_({Slice(), Slice(M, M + klen)}, signal_2.index({Slice(), Slice(start, end)}));
-   
-        // 3. Fill X buffer (wider block with overlaps)
-        int64_t x0 = start - M;
-        int64_t x1 = start + K + M;
-        
-        // Clip to signal boundaries [0, N]
-        int64_t ix0 = std::max((int64_t)0, x0);
-        int64_t ix1 = std::min(N, x1);
-
-        if (ix1 > ix0) {
-            // Determine placement in x_t buffer
-            int64_t dst0 = ix0 - x0;  
-            int64_t dst1 = dst0 + (ix1 - ix0);  
-
-            x_t.index_put_({Slice(), Slice(dst0, dst1)}, signal_1.index({Slice(), Slice(ix0, ix1)}));    
+        // y_t[:, M:M+klen] = signal_2[:, start:end]
+        {
+            auto y_dst = y_t.narrow(/*dim=*/1, /*start=*/M, /*length=*/klen);
+            auto y_src = signal_2.narrow(/*dim=*/1, /*start=*/start, /*length=*/klen);
+            y_dst.copy_(y_src);
         }
 
-        // 4. FFT
-        auto X = torch::fft::rfft(x_t, Lfft, -1);
-        auto Y = torch::fft::rfft(y_t, Lfft, -1);
+        // x_t gets [start-M : start+K+M] (clipped)
+        const int64_t x0 = start - M;
+        const int64_t x1 = start + K + M;
 
-        // 5. Accumulate: Rspec += conj(X) * Y
+        const int64_t ix0 = std::max<int64_t>(0, x0);
+        const int64_t ix1 = std::min<int64_t>(N, x1);
+
+        if (ix1 > ix0) {
+            const int64_t len  = ix1 - ix0;
+            const int64_t dst0 = ix0 - x0;  // offset into x_t
+
+            auto x_dst = x_t.narrow(/*dim=*/1, /*start=*/dst0, /*length=*/len);
+            auto x_src = signal_1.narrow(/*dim=*/1, /*start=*/ix0, /*length=*/len);
+            x_dst.copy_(x_src);
+        }
+
+        // FFT
+        auto X = torch::fft::rfft(x_t, /*n=*/Lfft, /*dim=*/-1);
+        auto Y = torch::fft::rfft(y_t, /*n=*/Lfft, /*dim=*/-1);
+
+        // Accumulate: Rspec += conj(X) * Y
         Rspec.addcmul_(X.conj(), Y);
     }
 
     // Inverse FFT
-    auto r = torch::fft::irfft(Rspec, Lfft, -1);
+    auto r = torch::fft::irfft(Rspec, /*n=*/Lfft, /*dim=*/-1);
 
-    // Circular shift / Reorder lags
-    // Result is in [0...M] (pos lags) and [L-M...L] (neg lags)
-    // We want standard linear order: [-M ... 0 ... +M]
-    // The negative lags are at the END of r.
+    // Reorder lags to [-M ... 0 ... +M]
+    auto neg_lags = r.narrow(/*dim=*/1, /*start=*/Lfft - M, /*length=*/M);
+    auto pos_lags = r.narrow(/*dim=*/1, /*start=*/0,        /*length=*/M + 1);
 
-    auto neg_lags = r.index({Slice(), Slice(Lfft - M, Lfft)}); // Last M samples
-    auto pos_lags = r.index({Slice(), Slice(0, M + 1)});       // First M+1 samples
-    
-    return torch::cat({neg_lags, pos_lags}, -1);
+    return torch::cat({neg_lags, pos_lags}, /*dim=*/-1);
 }
 
-// Pybind11 module definition
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("correlation_v1", &correlation_v1_cpp, "ANI V1 Correlation (CPU)");
+    m.def("correlation_v1", &correlation_v1_cpp, "ANI V1 Correlation (CPU, float32)");
 }
