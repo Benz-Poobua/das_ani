@@ -51,6 +51,7 @@ viz = [
   "pandas>=2.0",
   "seaborn>=0.13",
   "scikit-image>=0.22",
+  "plotly>=5.18",
 ]
 
 # Jupyter / interactive work

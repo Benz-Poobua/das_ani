@@ -33,8 +33,8 @@ def plot_ncf_section(
     filename: str | None = None,
 ) -> None:
     mode = mode.lower().strip()
-    if mode not in {"all", "causal", "acasual"}:
-        raise ValueError("mode must be one of: 'all', 'causal', 'acasual'")
+    if mode not in {"all", "causal", "acausal"}:
+        raise ValueError("mode must be one of: 'all', 'causal', 'acausal'")
 
     ncf = np.asarray(ncf)
     lag_axis = np.asarray(lag_axis)
@@ -59,7 +59,7 @@ def plot_ncf_section(
         y = lag_axis[sel]          # already 0..T
         data = ncf[:, sel]
         ylabel = "Lag time (s)"
-    else:  # acasual
+    else:  # acausal
         sel = lag_axis <= 0
         y = np.abs(lag_axis[sel])  # convert to positive
         data = ncf[:, sel]
@@ -112,14 +112,22 @@ def plot_fv_panel(
     fv_panel,
     f_axis,
     v_axis,
-    title="Dispersion Image (f–v panel)",
+    *,
+    title: str | None = None,
+    filename: str | None = None,
     cmap="viridis",
-    figsize=(7, 5),
+    figsize=(10, 6),
     save_path=None,
-    show=True):
+    show=True,
+):
     """
-    Plot dispersion image (frequency–velocity panel) using Matplotlib.
+    Plot dispersion image (frequency–velocity panel).
 
+    Title convention (consistent with plot_ncf_section):
+        - If title is None:
+              "Dispersion: <basename(filename)>"
+        - Else:
+              "Dispersion: <title>"
     :param fv_panel: Dispersion image of shape (n_vel, n_freq).
     :type fv_panel: numpy.ndarray or torch.Tensor
     :param f_axis: Frequency axis in Hz, shape (n_freq,).
@@ -143,6 +151,13 @@ def plot_fv_panel(
     P = convert_to_numpy(fv_panel)
     f = convert_to_numpy(f_axis)
     vel = convert_to_numpy(v_axis)
+
+    # --- Title (CONSISTENT WITH plot_ncf_section) ---
+    if title is None:
+        base = os.path.basename(filename) if filename else ""
+        title = f"Dispersion: {base}".strip().rstrip(":")
+    else:
+        title = f"Dispersion: {title}"
 
     fig, ax = plt.subplots(figsize=figsize)
 
@@ -178,14 +193,23 @@ def plot_fv_with_pick(
     f_axis,
     v_axis,
     pick_curve,
-    title="Dispersion with Picked Curve",
+    *,
+    title: str | None = None,
+    filename: str | None = None,
     cmap="viridis",
-    figsize=(7, 5),
+    figsize=(10, 6),
     save_path=None,
-    show=True):
+    show=True,
+):
     """
-    Plot dispersion image and overlay the picked dispersion curve using Matplotlib.
+    Plot dispersion image and overlay the picked dispersion curve.
 
+    Title convention (consistent with plot_ncf_section / plot_fv_panel):
+        - If title is None:
+              "Dispersion + Pick: <basename(filename)>"
+        - Else:
+              "Dispersion + Pick: <title>"
+    
     :param fv_panel: Dispersion image of shape (n_vel, n_freq).
     :type fv_panel: numpy.ndarray or torch.Tensor
     :param f_axis: Frequency axis in Hz, shape (n_freq,).
@@ -212,6 +236,13 @@ def plot_fv_with_pick(
     f = convert_to_numpy(f_axis)
     vel = convert_to_numpy(v_axis)
     pick = convert_to_numpy(pick_curve)
+
+    # --- Title (CONSISTENT) ---
+    if title is None:
+        base = os.path.basename(filename) if filename else ""
+        title = f"Dispersion + Pick: {base}".strip().rstrip(":")
+    else:
+        title = f"Dispersion + Pick: {title}"
 
     fig, ax = plt.subplots(figsize=figsize)
 
