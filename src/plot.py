@@ -19,7 +19,7 @@ from src.utils import convert_to_numpy
 # Global Plotly style
 PLOTLY_FONT_FAMILY = "Helvetica"
 
-# 0. Plot NCF
+# 1. Plot NCF
 # ===========================================================================
 def plot_ncf_section(
     ncf: np.ndarray,
@@ -31,6 +31,11 @@ def plot_ncf_section(
     cmap: str = "seismic",
     title: str | None = None,
     filename: str | None = None,
+    # New Arguments
+    vs: str = "0",
+    gauge_length: float = 8.16,
+    range_m: float = 500.0,
+    clip_lim: bool = True
 ) -> None:
     mode = mode.lower().strip()
     if mode not in {"all", "causal", "acausal"}:
@@ -44,10 +49,13 @@ def plot_ncf_section(
     if ncf.shape == (lag_axis.size, distance_axis.size):
         ncf = ncf.T
     if ncf.shape != (distance_axis.size, lag_axis.size):
-        raise ValueError(
-            f"Shape mismatch: ncf.shape={ncf.shape}, expected "
-            f"({distance_axis.size}, {lag_axis.size})."
-        )
+        raise ValueError(f"Shape mismatch: ncf.shape={ncf.shape}")
+
+    # --- Position Calculation ---
+    position = int(vs) * gauge_length
+
+    fig_size = (6, 6) if clip_lim else (10, 6)
+    fig, ax = plt.subplots(figsize=fig_size)
 
     # --- Select mode ---
     if mode == "all":
@@ -56,14 +64,13 @@ def plot_ncf_section(
         ylabel = "Lag time (s)"
     elif mode == "causal":
         sel = lag_axis >= 0
-        y = lag_axis[sel]          # already 0..T
+        y = lag_axis[sel]
         data = ncf[:, sel]
         ylabel = "Lag time (s)"
     else:  # acausal
         sel = lag_axis <= 0
-        y = np.abs(lag_axis[sel])  # convert to positive
+        y = np.abs(lag_axis[sel])
         data = ncf[:, sel]
-        # ensure y goes 0..T (not T..0)
         order = np.argsort(y)
         y = y[order]
         data = data[:, order]
@@ -78,13 +85,12 @@ def plot_ncf_section(
         c = np.max(np.abs(data)) if data.size else 1.0
 
     # --- Title ---
+    vs_info = f" (VS={vs} @ {position:.1f}m)"
     if title is None:
         base = os.path.basename(filename) if filename else ""
-        title = f"NCF {mode}: {base}".strip().rstrip(":")
+        title = f"NCF {mode}: {base}{vs_info}".strip().rstrip(":")
     else:
-        title = f"NCF {mode}: {title}"
-
-    fig, ax = plt.subplots(figsize=(10, 6))
+        title = f"NCF {mode}: {title}{vs_info}"
 
     img = ax.imshow(
         data.T,
@@ -93,20 +99,145 @@ def plot_ncf_section(
         cmap=cmap,
         vmin=-c, vmax=c,
         interpolation="nearest",
-        origin="lower",   # keep it simple...
+        origin="lower",
     )
 
-    # ...then FORCE time increasing downward
+    # --- Virtual Source Marker ---
+    # Add a vertical line at the virtual source position
+    ax.axvline(x=position, color='black', linestyle='--', linewidth=1.2, alpha=0.6, label=f"VS {vs}")
+
+    # --- Spatial Clipping (xlim) ---
+    if clip_lim:
+        # Calculate theoretical limits
+        left_lim = position - range_m
+        right_lim = position + range_m
+
+        # Clamp to the actual boundaries of the data
+        ax.set_xlim(
+            max(distance_axis.min(), left_lim), 
+            min(distance_axis.max(), right_lim)
+        )
+
+    # Force time increasing downward
     ax.invert_yaxis()
 
     fig.colorbar(img, ax=ax, label="Correlation amplitude")
     ax.set_xlabel("Distance along array (m)")
     ax.set_ylabel(ylabel)
-    ax.set_title(title)
+    ax.set_title(title, pad=15)
     fig.tight_layout()
+            
     plt.show()
 
-# 1. Matplotlib: f–v dispersion panel
+def plot_ncf_section_mesh(
+    ncf: np.ndarray,
+    lag_axis: np.ndarray,
+    distance_axis: np.ndarray,
+    mode: str = "all",
+    clip: float | None = 0.05,
+    pclip: float | None = None,
+    cmap: str = "seismic",
+    title: str | None = None,
+    filename: str | None = None,
+    vs: str = "0",
+    gauge_length: float = 8.16,
+    range_m: float = 500.0,
+    clip_lim: bool = True
+) -> None:
+    mode = mode.lower().strip()
+    if mode not in {"all", "causal", "acausal"}:
+        raise ValueError("mode must be one of: 'all', 'causal', 'acausal'")
+
+    ncf = np.asarray(ncf)
+    lag_axis = np.asarray(lag_axis)
+    distance_axis = np.asarray(distance_axis)
+
+    # Expect (n_distance, n_lag). Auto-fix common transpose.
+    if ncf.shape == (lag_axis.size, distance_axis.size):
+        ncf = ncf.T
+    if ncf.shape != (distance_axis.size, lag_axis.size):
+        raise ValueError(f"Shape mismatch: ncf.shape={ncf.shape}")
+
+    # --- Position Calculation ---
+    position = int(vs) * gauge_length
+
+    # --- Select mode and slice data ---
+    if mode == "all":
+        y = lag_axis
+        data = ncf
+        ylabel = "Lag time (s)"
+    elif mode == "causal":
+        sel = lag_axis >= 0
+        y = lag_axis[sel]
+        data = ncf[:, sel]
+        ylabel = "Lag time (s)"
+    else:  # acausal
+        sel = lag_axis <= 0
+        y_raw = np.abs(lag_axis[sel])
+        order = np.argsort(y_raw)
+        y = y_raw[order]
+        data = ncf[:, sel][:, order]
+        ylabel = "|Lag time| (s)"
+
+    # --- Color clip ---
+    if pclip is not None:
+        c = np.percentile(np.abs(data), pclip)
+    elif clip is not None:
+        c = float(clip)
+    else:
+        c = np.max(np.abs(data)) if data.size else 1.0
+
+    # --- Figure Setup ---
+    fig_size = (6, 6) if clip_lim else (10, 6)
+    fig, ax = plt.subplots(figsize=fig_size)
+
+    # --- Rendering with pcolormesh ---
+    # pcolormesh(X, Y, Z) where Z is (n_y, n_x)
+    # We pass data.T which is (n_lag, n_dist) to match X(dist) and Y(lag)
+    img = ax.pcolormesh(
+        distance_axis, 
+        y, 
+        data.T, 
+        shading='gouraud', # or `auto`
+        cmap=cmap, 
+        vmin=-c, 
+        vmax=c
+    )
+
+    # --- Virtual Source Marker ---
+    ax.axvline(x=position, color='black', linestyle='--', linewidth=1.2, alpha=0.6, label=f"VS {vs}")
+
+    # --- Title ---
+    vs_info = f" (VS={vs} @ {position:.1f}m)"
+    if title is None:
+        base = os.path.basename(filename) if filename else ""
+        title = f"NCF {mode}: {base}{vs_info}".strip().rstrip(":")
+    else:
+        title = f"NCF {mode}: {title}{vs_info}"
+
+    # --- Final Touches ---
+    if clip_lim:
+        # Calculate theoretical limits
+        left_lim = position - range_m
+        right_lim = position + range_m
+
+        # Clamp to the actual boundaries of the data
+        ax.set_xlim(
+            max(distance_axis.min(), left_lim), 
+            min(distance_axis.max(), right_lim)
+        )
+
+    ax.invert_yaxis() # Traditional seismic view: time increases downward
+    ax.set_xlabel("Distance along array (m)")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, pad=15)
+    
+    fig.colorbar(img, ax=ax, label="Correlation amplitude")
+    fig.tight_layout()
+            
+    plt.show()
+
+# 2. Matplotlib: f–v dispersion panel
 # ===========================================================================
 def plot_fv_panel(
     fv_panel,
@@ -186,7 +317,64 @@ def plot_fv_panel(
 
     return fig, ax
 
-# 2. Matplotlib: f–v panel + pick curve overlay
+def plot_fv_panel_mesh(
+    fv_panel,
+    f_axis,
+    v_axis,
+    *,
+    title: str | None = None,
+    filename: str | None = None,
+    cmap="viridis",
+    figsize=(10, 6),
+    save_path=None,
+    show=True,
+):
+    """
+    Plot dispersion image (frequency–velocity panel) using pcolormesh.
+    """
+    P = convert_to_numpy(fv_panel)
+    f = convert_to_numpy(f_axis)
+    vel = convert_to_numpy(v_axis)
+
+    # --- Title Consistency ---
+    if title is None:
+        base = os.path.basename(filename) if filename else ""
+        title = f"Dispersion: {base}".strip().rstrip(":")
+    else:
+        title = f"Dispersion: {title}"
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Rendering with pcolormesh
+    # P is usually (n_vel, n_freq). 
+    # f provides the X coordinates, vel provides the Y coordinates.
+    im = ax.pcolormesh(
+        f, 
+        vel, 
+        P, 
+        shading='gouraud', # `auto` can cause issues with non-uniform grids, so 'gouraud' is a good alternative for smooth rendering
+        cmap=cmap,
+        snap=True
+    )
+
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Phase velocity (m/s)")
+    ax.set_title(title)
+
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Amplitude (normalized)")
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close()
+
+    return fig, ax
+
+# 3. Matplotlib: f–v panel + pick curve overlay
 # ===========================================================================
 def plot_fv_with_pick(
     fv_panel,
@@ -273,7 +461,68 @@ def plot_fv_with_pick(
 
     return fig, ax
 
-# 3. Matplotlib: v(f) pick curve only
+def plot_fv_with_pick_mesh(
+    fv_panel,
+    f_axis,
+    v_axis,
+    pick_curve,
+    *,
+    title: str | None = None,
+    filename: str | None = None,
+    cmap="viridis",
+    figsize=(10, 6),
+    save_path=None,
+    show=True,
+):
+    """
+    Plot dispersion image using pcolormesh and overlay the picked dispersion curve.
+    """
+    P = convert_to_numpy(fv_panel)
+    f = convert_to_numpy(f_axis)
+    vel = convert_to_numpy(v_axis)
+    pick = convert_to_numpy(pick_curve)
+
+    # --- Title (CONSISTENT) ---
+    if title is None:
+        base = os.path.basename(filename) if filename else ""
+        title = f"Dispersion + Pick: {base}".strip().rstrip(":")
+    else:
+        title = f"Dispersion + Pick: {title}"
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Rendering the panel with pcolormesh
+    im = ax.pcolormesh(
+        f, 
+        vel, 
+        P, 
+        shading='gouraud',
+        cmap=cmap,
+        snap=True
+    )
+
+    # Overlay the red pick line
+    # zorder=10 ensures the line stays on top of the mesh
+    ax.plot(f, pick, "r-", linewidth=2.5, label="Picked dispersion", zorder=10)
+    ax.legend(loc='upper right')
+
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Phase velocity (m/s)")
+    ax.set_title(title)
+
+    plt.colorbar(im, ax=ax, label="Amplitude (normalized)")
+
+    if save_path:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close()
+
+    return fig, ax
+
+# 4. Matplotlib: v(f) pick curve only
 # ===========================================================================
 def plot_pick_curve(
     f_axis,
@@ -322,7 +571,7 @@ def plot_pick_curve(
 
     return fig, ax
 
-# 4. Plotly: f–v dispersion panel (interactive)
+# 5. Plotly: f–v dispersion panel (interactive)
 # ===========================================================================
 def plot_fv_panel_plotly(
     fv_panel,
@@ -487,7 +736,7 @@ def plot_fv_panel_plotly(
 
     return fig
 
-# 5. Plotly: f–v + pick overlay
+# 6. Plotly: f–v + pick overlay
 # ===========================================================================
 def plot_fv_with_pick_plotly(
     fv_panel,
@@ -635,7 +884,7 @@ def plot_fv_with_pick_plotly(
 
     return fig
 
-# 6. Plotly: v(f) pick curve only
+# 7. Plotly: v(f) pick curve only
 # ===========================================================================
 def plot_pick_curve_plotly(
     f_axis,
@@ -730,7 +979,7 @@ def plot_pick_curve_plotly(
 
     return fig
 
-# 7. Plotly: animation over days for f–v panels
+# 8. Plotly: animation over days for f–v panels
 # ===========================================================================
 def animate_fv_over_days_plotly(
     fv_stack,
@@ -911,7 +1160,7 @@ def animate_fv_over_days_plotly(
 
     return fig
 
-# 8. Other generic Plotly utilities
+# 9. Other generic Plotly utilities
 # ===========================================================================
 def plot_data_animation_plotly(
     data,
