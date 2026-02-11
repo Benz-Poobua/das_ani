@@ -29,10 +29,13 @@ preprocess:
 
 xcorr:
   # method switch
-  mode: v1 # conventional or v1 
+  mode: conventional # conventional or v1
+
+  # benchmark switch
+  use_cpp: false # set to false to use pure python benchmark
 
   # whitening
-  is_spectral_whitening: true # means: do whitening, but now done in prewhiten stage
+  is_spectral_whitening: false # do whitening, but now done in prewhiten stage
   window_freq_hz: 0.0
 
   # lags of interest
@@ -59,5 +62,5 @@ stacking:
   overwrite: false
   windows:
     7d: true
-    15d: false
-    30d: false
+    15d: true
+    30d: true

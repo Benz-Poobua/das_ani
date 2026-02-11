@@ -167,18 +167,13 @@ def stack_ncf_window(
     window_days: int,
     *,
     overwrite: bool = False,
+    min_frac: float = 0.9   
     ) -> None:
     """
-    Sliding-window stacking per (VS, method).
-
-    For each (VS, method), for each end date D:
-        stack all daily files from [D-window_days+1, ..., D]
-    Requires full window (exactly window_days daily files).
-
-    Output naming (method-aware):
-        YYYYMMDD_cc_###_<Nd>.npy                   (if method missing)
-        YYYYMMDD_cc_###_<Nd>_v1.npy
-        YYYYMMDD_cc_###_<Nd>_conventional.npy
+    Sliding-window stacking per (VS, method) with tolerance for missing days.
+    
+    :param min_frac: Minimum fraction of days required (0.0 to 1.0).
+                     e.g. 0.9 means a 30-day window needs at least 27 days present.
     """
     daily_root = Path(daily_root).expanduser().resolve()
     out_root = Path(out_root).expanduser().resolve()
@@ -210,18 +205,29 @@ def stack_ncf_window(
         # Sort by date
         items = sorted(items, key=lambda x: x[0])
         dates = [d for d, _ in items]
-
-        # Use a date->path lookup for fast window assembly
         date_to_path = {d: p for d, p in items}
 
+        # Iterate through EVERY possible end date in the range, not just the ones we have files for.
+        # This ensures we try to build a window ending on Oct 1 even if we only have data up to Sep 30?
+        # Actually, standard practice is to iterate through the dates we HAVE as end-points.
         for end_date in dates:
             start_date = end_date - timedelta(days=window_days - 1)
 
-            # Build contiguous window dates
-            win_dates = [start_date + timedelta(days=k) for k in range(window_days)]
-
-            # Require full window present
-            if not all(d in date_to_path for d in win_dates):
+            # 1. Identify valid files in this theoretical window
+            valid_paths = []
+            files_found_count = 0
+            
+            for k in range(window_days):
+                target_date = start_date + timedelta(days=k)
+                if target_date in date_to_path:
+                    valid_paths.append(date_to_path[target_date])
+                    files_found_count += 1
+            
+            # 2. Check threshold (Relaxed Logic)
+            required_days = int(np.ceil(window_days * min_frac))
+            if files_found_count < required_days:
+                # Optional: debug log why it failed
+                # logger.debug(f"Skip {end_date}: found {files_found_count}/{window_days} (need {required_days})")
                 continue
 
             suffix = f"_{method}" if method else ""
@@ -231,11 +237,13 @@ def stack_ncf_window(
             if outpath.exists() and not overwrite:
                 continue
 
-            arrs = [np.load(date_to_path[d]) for d in win_dates]
+            # 3. Stack only the files that exist
+            arrs = [np.load(p) for p in valid_paths]
             stack = np.mean(arrs, axis=0).astype(np.float32)
 
             np.save(outpath, stack)
-            logger.info("Saved %dd stack: %s", window_days, outpath)
+            # Log with count so you know quality
+            logger.info("Saved %dd stack: %s (used %d/%d days)", window_days, outname, files_found_count, window_days)
 
 # =====================================================
 # High-level runner (config-driven)

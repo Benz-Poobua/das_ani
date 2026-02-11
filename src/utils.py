@@ -23,8 +23,10 @@ import numpy as np
 
 from tqdm import tqdm
 from pathlib import Path
-from scipy.ndimage import median_filter, gaussian_filter
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar, Tuple, Union, overload
+from scipy.ndimage import uniform_filter, gaussian_filter, median_filter
+from scipy.fft import fft2, fftshift, ifft2, ifftshift
+
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar, Tuple, Union, overload, Literal
 
 
 logger = logging.getLogger(__name__)
@@ -233,7 +235,7 @@ def nextpow2(x: Union[int, float, torch.Tensor]) -> Union[int, torch.Tensor]:
 # 5. FK transform
 # ==============================================================
 @torch.no_grad()
-def fk_transform(
+def fk_transform_(
     data: Union[np.ndarray, torch.Tensor],
     dt: float,
     dx: float,
@@ -302,7 +304,7 @@ def fk_velocity_filter(
     nch, nt = ncf.shape
 
     # 1. Forward f–k transform 
-    freqs, ks, FK = fk_transform(
+    freqs, ks, FK = fk_transform_(
         ncf,
         dt=dt,
         dx=dx,
@@ -437,6 +439,156 @@ def fv_filter(
         raise ValueError("denoise must be one of: 'median', 'gaussian', 'none'")
 
     return P2.astype(np.float32, copy=False), f2, v2
+
+# ==============================================================
+# 5A. Legacy SciPy FK (for testing / comparison) (from Haipeng)
+# ==============================================================
+
+def fk_transform(
+    data: np.ndarray,
+    dt: float,
+    dx: float,
+    pad_shape: Optional[Tuple[int, int]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute the Forward 2D Fourier transform (f–k spectrum).
+
+    :param data: 2D data array (nx, nt).
+    :param dt: Time sampling interval (s).
+    :param dx: Spatial sampling interval (m).
+    :param pad_shape: Optional tuple (nx_pad, nt_pad) for FFT padding.
+    :return: (freqs [Hz], wavenumbers [cycles/m], fk_spectrum [complex])
+    """
+    if data.ndim != 2:
+        raise ValueError(f"'data' must be 2D (nx, nt); got {data.ndim}D")
+
+    shape = pad_shape if pad_shape is not None else data.shape
+    nx_out, nt_out = shape
+
+    # 2D FFT with shift (places DC at center)
+    fk_spectrum = fftshift(fft2(data, s=shape))
+
+    # Construct axes
+    k_axis = fftshift(np.fft.fftfreq(nx_out, dx))
+    f_axis = fftshift(np.fft.fftfreq(nt_out, dt))
+
+    return f_axis, k_axis, fk_spectrum
+
+
+def fk_inverse(
+    fk_spectrum: np.ndarray,
+    orig_shape: Optional[Tuple[int, int]] = None
+) -> np.ndarray:
+    """
+    Compute the Inverse 2D Fourier transform.
+
+    :param fk_spectrum: 2D f–k spectrum (nk, nf), usually fftshifted.
+    :param orig_shape: Optional (nx, nt) to crop the output to.
+    :return: Reconstructed time-space data (nx, nt).
+    """
+    if fk_spectrum.ndim != 2:
+        raise ValueError(f"'fk_spectrum' must be 2D; got {fk_spectrum.ndim}D")
+
+    # Inverse FFT (undo shift first)
+    data = ifft2(ifftshift(fk_spectrum))
+
+    # Crop to original shape if provided
+    if orig_shape is not None:
+        nx, nt = orig_shape
+        data = data[:nx, :nt]
+
+    return data.real
+
+
+def fk_filter(
+    data: np.ndarray,
+    dt: float,
+    dx: float,
+    vmin: float,
+    vmax: float,
+    mode: Literal["eliminate", "extract"] = "eliminate",
+    pad_factor: Tuple[int, int] = (1, 1),
+    smooth: Literal["no", "gaussian", "uniform"] = "no",
+    sigma: float = 1.0,
+    uniform_size: int = 1,
+) -> np.ndarray:
+    """
+    Apply velocity filtering in the f–k domain.
+
+    :param data: 2D data array (nx, nt).
+    :param dt: Time sampling interval (s).
+    :param dx: Spatial sampling interval (m).
+    :param vmin: Min absolute velocity to target (m/s).
+    :param vmax: Max absolute velocity to target (m/s).
+    :param mode: 'eliminate' (remove band) or 'extract' (keep band).
+    :param pad_factor: Factors (nx_mul, nt_mul) for FFT padding. Default (1, 1).
+    :param smooth: Mask smoothing method: 'no', 'gaussian', or 'uniform'.
+    :param sigma: Sigma for gaussian smoothing (if smooth='gaussian').
+    :param uniform_size: Kernel size for uniform smoothing (if smooth='uniform').
+    :return: Filtered data (nx, nt).
+    """
+    nx_in, nt_in = data.shape
+    nx_pad = int(nx_in * pad_factor[0])
+    nt_pad = int(nt_in * pad_factor[1])
+
+    # 1. Forward Transform
+    freqs, ks, fk_data = fk_transform(data, dt, dx, pad_shape=(nx_pad, nt_pad))
+
+    # Flip axis 0 (wavenumber) to match specific directional logic
+    # (Matches original logic: positive direction L to R handling)
+    fk_data = np.flip(fk_data, axis=0)
+
+    # 2. Create Velocity Mask
+    # v = f / k. Handle singularities.
+    f_grid, k_grid = np.meshgrid(freqs, ks, indexing="xy")
+    
+    with np.errstate(divide="ignore", invalid="ignore"):
+        v_grid = f_grid / k_grid
+        # Handle k=0 (infinite velocity)
+        v_grid[k_grid == 0] = np.inf
+    
+    # Base mask: 0 inside the velocity band, 1 outside
+    mask = np.ones_like(fk_data.real)
+
+    # Use absolute velocity to keep both Left and Right going waves
+    mask[(np.abs(v_grid) >= vmin) & (np.abs(v_grid) <= vmax)] = 0.0
+
+    # 3. Apply Smoothing
+    if smooth == "gaussian":
+        mask = gaussian_filter(mask, sigma=sigma)
+    elif smooth == "uniform":
+        mask = uniform_filter(mask, size=uniform_size)
+    elif smooth != "no":
+        raise ValueError(f"Invalid smooth mode: {smooth}")
+
+    # 4. Apply Mask (Mode Logic)
+    if mode == "eliminate":
+        # Keep everything OUTSIDE the band (multiply by mask where band=0)
+        fk_data *= mask
+    elif mode == "extract":
+        # Keep everything INSIDE the band (multiply by inverse mask)
+        fk_data *= (1.0 - mask)
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
+
+    # 5. Inverse Transform
+    # Flip back before inverse
+    fk_data = np.flip(fk_data, axis=0)
+    
+    return fk_inverse(fk_data, orig_shape=(nx_in, nt_in))
+
+# ==============================================================
+# 5B. Hilbert transform along time axis (for analytic signal / envelope)
+# ==============================================================
+def compute_envelope(data: np.ndarray, axis: int = -1) -> np.ndarray:
+    """
+    Compute the instantaneous amplitude (envelope) via Hilbert transform.
+    """
+    # Import locally to avoid slow load times if not used
+    from scipy.signal import hilbert
+    
+    # Return absolute value of analytic signal
+    return np.abs(hilbert(data, axis=axis))
 
 # ==============================================================
 # 6. Runlog writer

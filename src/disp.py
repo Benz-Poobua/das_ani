@@ -113,7 +113,7 @@ def dispersion_curve(
         f"nv={nv} (v=[{vmin},{vmax}] dv={dv}) | nf={nf} (f=[{fmin},{fmax}])"
         )
 
-    # FFT along time: (nrec, nf)
+    # FFT along time: (nrec, nfreq_masked)
     fft_data = torch.fft.rfft(data_t, n=nfft, dim=1)[:, freq_mask]
 
     # Phase-only (avoid amplitude dominance)
@@ -454,7 +454,11 @@ def compute_dispersion_from_ncf(
     """
     Build offset + time vectors from an NCF and compute:
       - f–v panel
-      - optional picks (if pick_kwargs provided)
+      - optional picks 
+
+    **Important:** This function assumes `ncf` is "one-sided" (or folded).
+    It constructs time as starting from 0 (causal).
+    If you have a symmetric NCF, fold it before passing here.
 
     :param ncf: NCF matrix (nrec, nlag), symmetric around zero lag.
     :param fs: Sampling rate (Hz).
@@ -470,19 +474,19 @@ def compute_dispersion_from_ncf(
     
     nrec, nlag = ncf_arr.shape
 
-    # Build offset vector
+    # 1. Build Offset Vector (0 to L)
     offset = np.arange(nrec, dtype=float) * float(dx)
 
-    # Build symmetric time vector centered at zero lag; assume nlag is odd and centered
-    max_lag = (nlag - 1) // 2
-    t = np.linspace(-max_lag / float(fs), max_lag / float(fs), nlag, dtype=float)
+    # 2. Build Time Vector (0 to T)
+    # We assume 'disp_pick.py' has already folded/cut the data to be causal.
+    t = np.arange(nlag, dtype=float) / float(fs)
 
-    # Compute dispersion
+    # 3. Compute Dispersion
     fv_kwargs = fv_kwargs or {}
     fv_panel, f_axis, v_axis = dispersion_curve(
         data=ncf_arr, offset=offset, t=t, **fv_kwargs)
 
-    # Pick fundamental dispersion curve
+    # 4. Picking
     picks = None
     if pick_kwargs is not None:
         picks = extr_disp(f_axis, v_axis, fv_panel, **pick_kwargs)
