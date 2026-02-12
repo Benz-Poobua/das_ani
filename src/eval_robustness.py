@@ -860,11 +860,11 @@ if __name__ == "__main__":
 # python -m src.eval_robustness \
 #   --cc_config configs/cc.yaml \
 #   --outdir data/benchmarks/final \
-#   --n_files 4 \
-#   --repeats 3 \
-#   --cores 1 2 4 8 \
+#   --n_files 16 \
+#   --repeats 1 \
+#   --cores 1 2 4 8 16\
 #   --window_sec 60 \
-#   --njobs_complexity 4 \
+#   --njobs_complexity 16 \
 #   --lags 0.5 1 2 4 5 10 20
 
 # Re-plotting only from existing CSV:
