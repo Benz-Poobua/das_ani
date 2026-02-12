@@ -33,7 +33,8 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+from scipy.optimize import curve_fit
 
 import numpy as np
 import pandas as pd
@@ -115,6 +116,80 @@ def fit_amdahl_s(ps: List[int], speedups: List[float]) -> float:
                 best_s = float(s)
 
     return float(best_s)
+
+# -----------------------------------------------------------------------------
+# USL helpers
+# -----------------------------------------------------------------------------
+def usl_speedup(p: int, sigma: float, kappa: float) -> float:
+    """
+    Universal Scalability Law speedup:
+        S(p) = p / (1 + sigma * (p - 1) + kappa * p * (p - 1))
+    sigma: contention parameter (similar to Amdahl's serial fraction)
+    kappa: coherency parameter (crosstalk/synchronization overhead)
+    """
+    p = float(p)
+    if p < 1:
+        return 0.0
+    # S(p) = p / (1 + sigma(p-1) + kappa*p(p-1))
+    denom = 1.0 + sigma * (p - 1.0) + kappa * p * (p - 1.0)
+    return p / denom
+
+def usl_model(p, sigma, kappa):
+    """Vectorized model for scipy.optimize."""
+    p = np.asarray(p, dtype=float)
+    denom = 1.0 + sigma * (p - 1.0) + kappa * p * (p - 1.0)
+    return np.divide(p, denom, out=np.zeros_like(p), where=denom != 0)
+
+def fit_usl_params(ps: List[int], speedups: List[float]) -> Tuple[float, float]:
+    """
+    Fallback grid search for sigma and kappa.
+    """
+    pairs = [(int(p), float(S)) for p, S in zip(ps, speedups) if int(p) >= 1 and float(S) > 0]
+    if len(pairs) < 2:
+        return 0.1, 0.0  
+
+    best_params = (0.1, 0.0)
+    best_err = float("inf")
+
+    # Coarse search to provide a stable baseline
+    for s in np.linspace(0.0, 0.5, 50):
+        for k in np.linspace(0.0, 0.02, 50):
+            err = np.sum([(usl_speedup(p, s, k) - Sobs)**2 for p, Sobs in pairs])
+            if err < best_err:
+                best_err = err
+                best_params = (float(s), float(k))
+    return best_params
+
+def fit_usl_params_precise(ps: List[int], speedups: List[float]) -> Tuple[float, float]:
+    """
+    Precise fit using non-linear least squares.
+    """
+    ps_arr = np.array(ps, dtype=float)
+    ss_arr = np.array(speedups, dtype=float)
+    
+    if len(ps_arr) < 3:
+        return fit_usl_params(ps, speedups) 
+
+    try:
+        # Constraints: sigma [0, 1], kappa [0, 1]
+        popt, _ = curve_fit(
+            usl_model, ps_arr, ss_arr, 
+            p0=[0.1, 0.001], 
+            bounds=([0.0, 0.0], [1.0, 1.0])
+        )
+        return float(popt[0]), float(popt[1])
+    except Exception as e:
+        # Graceful fallback if scipy fails
+        return fit_usl_params(ps, speedups)
+    
+def predict_max_cores(sigma: float, kappa: float) -> int:
+    """
+    Calculates the 'Peak' of the USL curve: p_max = sqrt((1-sigma)/kappa).
+    """
+    if kappa <= 0:
+        return 999  # Infinite scaling theoretically
+    p_max = np.sqrt((1.0 - sigma) / kappa)
+    return int(round(p_max))
 
 # -----------------------------------------------------------------------------
 # Resume / manifest helpers
@@ -513,6 +588,16 @@ def plot_results(df: pd.DataFrame, out_dir: Path) -> None:
 
     sns.set_theme(style="whitegrid")
 
+    # Global window suffix 
+    window_suffix = ""
+    if "window_sec" in df.columns:
+        wvals = pd.to_numeric(df["window_sec"], errors="coerce").dropna().unique()
+        wvals = np.sort(wvals)
+        if wvals.size == 1:
+            window_suffix = f"_W{wvals[0]:g}s"
+        elif wvals.size > 1:
+            window_suffix = f"_Wmulti"
+
     def _window_label(subdf: pd.DataFrame) -> str:
         """Return a clean title suffix describing window_sec."""
         if "window_sec" not in subdf.columns:
@@ -553,16 +638,7 @@ def plot_results(df: pd.DataFrame, out_dir: Path) -> None:
     # -----------------------
     dsc = df[df["experiment"] == "scaling"].copy()
     if not dsc.empty:
-        plt.figure(figsize=(9, 5))
-        ax = sns.lineplot(data=dsc, x="njobs", y="wall_sec", hue="mode", marker="o")
-        ax.set_title("Strong scaling: Wall time vs cores")
-        ax.set_xlabel("njobs (processes)")
-        ax.set_ylabel("wall time (s)")
-        ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-        plt.tight_layout()
-        plt.savefig(plots_dir / "scaling_wall_time.png", dpi=220)
-        plt.close()
-
+        # Preparation for speedup calculation
         dsc2 = dsc.copy()
         dsc2["speedup"] = np.nan
         dsc2["efficiency"] = np.nan
@@ -572,7 +648,6 @@ def plot_results(df: pd.DataFrame, out_dir: Path) -> None:
             sub = dsc2[dsc2["mode"] == mode].sort_values("njobs")
             p0 = int(sub["njobs"].iloc[0])
             t0 = float(sub["wall_sec"].iloc[0])
-
             for idx, row in sub.iterrows():
                 p = int(row["njobs"])
                 tp = float(row["wall_sec"])
@@ -580,59 +655,60 @@ def plot_results(df: pd.DataFrame, out_dir: Path) -> None:
                 dsc2.loc[idx, "speedup"] = S
                 dsc2.loc[idx, "efficiency"] = S / (float(p) / float(p0)) if (p0 > 0 and p > 0) else float("nan")
                 dsc2.loc[idx, "serial_frac_est"] = estimate_serial_fraction(p, S)
-        
+
+        # 1) Wall Time Plot
         plt.figure(figsize=(9, 5))
-        ax = sns.lineplot(data=dsc2, x="njobs", y="speedup", hue="mode", marker="o")
-        ax.set_title("Strong scaling: Speedup vs cores")
-        ax.set_xlabel("njobs (processes)")
-        ax.set_ylabel("speedup = T1 / Tp")
+        ax = sns.lineplot(data=dsc, x="njobs", y="wall_sec", hue="mode", marker="o")
+        ax.set_title("Strong scaling: Wall time vs cores")
         ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
         plt.tight_layout()
-        plt.savefig(plots_dir / "scaling_speedup.png", dpi=220)
+        plt.savefig(plots_dir / f"scaling_wall_time{window_suffix}.png", dpi=220)
         plt.close()
 
-        plt.figure(figsize=(9, 5))
-        ax = sns.lineplot(data=dsc2, x="njobs", y="speedup", hue="mode", marker="o")
-        ax.set_title("Strong scaling: Speedup vs cores (Amdahl fit)")
-        ax.set_xlabel("njobs (processes)")
-        ax.set_ylabel("speedup = T1 / Tp")
-        ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-
-        for mode in dsc2["mode"].unique():
-            sub = dsc2[dsc2["mode"] == mode].sort_values("njobs")
-            ps = [int(x) for x in sub["njobs"].tolist()]
-            Ss = [float(x) for x in sub["speedup"].tolist()]
-            s_fit = fit_amdahl_s(ps, Ss)
-            if np.isfinite(s_fit):
-                p_grid = sorted(set(ps))
-                y_fit = [amdahl_speedup(p, s_fit) for p in p_grid]
-                ax.plot(p_grid, y_fit, linestyle="--", linewidth=2, label=f"{mode} Amdahl (s={s_fit:.2f})")
-
-        ax.legend(title="mode", frameon=True, loc="best")
-        plt.tight_layout()
-        plt.savefig(plots_dir / "scaling_speedup_amdahl.png", dpi=220)
-        plt.close()
-
+        # 2) Efficiency Plot
         plt.figure(figsize=(9, 5))
         ax = sns.lineplot(data=dsc2, x="njobs", y="efficiency", hue="mode", marker="o")
         ax.set_title("Strong scaling: Parallel efficiency vs cores")
-        ax.set_xlabel("njobs (processes)")
-        ax.set_ylabel("efficiency")
         ax.set_ylim(0.0, 1.05)
         ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
         plt.tight_layout()
-        plt.savefig(plots_dir / "scaling_efficiency.png", dpi=220)
+        plt.savefig(plots_dir / f"scaling_efficiency{window_suffix}.png", dpi=220)
         plt.close()
 
-        plt.figure(figsize=(9, 5))
-        ax = sns.lineplot(data=dsc2, x="njobs", y="serial_frac_est", hue="mode", marker="o")
-        ax.set_title("Amdahl diagnostic: Estimated serial fraction vs cores")
-        ax.set_xlabel("njobs (processes)")
-        ax.set_ylabel("serial fraction (estimated)")
-        ax.set_ylim(0.0, 1.0)
-        ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+        # 3) AMDAHL VS USL COMPARISON PLOT
+        plt.figure(figsize=(10, 6))
+        # Plot raw speedup points
+        ax = sns.scatterplot(data=dsc2, x="njobs", y="speedup", hue="mode", s=100, zorder=5)
+        ax.set_title("Scaling Model Comparison: Amdahl vs. USL")
+        ax.set_ylabel("speedup = T1 / Tp")
+        
+        p_max = int(dsc2["njobs"].max())
+        p_grid = np.linspace(1, p_max, 100)
+        palette = sns.color_palette()
+        mode_colors = {"conventional": palette[0], "v1": palette[1]}
+
+        for mode in dsc2["mode"].unique():
+            sub = dsc2[dsc2["mode"] == mode].sort_values("njobs")
+            ps = sub["njobs"].tolist()
+            Ss = sub["speedup"].tolist()
+            color = mode_colors.get(mode, "black")
+
+            # --- Amdahl Fit ---
+            s_fit = fit_amdahl_s(ps, Ss)
+            if np.isfinite(s_fit):
+                y_amdahl = [amdahl_speedup(p, s_fit) for p in p_grid]
+                ax.plot(p_grid, y_amdahl, linestyle="--", alpha=0.5, color=color,
+                        label=f"{mode} Amdahl (s={s_fit:.2f})")
+
+            # --- USL Fit (Precise) ---
+            sigma, kappa = fit_usl_params_precise(ps, Ss)
+            y_usl = [usl_speedup(p, sigma, kappa) for p in p_grid]
+            ax.plot(p_grid, y_usl, linestyle="-", linewidth=2.5, color=color,
+                    label=f"{mode} USL (σ={sigma:.3f}, κ={kappa:.5f})")
+
+        ax.legend(title="Model Comparison", bbox_to_anchor=(1.05, 1), loc='upper left')
         plt.tight_layout()
-        plt.savefig(plots_dir / "scaling_serial_fraction.png", dpi=220)
+        plt.savefig(plots_dir / f"scaling_comparison_models{window_suffix}.png", dpi=220)
         plt.close()
 
     # -----------------------
@@ -655,6 +731,7 @@ def plot_results(df: pd.DataFrame, out_dir: Path) -> None:
             # Determine window for ratio axis (only if single-valued)
             w_unique = pd.to_numeric(g.get("window_sec", pd.Series(dtype=float)), errors="coerce").dropna().unique()
             window_for_axis = float(w_unique[0]) if w_unique.size == 1 else None
+            suffix = f"_W{window_for_axis:g}s" if window_for_axis is not None else ""
 
             # 1) wall time vs lag
             plt.figure(figsize=(9, 5))
@@ -662,11 +739,14 @@ def plot_results(df: pd.DataFrame, out_dir: Path) -> None:
             ax.set_title(f"Complexity sweep: Wall time vs max lag {win_label}".strip(), pad=20)
             ax.set_xlabel("max_lag_sec (s)")
             ax.set_ylabel("wall time (s)")
+
+            ax.set_ylim(bottom=0)
+            ax.yaxis.set_major_locator(ticker.MultipleLocator(100))
+
             if window_for_axis is not None:
                 _add_ratio_top_axis(ax, window_sec=window_for_axis)
             plt.tight_layout()
-
-            suffix = f"_W{window_for_axis:g}s" if window_for_axis is not None else ""
+            
             plt.savefig(plots_dir / f"complexity_wall_time_vs_lag{suffix}.png", dpi=220)
             plt.close()
 
@@ -677,11 +757,62 @@ def plot_results(df: pd.DataFrame, out_dir: Path) -> None:
             if not m.empty:
                 m["speedup_conv_over_v1"] = m["t_conv"] / m["t_v1"]
 
+                # --- 1. Find the Crossover Point (Speedup = 1.0) ---
+                m_sorted = m.sort_values("max_lag_sec")
+                l_vals = m_sorted["max_lag_sec"].values
+                s_vals = m_sorted["speedup_conv_over_v1"].values
+                
+                # Use interpolation to find the exact lag where speedup hits 1.0
+                x_cross = None
+                # Check for crossover only if data actually crosses 1.0
+                if s_vals.min() < 1.0 and s_vals.max() > 1.0:
+                    # np.interp expects increasing x; we flip if speeds are decreasing
+                    if s_vals[0] > s_vals[-1]:
+                        x_cross = np.interp(1.0, s_vals[::-1], l_vals[::-1])
+                    else:
+                        x_cross = np.interp(1.0, s_vals, l_vals)
+
+                # --- 2. Plotting ---
                 plt.figure(figsize=(9, 5))
-                ax = sns.lineplot(data=m, x="max_lag_sec", y="speedup_conv_over_v1", marker="o")
+                ax = sns.lineplot(data=m, x="max_lag_sec", y="speedup_conv_over_v1", marker="o", color='teal')
+                
+                # Horizontal line at crossover (y=1)
+                ax.axhline(1.0, color='red', linestyle='--', linewidth=1.5, label='Crossover (y=1.0)')
+
+                # --- 3. Add Vertical Line and Ratio Label ---
+                if x_cross is not None:
+                    # Draw vertical line at the crossover lag
+                    ax.axvline(x_cross, color='gray', linestyle=':', alpha=0.8, linewidth=2)
+                    
+                    # Calculate ratio (lag / window)
+                    ratio_cross = x_cross / window_for_axis if window_for_axis else 0.0
+
+                    # State both critical values
+                    label_text = f"Lag = {x_cross:.2f}s\nRatio = {ratio_cross:.3f}"
+                    
+                    # Add annotation near the crossover point
+                    ax.annotate(label_text, 
+                                xy=(x_cross, 1.0), 
+                                xytext=(x_cross + (max(l_vals)*0.08), 1.3),
+                                arrowprops=dict(
+                                    edgecolor='black', 
+                                    facecolor='black', 
+                                    shrink=0.01, 
+                                    width=1.0, 
+                                    headwidth=5
+                                ),
+                                fontweight='bold',
+                                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.8))
+                    
+                    logger.info(f"Window {window_for_axis}s: Threshold Lag={x_cross:.2f}s, Ratio={ratio_cross:.4f}")
+
                 ax.set_title(f"Complexity sweep: Speedup (conv / v1) vs max lag {win_label}".strip(), pad=20)
                 ax.set_xlabel("max_lag_sec (s)")
                 ax.set_ylabel("speedup")
+
+                ax.set_ylim(0, 3.0)
+                ax.yaxis.set_major_locator(ticker.MultipleLocator(0.5))
+
                 if window_for_axis is not None:
                     _add_ratio_top_axis(ax, window_sec=window_for_axis)
                 plt.tight_layout()
