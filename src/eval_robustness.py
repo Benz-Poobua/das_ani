@@ -39,6 +39,9 @@ from scipy.optimize import curve_fit
 import numpy as np
 import pandas as pd
 import matplotlib.ticker as ticker
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -56,6 +59,16 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# CSV helpers
+# -----------------------------------------------------------------------------
+def checkpoint_csv(results: List[RunResult], csv_path: Path) -> None:
+    if not results:
+        return
+    df = pd.DataFrame([r.__dict__ for r in results])
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_path, index=False)
+    
 # -----------------------------------------------------------------------------
 # Amdahl helpers
 # -----------------------------------------------------------------------------
@@ -290,16 +303,23 @@ class RunResult:
     njobs: int
     wall_sec: float
     n_files: int
+
     max_lag_sec: Optional[float] = None
     window_sec: Optional[float] = None
     ratio_lag_win: Optional[float] = None
 
-    # fidelity (only meaningful for v1 vs conventional comparisons)
+    # timing stats (NEW)
+    wall_mean: Optional[float] = None
+    wall_std: Optional[float] = None
+    wall_p25: Optional[float] = None
+    wall_p75: Optional[float] = None
+    n_eff: Optional[int] = None
+
+    # fidelity
     rel_fro: Optional[float] = None
     max_abs: Optional[float] = None
     cos_mean: Optional[float] = None
     cos_p05: Optional[float] = None
-
 
 class BenchmarkRunner:
     def __init__(self, cc_config_path: Path, files: List[Path], out_dir: Path):
@@ -395,22 +415,37 @@ class BenchmarkRunner:
         t1 = time.perf_counter()
         return float(t1 - t0)
 
-    def run_batch(self, *, run_id: str, overrides: Dict[str, Any], repeats: int = 2) -> float:
+    def run_batch(self, *, run_id: str, overrides: Dict[str, Any], repeats: int = 2) -> Dict[str, float]:
         """
-        Run repeats times; discard first as warm-up. Return median of remaining.
+        Run repeats times; discard first as warm-up.
+        Return summary stats over remaining runs.
         """
         repeats = max(1, int(repeats))
         times: List[float] = []
         for r in range(repeats):
             t = self._run_pool(self._prepare_cfg(run_id=f"{run_id}_rep{r}", overrides=overrides))
-            times.append(t)
+            times.append(float(t))
 
+        # Discard warmup
         if repeats == 1:
-            return float(times[0])
+            arr = np.asarray(times, dtype=np.float64)
+        else:
+            arr = np.asarray(times[1:], dtype=np.float64)
 
-        # discard first (warmup), take median of rest
-        rest = np.asarray(times[1:], dtype=np.float64)
-        return float(np.median(rest))
+        med = float(np.median(arr))
+        mean = float(np.mean(arr))
+        std = float(np.std(arr, ddof=1)) if arr.size >= 2 else float("nan")
+        p25 = float(np.percentile(arr, 25))
+        p75 = float(np.percentile(arr, 75))
+
+        return {
+            "wall_sec": med,          
+            "wall_mean": mean,
+            "wall_std": std,
+            "wall_p25": p25,
+            "wall_p75": p75,
+            "n_eff": int(arr.size),
+        }
 
     def compare_fidelity_for_last_run(
         self,
@@ -449,25 +484,54 @@ def run_scaling_test(runner: BenchmarkRunner, cores_list: List[int], *, repeats:
     logger.info("=== Experiment: Strong scaling ===")
     results: List[RunResult] = []
 
+    # Record the "context" of scaling so filenames/CSV are consistent
+    max_lag_sec_base = float(get_cfg(runner.base_cfg, ["xcorr", "max_lag_sec"], 4.0))
+    win_conv = float(get_cfg(runner.base_cfg, ["xcorr", "xcorr_seg_sec"], 8.0))
+    win_v1 = float(get_cfg(runner.base_cfg, ["xcorr", "xcorr_seg_sec_v1"], win_conv))
+
     for mode in ("conventional", "v1"):
+        win = win_v1 if mode == "v1" else win_conv
+        ratio = (max_lag_sec_base / win) if win > 0 else None
+        
         for p in cores_list:
             p = max(1, int(p))
             run_id = f"scale_{mode}_p{p}"
-
-            t = runner.run_batch(
+            stats = runner.run_batch(
                 run_id=run_id,
-                overrides={"runtime.njobs": p, "xcorr.mode": mode},
+                overrides={
+                    "runtime.njobs": p,
+                    "xcorr.mode": mode,
+                },
                 repeats=repeats,
             )
 
-            results.append(RunResult(
+            rr = RunResult(
                 experiment="scaling",
                 mode=mode,
                 njobs=p,
-                wall_sec=float(t),
+                wall_sec=stats["wall_sec"],
+                wall_mean=stats["wall_mean"],
+                wall_std=stats["wall_std"],
+                wall_p25=stats["wall_p25"],
+                wall_p75=stats["wall_p75"],
+                n_eff=stats["n_eff"],
                 n_files=len(runner.files),
-            ))
-            logger.info("[%s] p=%d wall=%.2fs", mode, p, t)
+
+                max_lag_sec=max_lag_sec_base,
+                window_sec=win,
+                ratio_lag_win=float(ratio) if ratio is not None else None,
+            )
+
+            results.append(rr)
+
+            logger.info(
+                "[%s] p=%d median=%.2fs (IQR %.2f–%.2f)",
+                mode,
+                p,
+                stats["wall_sec"],
+                stats["wall_p25"],
+                stats["wall_p75"],
+            )
 
     return results
 
@@ -492,13 +556,16 @@ def run_complexity_test(
         if lag >= window_sec:
             logger.warning("Skipping lag=%.3f >= window=%.3f", lag, window_sec)
             continue
+        
+        window_sec = float(window_sec)
+        ratio = lag / window_sec
 
-        ratio = lag / float(window_sec)
         logger.info("Lag=%.3fs, Window=%.3fs, ratio=%.4f", lag, window_sec, ratio)
 
         # --- conventional ---
         conv_id = f"complex_conv_L{lag:g}_W{window_sec:g}_p{njobs}"
-        t_conv = runner.run_batch(
+
+        stats_conv = runner.run_batch(
             run_id=conv_id,
             overrides={
                 "runtime.njobs": int(njobs),
@@ -508,10 +575,11 @@ def run_complexity_test(
             },
             repeats=repeats,
         )
-
+        
         # --- v1 ---
         v1_id = f"complex_v1_L{lag:g}_W{window_sec:g}_p{njobs}"
-        t_v1 = runner.run_batch(
+
+        stats_v1 = runner.run_batch(
             run_id=v1_id,
             overrides={
                 "runtime.njobs": int(njobs),
@@ -545,7 +613,10 @@ def run_complexity_test(
             fid = runner.compare_fidelity_for_last_run(conv_cfg=conv_cfg, v1_cfg=v1_cfg)
             logger.info(
                 "Fidelity: rel_fro=%.3e max_abs=%.3e cos_mean=%.6f cos_p05=%.6f",
-                fid["rel_fro"], fid["max_abs"], fid["cos_mean"], fid["cos_p05"]
+                fid["rel_fro"],
+                fid["max_abs"],
+                fid["cos_mean"],
+                fid["cos_p05"],
             )
         except Exception as e:
             logger.warning("Fidelity check failed at lag=%.3f: %s", lag, e)
@@ -554,7 +625,12 @@ def run_complexity_test(
             experiment="complexity",
             mode="conventional",
             njobs=int(njobs),
-            wall_sec=float(t_conv),
+            wall_sec=stats_conv["wall_sec"],
+            wall_mean=stats_conv["wall_mean"],
+            wall_std=stats_conv["wall_std"],
+            wall_p25=stats_conv["wall_p25"],
+            wall_p75=stats_conv["wall_p75"],
+            n_eff=stats_conv["n_eff"],
             n_files=len(runner.files),
             max_lag_sec=float(lag),
             window_sec=float(window_sec),
@@ -564,7 +640,12 @@ def run_complexity_test(
             experiment="complexity",
             mode="v1",
             njobs=int(njobs),
-            wall_sec=float(t_v1),
+            wall_sec=stats_v1["wall_sec"],
+            wall_mean=stats_v1["wall_mean"],
+            wall_std=stats_v1["wall_std"],
+            wall_p25=stats_v1["wall_p25"],
+            wall_p75=stats_v1["wall_p75"],
+            n_eff=stats_v1["n_eff"],
             n_files=len(runner.files),
             max_lag_sec=float(lag),
             window_sec=float(window_sec),
@@ -582,24 +663,14 @@ def run_complexity_test(
 # Plotting
 # -----------------------------------------------------------------------------
 def plot_results(df: pd.DataFrame, out_dir: Path) -> None:
+    out_dir = Path(out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     plots_dir = out_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     sns.set_theme(style="whitegrid")
 
-    # Global window suffix 
-    window_suffix = ""
-    if "window_sec" in df.columns:
-        wvals = pd.to_numeric(df["window_sec"], errors="coerce").dropna().unique()
-        wvals = np.sort(wvals)
-        if wvals.size == 1:
-            window_suffix = f"_W{wvals[0]:g}s"
-        elif wvals.size > 1:
-            window_suffix = f"_Wmulti"
-
     def _window_label(subdf: pd.DataFrame) -> str:
-        """Return a clean title suffix describing window_sec."""
         if "window_sec" not in subdf.columns:
             return ""
         vals = pd.to_numeric(subdf["window_sec"], errors="coerce").dropna().unique()
@@ -608,16 +679,20 @@ def plot_results(df: pd.DataFrame, out_dir: Path) -> None:
             return ""
         if vals.size == 1:
             return f"(window={vals[0]:g}s)"
-        # multiple windows in same dataframe
         return f"(window in [{vals[0]:g}..{vals[-1]:g}]s, n={vals.size})"
     
+    def _window_suffix(subdf: pd.DataFrame) -> str:
+        if "window_sec" not in subdf.columns:
+            return ""
+        vals = pd.to_numeric(subdf["window_sec"], errors="coerce").dropna().unique()
+        vals = np.sort(vals)
+        if vals.size == 1:
+            return f"_W{vals[0]:g}s"
+        if vals.size > 1:
+            return "_Wmulti"
+        return ""
+    
     def _add_ratio_top_axis(ax: plt.Axes, *, window_sec: float) -> None:
-        """
-        Add top x-axis mapping:
-            bottom: lag_sec
-            top: ratio = lag_sec / window_sec
-        Only valid if window_sec is constant for this axes.
-        """
         if not np.isfinite(window_sec) or window_sec <= 0:
             return
 
@@ -629,198 +704,217 @@ def plot_results(df: pd.DataFrame, out_dir: Path) -> None:
 
         secax = ax.secondary_xaxis("top", functions=(sec_to_ratio, ratio_to_sec))
         secax.set_xlabel("lag/window ratio", labelpad=12)
-        # nice-ish tick formatting
         secax.xaxis.set_major_locator(ticker.MaxNLocator(nbins=6))
         secax.xaxis.set_major_formatter(ticker.FormatStrFormatter("%.3g"))
+
+
+    def _group_by_window(d: pd.DataFrame) -> List[pd.DataFrame]:
+        if "window_sec" not in d.columns:
+            return [d]
+        wvals = pd.to_numeric(d["window_sec"], errors="coerce").dropna().unique()
+        wvals = np.sort(wvals)
+        if wvals.size == 0:
+            return [d]
+        return [d[d["window_sec"] == w].copy() for w in wvals]
+
+    def _require_cols(d: pd.DataFrame, cols: List[str]) -> bool:
+        return all(c in d.columns for c in cols)
 
     # -----------------------
     # SCALING PLOTS 
     # -----------------------
-    dsc = df[df["experiment"] == "scaling"].copy()
-    if not dsc.empty:
-        # Preparation for speedup calculation
-        dsc2 = dsc.copy()
-        dsc2["speedup"] = np.nan
-        dsc2["efficiency"] = np.nan
-        dsc2["serial_frac_est"] = np.nan
+    dsc_all = df[df["experiment"] == "scaling"].copy()
+    if not dsc_all.empty:
+        # Ensure numeric
+        for c in ["njobs", "wall_sec", "wall_p25", "wall_p75"]:
+            if c in dsc_all.columns:
+                dsc_all[c] = pd.to_numeric(dsc_all[c], errors="coerce")
 
-        for mode in dsc2["mode"].unique():
-            sub = dsc2[dsc2["mode"] == mode].sort_values("njobs")
-            p0 = int(sub["njobs"].iloc[0])
-            t0 = float(sub["wall_sec"].iloc[0])
-            for idx, row in sub.iterrows():
-                p = int(row["njobs"])
-                tp = float(row["wall_sec"])
-                S = (t0 / tp) if tp > 0 else float("nan")
-                dsc2.loc[idx, "speedup"] = S
-                dsc2.loc[idx, "efficiency"] = S / (float(p) / float(p0)) if (p0 > 0 and p > 0) else float("nan")
-                dsc2.loc[idx, "serial_frac_est"] = estimate_serial_fraction(p, S)
+        for gwin in _group_by_window(dsc_all):
+            if gwin.empty:
+                continue
 
-        # 1) Wall Time Plot
-        plt.figure(figsize=(9, 5))
-        ax = sns.lineplot(data=dsc, x="njobs", y="wall_sec", hue="mode", marker="o")
-        ax.set_title("Strong scaling: Wall time vs cores")
-        ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-        plt.tight_layout()
-        plt.savefig(plots_dir / f"scaling_wall_time{window_suffix}.png", dpi=220)
-        plt.close()
+            win_label = _window_label(gwin)
+            suffix = _window_suffix(gwin)
 
-        # 2) Efficiency Plot
-        plt.figure(figsize=(9, 5))
-        ax = sns.lineplot(data=dsc2, x="njobs", y="efficiency", hue="mode", marker="o")
-        ax.set_title("Strong scaling: Parallel efficiency vs cores")
-        ax.set_ylim(0.0, 1.05)
-        ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-        plt.tight_layout()
-        plt.savefig(plots_dir / f"scaling_efficiency{window_suffix}.png", dpi=220)
-        plt.close()
+            # Compute speedup + efficiency (relative to smallest njobs within each mode)
+            g2 = gwin.copy()
+            g2["speedup"] = np.nan
+            g2["efficiency"] = np.nan
 
-        # 3) AMDAHL VS USL COMPARISON PLOT
-        plt.figure(figsize=(10, 6))
-        # Plot raw speedup points
-        ax = sns.scatterplot(data=dsc2, x="njobs", y="speedup", hue="mode", s=100, zorder=5)
-        ax.set_title("Scaling Model Comparison: Amdahl vs. USL")
-        ax.set_ylabel("speedup = T1 / Tp")
-        
-        p_max = int(dsc2["njobs"].max())
-        p_grid = np.linspace(1, p_max, 100)
-        palette = sns.color_palette()
-        mode_colors = {"conventional": palette[0], "v1": palette[1]}
+            for mode in sorted(g2["mode"].astype(str).unique()):
+                sub = g2[g2["mode"] == mode].sort_values("njobs")
+                sub = sub.dropna(subset=["njobs", "wall_sec"])
+                if sub.empty:
+                    continue
+                p0 = int(sub["njobs"].iloc[0])
+                t0 = float(sub["wall_sec"].iloc[0])
 
-        for mode in dsc2["mode"].unique():
-            sub = dsc2[dsc2["mode"] == mode].sort_values("njobs")
-            ps = sub["njobs"].tolist()
-            Ss = sub["speedup"].tolist()
-            color = mode_colors.get(mode, "black")
+                for idx, row in sub.iterrows():
+                    p = int(row["njobs"])
+                    tp = float(row["wall_sec"])
+                    S = (t0 / tp) if tp > 0 else np.nan
+                    g2.loc[idx, "speedup"] = S
+                    g2.loc[idx, "efficiency"] = S / (p / p0) if (p0 > 0 and p > 0) else np.nan
 
-            # --- Amdahl Fit ---
-            s_fit = fit_amdahl_s(ps, Ss)
-            if np.isfinite(s_fit):
-                y_amdahl = [amdahl_speedup(p, s_fit) for p in p_grid]
-                ax.plot(p_grid, y_amdahl, linestyle="--", alpha=0.5, color=color,
-                        label=f"{mode} Amdahl (s={s_fit:.2f})")
+            # 1) Wall time (median + IQR error bars)
+            plt.figure(figsize=(9, 5))
+            ax = plt.gca()
 
-            # --- USL Fit (Precise) ---
-            sigma, kappa = fit_usl_params_precise(ps, Ss)
-            y_usl = [usl_speedup(p, sigma, kappa) for p in p_grid]
-            ax.plot(p_grid, y_usl, linestyle="-", linewidth=2.5, color=color,
-                    label=f"{mode} USL (σ={sigma:.3f}, κ={kappa:.5f})")
+            if _require_cols(gwin, ["mode", "njobs", "wall_sec", "wall_p25", "wall_p75"]):
+                for mode, subm in gwin.groupby("mode"):
+                    subm = subm.sort_values("njobs").dropna(subset=["njobs", "wall_sec", "wall_p25", "wall_p75"])
+                    if subm.empty:
+                        continue
+                    x = subm["njobs"].to_numpy()
+                    y = subm["wall_sec"].to_numpy()
+                    y_low = np.clip(y - subm["wall_p25"].to_numpy(), 0.0, None)
+                    y_high = np.clip(subm["wall_p75"].to_numpy() - y, 0.0, None)
 
-        ax.legend(title="Model Comparison", bbox_to_anchor=(1.05, 1), loc='upper left')
-        plt.tight_layout()
-        plt.savefig(plots_dir / f"scaling_comparison_models{window_suffix}.png", dpi=220)
-        plt.close()
+                    ax.errorbar(
+                        x, y,
+                        yerr=[y_low, y_high],
+                        fmt="o-",
+                        capsize=4,
+                        label=str(mode),
+                    )
+
+            else:
+                # fallback: simple median lines
+                sns.lineplot(data=gwin, x="njobs", y="wall_sec", hue="mode", marker="o", ax=ax)
+
+            ax.set_title(f"Strong scaling: Wall time vs cores (median + IQR) {win_label}".strip(), pad=20)
+            ax.set_xlabel("njobs (processes)")
+            ax.set_ylabel("wall time (s)")
+            ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+            ax.legend(title="mode", frameon=True, loc="best")
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"scaling_wall_time{suffix}.png", dpi=220)
+            plt.close()
+
+            # 2) Efficiency
+            plt.figure(figsize=(9, 5))
+            ax = sns.lineplot(data=g2, x="njobs", y="efficiency", hue="mode", marker="o")
+            ax.set_title(f"Strong scaling: Parallel efficiency vs cores {win_label}".strip(), pad=20)
+            ax.set_xlabel("njobs (processes)")
+            ax.set_ylabel("efficiency")
+            ax.set_ylim(0.0, 1.05)
+            ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+            ax.legend(title="mode", frameon=True, loc="best")
+            plt.tight_layout()
+            plt.savefig(plots_dir / f"scaling_efficiency{suffix}.png", dpi=220)
+            plt.close()
 
     # -----------------------
-    # COMPLEXITY PLOTS 
+    # COMPLEXITY PLOTS
     # -----------------------
     dcp_all = df[df["experiment"] == "complexity"].copy()
     if not dcp_all.empty:
-        # If multiple window_sec appear, split plots per window to keep ratio axis correct.
-        if "window_sec" in dcp_all.columns:
-            wvals = pd.to_numeric(dcp_all["window_sec"], errors="coerce").dropna().unique()
-            wvals = np.sort(wvals)
-            groups = [dcp_all[dcp_all["window_sec"] == w] for w in wvals] if wvals.size > 0 else [dcp_all]
-        else:
-            groups = [dcp_all]
+        for c in ["max_lag_sec", "wall_sec", "wall_p25", "wall_p75", "window_sec"]:
+            if c in dcp_all.columns:
+                dcp_all[c] = pd.to_numeric(dcp_all[c], errors="coerce")
 
-        for g in groups:
-            g = g.copy()
-            win_label = _window_label(g)
+        for gwin in _group_by_window(dcp_all):
+            if gwin.empty:
+                continue
 
-            # Determine window for ratio axis (only if single-valued)
-            w_unique = pd.to_numeric(g.get("window_sec", pd.Series(dtype=float)), errors="coerce").dropna().unique()
+            win_label = _window_label(gwin)
+            suffix = _window_suffix(gwin)
+
+            w_unique = pd.to_numeric(gwin.get("window_sec", pd.Series(dtype=float)), errors="coerce").dropna().unique()
             window_for_axis = float(w_unique[0]) if w_unique.size == 1 else None
-            suffix = f"_W{window_for_axis:g}s" if window_for_axis is not None else ""
 
-            # 1) wall time vs lag
+            # 1) wall time vs lag (median + IQR)
             plt.figure(figsize=(9, 5))
-            ax = sns.lineplot(data=g, x="max_lag_sec", y="wall_sec", hue="mode", marker="o")
+            ax = plt.gca()
+
+            if _require_cols(gwin, ["mode", "max_lag_sec", "wall_sec", "wall_p25", "wall_p75"]):
+                for mode, subm in gwin.groupby("mode"):
+                    subm = subm.sort_values("max_lag_sec").dropna(subset=["max_lag_sec", "wall_sec", "wall_p25", "wall_p75"])
+                    if subm.empty:
+                        continue
+                    x = subm["max_lag_sec"].to_numpy()
+                    y = subm["wall_sec"].to_numpy()
+                    y_low = np.clip(y - subm["wall_p25"].to_numpy(), 0.0, None)
+                    y_high = np.clip(subm["wall_p75"].to_numpy() - y, 0.0, None)
+
+                    ax.errorbar(x, y, yerr=[y_low, y_high], fmt="o-", capsize=4, label=str(mode))
+            else:
+                sns.lineplot(data=gwin, x="max_lag_sec", y="wall_sec", hue="mode", marker="o", ax=ax)
+
+            
             ax.set_title(f"Complexity sweep: Wall time vs max lag {win_label}".strip(), pad=20)
             ax.set_xlabel("max_lag_sec (s)")
             ax.set_ylabel("wall time (s)")
-
-            ax.set_ylim(bottom=0)
-            ax.yaxis.set_major_locator(ticker.MultipleLocator(100))
-
+            ax.set_ylim(bottom=0.0)
+            ax.legend(title="mode", frameon=True, loc="best")
             if window_for_axis is not None:
                 _add_ratio_top_axis(ax, window_sec=window_for_axis)
+
             plt.tight_layout()
-            
             plt.savefig(plots_dir / f"complexity_wall_time_vs_lag{suffix}.png", dpi=220)
             plt.close()
 
-            # 2) speedup vs lag (conv/v1)
-            conv = g[g["mode"] == "conventional"][["max_lag_sec", "wall_sec"]].rename(columns={"wall_sec": "t_conv"})
-            v1 = g[g["mode"] == "v1"][["max_lag_sec", "wall_sec"]].rename(columns={"wall_sec": "t_v1"})
-            m = conv.merge(v1, on="max_lag_sec", how="inner")
+            # 2) speedup vs lag (conv/v1) + crossover annotation
+            conv = gwin[gwin["mode"] == "conventional"][["max_lag_sec", "wall_sec"]].rename(columns={"wall_sec": "t_conv"})
+            v1 = gwin[gwin["mode"] == "v1"][["max_lag_sec", "wall_sec"]].rename(columns={"wall_sec": "t_v1"})
+            m = conv.merge(v1, on="max_lag_sec", how="inner").dropna(subset=["max_lag_sec", "t_conv", "t_v1"])
             if not m.empty:
+                m = m.sort_values("max_lag_sec")
                 m["speedup_conv_over_v1"] = m["t_conv"] / m["t_v1"]
 
-                # --- 1. Find the Crossover Point (Speedup = 1.0) ---
-                m_sorted = m.sort_values("max_lag_sec")
-                l_vals = m_sorted["max_lag_sec"].values
-                s_vals = m_sorted["speedup_conv_over_v1"].values
-                
-                # Use interpolation to find the exact lag where speedup hits 1.0
+                l_vals = m["max_lag_sec"].to_numpy()
+                s_vals = m["speedup_conv_over_v1"].to_numpy()
+
                 x_cross = None
-                # Check for crossover only if data actually crosses 1.0
-                if s_vals.min() < 1.0 and s_vals.max() > 1.0:
-                    # np.interp expects increasing x; we flip if speeds are decreasing
+                if np.nanmin(s_vals) < 1.0 and np.nanmax(s_vals) > 1.0:
+                    # interpolate lag at speedup=1
+                    # ensure monotonic for np.interp by choosing direction
                     if s_vals[0] > s_vals[-1]:
-                        x_cross = np.interp(1.0, s_vals[::-1], l_vals[::-1])
+                        x_cross = float(np.interp(1.0, s_vals[::-1], l_vals[::-1]))
                     else:
-                        x_cross = np.interp(1.0, s_vals, l_vals)
+                        x_cross = float(np.interp(1.0, s_vals, l_vals))
 
-                # --- 2. Plotting ---
                 plt.figure(figsize=(9, 5))
-                ax = sns.lineplot(data=m, x="max_lag_sec", y="speedup_conv_over_v1", marker="o", color='teal')
-                
-                # Horizontal line at crossover (y=1)
-                ax.axhline(1.0, color='red', linestyle='--', linewidth=1.5, label='Crossover (y=1.0)')
+                ax = sns.lineplot(data=m, x="max_lag_sec", y="speedup_conv_over_v1", marker="o")
+                ax.axhline(1.0, color="red", linestyle="--", linewidth=1.5, label="crossover (y=1)")
 
-                # --- 3. Add Vertical Line and Ratio Label ---
                 if x_cross is not None:
-                    # Draw vertical line at the crossover lag
-                    ax.axvline(x_cross, color='gray', linestyle=':', alpha=0.8, linewidth=2)
-                    
-                    # Calculate ratio (lag / window)
-                    ratio_cross = x_cross / window_for_axis if window_for_axis else 0.0
+                    ax.axvline(x_cross, color="gray", linestyle=":", alpha=0.8, linewidth=2)
 
-                    # State both critical values
-                    label_text = f"Lag = {x_cross:.2f}s\nRatio = {ratio_cross:.3f}"
-                    
-                    # Add annotation near the crossover point
-                    ax.annotate(label_text, 
-                                xy=(x_cross, 1.0), 
-                                xytext=(x_cross + (max(l_vals)*0.08), 1.3),
-                                arrowprops=dict(
-                                    edgecolor='black', 
-                                    facecolor='black', 
-                                    shrink=0.01, 
-                                    width=1.0, 
-                                    headwidth=5
-                                ),
-                                fontweight='bold',
-                                bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.8))
-                    
-                    logger.info(f"Window {window_for_axis}s: Threshold Lag={x_cross:.2f}s, Ratio={ratio_cross:.4f}")
+                    ratio_cross = (x_cross / window_for_axis) if (window_for_axis is not None and window_for_axis > 0) else np.nan
+                    label_text = f"Lag={x_cross:.2f}s\nRatio={ratio_cross:.3f}" if np.isfinite(ratio_cross) else f"Lag={x_cross:.2f}s"
+
+                    ax.annotate(
+                        label_text,
+                        xy=(x_cross, 1.0),
+                        xytext=(x_cross + 0.08 * float(np.nanmax(l_vals)), 1.3),
+                        arrowprops=dict(arrowstyle="->", color="black", lw=1.2),
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.85),
+                    )
+
+                    if window_for_axis is not None:
+                        logger.info("Window %.3gs: crossover lag=%.3gs, ratio=%.4f", window_for_axis, x_cross, ratio_cross)
+                    else:
+                        logger.info("Crossover lag=%.3gs", x_cross)
 
                 ax.set_title(f"Complexity sweep: Speedup (conv / v1) vs max lag {win_label}".strip(), pad=20)
                 ax.set_xlabel("max_lag_sec (s)")
-                ax.set_ylabel("speedup")
-
-                ax.set_ylim(0, 3.0)
-                ax.yaxis.set_major_locator(ticker.MultipleLocator(0.5))
+                ax.set_ylabel("speedup (conv / v1)")
+                ax.set_ylim(bottom=0.0)
+                ax.yaxis.set_major_locator(ticker.MaxNLocator(nbins=7))
+                ax.legend(frameon=True, loc="best")
 
                 if window_for_axis is not None:
                     _add_ratio_top_axis(ax, window_sec=window_for_axis)
+
                 plt.tight_layout()
                 plt.savefig(plots_dir / f"complexity_speedup_vs_lag{suffix}.png", dpi=220)
                 plt.close()
-            
-            # 3) fidelity vs lag (v1 rows only)
-            v1f = g[g["mode"] == "v1"].copy()
+
+            # 3) fidelity vs lag (v1 only)
+            v1f = gwin[gwin["mode"] == "v1"].copy()
+
             if "rel_fro" in v1f.columns and v1f["rel_fro"].notna().any():
                 plt.figure(figsize=(9, 5))
                 ax = sns.lineplot(data=v1f, x="max_lag_sec", y="rel_fro", marker="o")
@@ -955,6 +1049,7 @@ def main() -> None:
     # --- scaling ---
     if not args.skip_scaling:
         results.extend(run_scaling_test(runner, cores_list, repeats=int(args.repeats)))
+        checkpoint_csv(results, csv_path)
 
     # --- complexity ---
     if not args.skip_complexity:
@@ -967,6 +1062,7 @@ def main() -> None:
                 repeats=int(args.repeats),
             )
         )
+        checkpoint_csv(results, csv_path)
 
     # write results + plots
     if results:
@@ -990,9 +1086,9 @@ if __name__ == "__main__":
 # Example
 # python -m src.eval_robustness \
 #   --cc_config configs/cc.yaml \
-#   --outdir data/benchmarks/final \
+#   --outdir data/benchmarks/rob_w60 \
 #   --n_files 16 \
-#   --repeats 1 \
+#   --repeats 4 \
 #   --cores 1 2 4 8 16\
 #   --window_sec 60 \
 #   --njobs_complexity 16 \

@@ -75,6 +75,7 @@ module load python/3.12.1
 module load py-pandas/2.2.1_py312
 module load py-pytorch/2.4.1_py312
 module load py-scikit-image/0.24.0_py312
+module load py-scipy/1.12.0_py312
 ```
 Always match `_py312` suffix with Python 3.12.
 
@@ -100,13 +101,14 @@ from src.cc import process_single_file
 # 6. Verify Environment
 
 ```bash
-python3 -c "import torch, numpy, pandas, skimage; \
+python3 -c "import torch, numpy, pandas, skimage, scipy; \
 print('Python:', __import__('sys').version.split()[0]); \
 print('NumPy:', numpy.__version__); \
 print('Pandas:', pandas.__version__); \
 print('Torch:', torch.__version__); \
 print('CUDA available:', torch.cuda.is_available()); \
-print('scikit-image:', skimage.__version__)"
+print('scikit-image:', skimage.__version__)
+print('scipy:', scipy.__version__)"
 ```
 
 ---
@@ -114,12 +116,12 @@ print('scikit-image:', skimage.__version__)"
 # 7. Running Benchmarks
 
 ```bash
-python3 src/eval_robustness.py \
+python3 -m src.eval_robustness \
   --cc_config configs/cc.yaml \
-  --outdir data/benchmarks/final \
+  --outdir data/benchmarks/rob_w60 \
   --n_files 16 \
-  --repeats 1 \
-  --cores 1 2 4 8 16 \
+  --repeats 4 \
+  --cores 1 2 4 8 16\
   --window_sec 60 \
   --njobs_complexity 16 \
   --lags 0.5 1 2 4 5 10 20
