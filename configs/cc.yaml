@@ -3,7 +3,7 @@ paths:
   output_root: ./data/ncf_raw
 
 runtime:
-  njobs: 1
+  njobs: 6
   use_gpu: false
   mmap: true
   frac_mem: 0.25

@@ -480,49 +480,51 @@ class BenchmarkRunner:
 # -----------------------------------------------------------------------------
 # Experiments
 # -----------------------------------------------------------------------------
-def run_scaling_test(runner: BenchmarkRunner, cores_list: List[int], *, repeats: int = 2) -> List[RunResult]:
+def run_scaling_test(
+    runner: BenchmarkRunner,
+    cores_list: List[int],
+    *,
+    window_sec: float,
+    repeats: int = 2,
+) -> List[RunResult]:
+
     logger.info("=== Experiment: Strong scaling ===")
     results: List[RunResult] = []
 
     # Record the "context" of scaling so filenames/CSV are consistent
     max_lag_sec_base = float(get_cfg(runner.base_cfg, ["xcorr", "max_lag_sec"], 4.0))
-    win_conv = float(get_cfg(runner.base_cfg, ["xcorr", "xcorr_seg_sec"], 8.0))
-    win_v1 = float(get_cfg(runner.base_cfg, ["xcorr", "xcorr_seg_sec_v1"], win_conv))
 
     for mode in ("conventional", "v1"):
-        win = win_v1 if mode == "v1" else win_conv
-        ratio = (max_lag_sec_base / win) if win > 0 else None
-        
         for p in cores_list:
-            p = max(1, int(p))
             run_id = f"scale_{mode}_p{p}"
             stats = runner.run_batch(
                 run_id=run_id,
                 overrides={
                     "runtime.njobs": p,
                     "xcorr.mode": mode,
+                    "xcorr.xcorr_seg_sec": float(window_sec),
+                    "xcorr.xcorr_seg_sec_v1": float(window_sec),
+                    # optional: also force max_lag if you want consistency
+                    "xcorr.max_lag_sec": max_lag_sec_base,
                 },
                 repeats=repeats,
             )
 
-            rr = RunResult(
+            results.append(RunResult(
                 experiment="scaling",
                 mode=mode,
                 njobs=p,
                 wall_sec=stats["wall_sec"],
+                n_files=len(runner.files),
+                max_lag_sec=max_lag_sec_base,
+                window_sec=float(window_sec),
+                ratio_lag_win=float(max_lag_sec_base / window_sec),
                 wall_mean=stats["wall_mean"],
                 wall_std=stats["wall_std"],
                 wall_p25=stats["wall_p25"],
                 wall_p75=stats["wall_p75"],
                 n_eff=stats["n_eff"],
-                n_files=len(runner.files),
-
-                max_lag_sec=max_lag_sec_base,
-                window_sec=win,
-                ratio_lag_win=float(ratio) if ratio is not None else None,
-            )
-
-            results.append(rr)
+            ))
 
             logger.info(
                 "[%s] p=%d median=%.2fs (IQR %.2f–%.2f)",
@@ -1048,7 +1050,7 @@ def main() -> None:
 
     # --- scaling ---
     if not args.skip_scaling:
-        results.extend(run_scaling_test(runner, cores_list, repeats=int(args.repeats)))
+        results.extend(run_scaling_test(runner, cores_list, window_sec=float(args.window_sec),repeats=int(args.repeats)))
         checkpoint_csv(results, csv_path)
 
     # --- complexity ---

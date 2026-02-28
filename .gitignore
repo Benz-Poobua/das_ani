@@ -56,3 +56,11 @@ das_ani/pyvenv.cfg
 # More accidental venv folders inside package
 das_ani/share/
 das_ani/include/
+# big artifacts
+notebooks/data/
+.ipynb_checkpoints/
+*.npy
+*.npz
+*.pt
+*.tar
+*.zip

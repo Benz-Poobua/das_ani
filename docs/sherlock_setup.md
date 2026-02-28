@@ -65,6 +65,8 @@ cd /home/users/spoobua
 ln -s /home/groups/biondo/spoobua/das_ani das_ani
 ```
 
+---
+
 # 4. Required Module Stack (CPU Version)
 Run this at every login or inside every Slurm job:
 
@@ -124,7 +126,7 @@ python3 -m src.eval_robustness \
   --cores 1 2 4 8 16\
   --window_sec 60 \
   --njobs_complexity 16 \
-  --lags 0.5 1 2 4 5 10 20
+  --lags 0.5 1 2 4 5 10
 ```
 
 ---

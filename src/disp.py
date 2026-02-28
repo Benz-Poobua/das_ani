@@ -9,13 +9,15 @@
 """
 from __future__ import annotations
 
+import dask
 import logging 
+import os
 import torch
 import numpy as np
-
+from scipy.interpolate import interp1d
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-from src.utils import convert_to_tensor, convert_to_numpy, nextpow2, timeit
+from src.utils import convert_to_tensor, convert_to_numpy, nextpow2, timeit, parse_ncf_stack_filename, fk_filter
 
 logger = logging.getLogger(__name__)
 
@@ -492,3 +494,341 @@ def compute_dispersion_from_ncf(
         picks = extr_disp(f_axis, v_axis, fv_panel, **pick_kwargs)
 
     return fv_panel, f_axis, v_axis, picks
+
+# =====================================================
+# 4. Spatial-Temporal Swap
+# =====================================================
+def prep_ncf(
+    ncf: np.ndarray, 
+    lag_axis: np.ndarray, 
+    distance_axis: np.ndarray, 
+    vs: str | int, 
+    gauge_length: float = 8.16
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Separates the Noise Correlation Function (NCF) into causal/acausal parts 
+    and performs spatial-temporal recombination to group energy by source direction.
+
+    :param ncf: The 2D noise correlation function data array.
+    :type ncf: np.ndarray
+    :param lag_axis: 1D array of time lag values.
+    :type lag_axis: np.ndarray
+    :param distance_axis: 1D array of spatial distances along the cable.
+    :type distance_axis: np.ndarray
+    :param vs: Virtual source channel index or identifier.
+    :type vs: str | int
+    :param gauge_length: The spacing between channels in meters. Default is 8.16.
+    :type gauge_length: float, optional
+    :returns: A tuple containing (causal NCF, acausal NCF, causal lag axis, 
+              source 1 recombined NCF, source 2 recombined NCF).
+    :rtype: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    """
+    ncf = np.asarray(ncf)
+    lag_axis = np.asarray(lag_axis)
+    distance_axis = np.asarray(distance_axis)
+
+    if ncf.shape[1] != lag_axis.size and ncf.shape[0] == lag_axis.size:
+        ncf = ncf.T
+
+    # 1. Basic Time Separation
+    c_sel = lag_axis >= 0
+    ncf_c = ncf[:, c_sel]
+    new_lag_axis = lag_axis[c_sel]
+
+    a_sel = lag_axis <= 0
+    ncf_a = ncf[:, a_sel][:, ::-1]
+
+    # 2. Spatial-Temporal Splitting
+    position = int(vs) * gauge_length
+    vs_idx = np.argmin(np.abs(distance_axis - position))
+
+    A = ncf_c[:vs_idx, :] 
+    B = ncf_c[vs_idx:, :] 
+    C = ncf_a[:vs_idx, :] 
+    D = ncf_a[vs_idx:, :] 
+
+    # 3. Source-consistent Recombination
+    ncf_s1 = np.vstack([A, D])
+    ncf_s2 = np.vstack([C, B])
+
+    return ncf_c, ncf_a, new_lag_axis, ncf_s1, ncf_s2
+
+
+def clip_ncf_side(
+    data: np.ndarray, 
+    distance_axis: np.ndarray, 
+    vs: str | int, 
+    range_m: float, 
+    side: str = "right", 
+    pos_offset: float = 0.0,
+    gauge_length: float = 8.16
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Clips NCF spatially to one side of the virtual source with an optional inner offset.
+
+    :param data: The 2D NCF data to be clipped.
+    :type data: np.ndarray
+    :param distance_axis: 1D array of spatial distances along the cable.
+    :type distance_axis: np.ndarray
+    :param vs: Virtual source channel index or identifier.
+    :type vs: str | int
+    :param range_m: The maximum spatial range (in meters) to retain from the virtual source.
+    :type range_m: float
+    :param side: The direction to clip relative to the source ("left" or "right"). Default is "right".
+    :type side: str, optional
+    :param pos_offset: Inner spatial offset (in meters) to exclude near-source effects. Default is 0.0.
+    :type pos_offset: float, optional
+    :param gauge_length: The spacing between channels in meters. Default is 8.16.
+    :type gauge_length: float, optional
+    :returns: A tuple containing the clipped NCF data and the corresponding clipped distance axis.
+    :rtype: tuple[np.ndarray, np.ndarray]
+    :raises ValueError: If `side` is invalid or if `pos_offset` exceeds the available range.
+    """
+    position = int(vs) * gauge_length
+    
+    if side.lower() == "right":
+        lower = position + pos_offset
+        upper = position + range_m
+    elif side.lower() == "left":
+        lower = position - range_m
+        upper = position - pos_offset
+    else:
+        raise ValueError("side must be 'left' or 'right'")
+
+    lower = max(distance_axis.min(), lower)
+    upper = min(distance_axis.max(), upper)
+
+    if lower > upper:
+        raise ValueError(f"pos_offset ({pos_offset}m) is larger than the available range.")
+    
+    idx_sel = (distance_axis >= lower) & (distance_axis <= upper)
+    
+    return data[idx_sel, :], distance_axis[idx_sel]
+
+@dask.delayed
+def process_and_save_subset(
+    path: str, 
+    lag_axis: np.ndarray, 
+    distance_axis: np.ndarray, 
+    dt: float, 
+    dx: float, 
+    vmin: float, 
+    vmax: float, 
+    target: str, 
+    side: str, 
+    pos_offset: float, 
+    range_m: float, 
+    out_dir: str = "../results/ncf_disp"
+) -> str:
+    """
+    Dask-delayed function to process a single NCF file: 
+    F-K filter -> Directional Swap -> Spatial Clip -> Flip (if left) -> Save.
+    
+    :param path: Path to the raw .npy NCF file.
+    :type path: str
+    :param lag_axis: 1D array of time lag values.
+    :type lag_axis: np.ndarray
+    :param distance_axis: 1D array of spatial distances.
+    :type distance_axis: np.ndarray
+    :param dt: Time sampling interval.
+    :type dt: float
+    :param dx: Spatial sampling interval (gauge length).
+    :type dx: float
+    :param vmin: Minimum velocity for the F-K filter.
+    :type vmin: float
+    :param vmax: Maximum velocity for the F-K filter.
+    :type vmax: float
+    :param target: Wavefield mapping target ("s1", "s2", "causal", or "acausal").
+    :type target: str
+    :param side: Side relative to the virtual source ("left" or "right"). If "left", data is flipped to be causal/positive-traveling.
+    :type side: str
+    :param pos_offset: Inner spatial offset to exclude near-source effects.
+    :type pos_offset: float
+    :param range_m: Total spatial range to clip.
+    :type range_m: float
+    :param out_dir: Directory to save the processed results. Default is "../results/ncf_disp".
+    :type out_dir: str, optional
+    :returns: The base filename of the saved output file.
+    :rtype: str
+    """
+    # 1. Metadata and Load
+    date, vs, window, v_mode = parse_ncf_stack_filename(path)
+    ncf_raw = np.load(path)
+    
+    # Ensure (n_channel, n_time) orientation
+    if ncf_raw.shape == (lag_axis.size, distance_axis.size):
+        ncf_raw = ncf_raw.T
+    
+    # 2. F-K Filter (Extracting energy within velocity bounds)
+    ncf_fk = fk_filter(ncf_raw, dt=dt, dx=dx, vmin=vmin, vmax=vmax, mode="extract")
+    
+    # 3. Spatial-Temporal Swap (prep_ncf assumed to be in same file)
+    ncf_c, ncf_a, h_lag, s1, s2 = prep_ncf(ncf_fk, lag_axis, distance_axis, vs)
+    
+    # Select target wavefield (s1, s2, causal, or acausal)
+    mapping = {"s1": s1, "s2": s2, "causal": ncf_c, "acausal": ncf_a}
+    target_data = mapping[target.lower()]
+    
+    # 4. Spatial Clipping
+    # Grabs the subset of channels on the chosen side of the VS
+    final_data, final_dist = clip_ncf_side(
+        target_data, distance_axis, vs, 
+        range_m=range_m, side=side, pos_offset=pos_offset
+    )
+
+    # Calculate Relative Distance from Virtual Source
+    # (e.g., if VS is at 800m, and channel is at 816m, dist_rel = 16m)
+    dist_rel = final_dist - (int(vs) * 8.16)
+
+    # --- 5. THE LEFT-SIDE FLIP LOGIC ---
+    # For dispersion analysis, we want distance to increase away from the source (0 -> +Range).
+    # On the left side, dist_rel is negative (e.g., -10, -20, -30).
+    # We flip the array and take absolute distance so the phase-shift sees a 
+    # positive-traveling wave.
+    if side.lower() == "left":
+        dist_rel = np.abs(dist_rel[::-1]) 
+        final_data = final_data[::-1, :] 
+
+    # 6. Save to results directory
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+        
+    out_name = f"{date}_cc_{vs}_{window}_{v_mode}_{target}_{side}.npy"
+    out_path = os.path.join(out_dir, out_name)
+    
+    # Store as a dictionary for easy loading in dispersion loops
+    np.save(out_path, {
+        "data": final_data, 
+        "dist_rel": dist_rel, 
+        "lag": h_lag,
+        "vs_m": int(vs) * 8.16,
+        "side": side.lower()
+    })
+    
+    return out_name
+
+# =====================================================
+# 5. Regularize picks
+# =====================================================
+def regularize_dispersion_data(
+    x_raw: Sequence[float] | np.ndarray, 
+    y_raw: Sequence[float] | np.ndarray, 
+    z_raw: Sequence[float] | np.ndarray, 
+    f_min: float = 2.0, 
+    f_max: float = 6.0, 
+    f_step: float = 0.2
+) -> tuple[list[float], list[float], list[float], dict[float, dict[str, np.ndarray]]]:
+    """
+    Regularizes scattered dispersion data onto a uniform frequency axis.
+    Averages duplicate frequencies (combining S1 and S2) and interpolates missing values.
+    
+    :param x_raw: Raw spatial distances corresponding to the picks.
+    :type x_raw: array_like
+    :param y_raw: Raw frequency values corresponding to the picks.
+    :type y_raw: array_like
+    :param z_raw: Raw phase velocity values corresponding to the picks.
+    :type z_raw: array_like
+    :param f_min: Minimum frequency for the target uniform axis. Default is 2.0.
+    :type f_min: float, optional
+    :param f_max: Maximum frequency for the target uniform axis. Default is 6.0.
+    :type f_max: float, optional
+    :param f_step: Frequency step spacing for the target axis. Default is 0.2.
+    :type f_step: float, optional
+    :returns: A tuple containing flattened lists of regularized (x, y, z) data for plotting, 
+              and a dictionary mapping each distance to its cleaned 'f' and 'v' arrays for inversion.
+    :rtype: tuple[list[float], list[float], list[float], dict[float, dict[str, np.ndarray]]]
+    """
+    # 1. Define the standard inversion frequency axis
+    # We add f_step/2 to f_max to ensure the final value is included in np.arange
+    f_target = np.arange(f_min, f_max + (f_step / 2), f_step) 
+    
+    regularized_profiles = {}
+    x_reg = []
+    y_reg = []
+    z_reg = []
+
+    unique_distances = np.unique(x_raw)
+
+    for dist in unique_distances:
+        # Extract raw data for this specific distance
+        mask = np.array(x_raw) == dist
+        f_station = np.array(y_raw)[mask]
+        v_station = np.array(z_raw)[mask]
+        
+        # --- Average duplicate frequencies (Combine S1 & S2) ---
+        f_unique = np.unique(f_station)
+        v_unique = np.array([np.mean(v_station[f_station == f_val]) for f_val in f_unique])
+        
+        # --- Mute/Drop data above f_max ---
+        valid = f_unique <= f_max
+        f_clean = f_unique[valid]
+        v_clean = v_unique[valid]
+        
+        # Skip if a station somehow has fewer than 2 points left
+        if len(f_clean) < 2:
+            continue
+            
+        # 2. Build the Interpolator for this station
+        interp_func = interp1d(
+            f_clean, 
+            v_clean, 
+            kind='linear', 
+            bounds_error=False, 
+            # Pad missing edges with the nearest valid velocity
+            fill_value=(v_clean[0], v_clean[-1]) 
+        )
+        
+        # 3. Apply it to our standard target frequency axis
+        v_target = interp_func(f_target)
+        
+        # Save to dictionary for inversion later
+        regularized_profiles[dist] = {
+            'f': f_target,
+            'v': v_target
+        }
+        
+        # Save to lists for plotting
+        x_reg.extend([dist] * len(f_target))
+        y_reg.extend(f_target)
+        z_reg.extend(v_target)
+        
+    return x_reg, y_reg, z_reg, regularized_profiles
+
+# =====================================================
+# 6. Save regularized picks for inversion
+# =====================================================
+def export_inversion_inputs(
+    profiles_dict: dict[float, dict[str, np.ndarray]], 
+    output_dir: str
+) -> None:
+    """
+    Exports regularized 1D dispersion curves into individual text files 
+    formatted for standard 1D depth inversion software.
+
+    :param profiles_dict: Dictionary mapping spatial distances to their corresponding 
+                          'f' (frequency) and 'v' (velocity) arrays.
+    :type profiles_dict: dict[float, dict[str, np.ndarray]]
+    :param output_dir: Directory where the formatted text files will be saved.
+    :type output_dir: str
+    """
+    # Create a folder to keep your directory clean
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for dist, data in profiles_dict.items():
+        # Format the filename so they sort nicely (e.g., 'dispersion_0120m.txt')
+        filename = f"dispersion_{int(dist):04d}m.txt" 
+        filepath = os.path.join(output_dir, filename)
+        
+        # Stack the 1D arrays as two columns: Frequency, Velocity
+        out_data = np.column_stack((data['f'], data['v']))
+        
+        # Save to a space- or tab-delimited text file
+        # fmt='%.3f' keeps the numbers clean (3 decimal places)
+        np.savetxt(
+            filepath, 
+            out_data, 
+            fmt='%.3f', 
+            delimiter='\t', 
+            header='Frequency(Hz)\tPhaseVelocity(m/s)', 
+            comments='# '
+        )
