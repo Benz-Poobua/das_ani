@@ -7,36 +7,62 @@
 :purpose: Inversion utilities
 """
 import os
-import sys
-import glob
-import pickle
-from typing import Any, Literal
-
+import contextlib
 import numpy as np
-np.Inf = np.inf 
+from typing import Any, Literal, List, Dict, Tuple, Optional
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 from matplotlib.axes import Axes
-from matplotlib import cm
 from matplotlib.ticker import ScalarFormatter
-from matplotlib.colors import Normalize, ListedColormap
+from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 from matplotlib.lines import Line2D
 from matplotlib.animation import FuncAnimation
 
 from IPython.display import HTML, display
 from joblib import Parallel, delayed
-import dask
-from dask.diagnostics import ProgressBar
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
-from scipy.interpolate import interp1d
 
 from evodcinv import EarthModel, Layer, Curve
 from disba import PhaseDispersion, depthplot, surf96
 from disba._common import ifunc
 
+np.Inf = np.inf
+
+# Global Publication Typography Settings
+mpl.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Arial', 'Helvetica', 'Liberation Sans', 'DejaVu Sans'],
+    'axes.labelsize': 14,
+    'axes.titlesize': 16,
+    'xtick.labelsize': 12,
+    'ytick.labelsize': 12,
+    'legend.fontsize': 12,
+    'figure.dpi': 150,
+    'axes.linewidth': 1.2,      # Thicker axis lines for better visibility
+    'pdf.fonttype': 42,         # Ensures fonts are editable/embedded in PDFs
+    'ps.fonttype': 42
+})
+
+import joblib
+@contextlib.contextmanager
+def tqdm_joblib(tqdm_object):
+    """Context manager to patch joblib to report into tqdm progress bar."""
+    class TqdmBatchCompletionCallback(joblib.parallel.BatchCompletionCallBack):
+        def __call__(self, *args, **kwargs):
+            tqdm_object.update(n=self.batch_size)
+            return super().__call__(*args, **kwargs)
+
+    old_batch_callback = joblib.parallel.BatchCompletionCallBack
+    joblib.parallel.BatchCompletionCallBack = TqdmBatchCompletionCallback
+    try:
+        yield tqdm_object
+    finally:
+        joblib.parallel.BatchCompletionCallBack = old_batch_callback
+        tqdm_object.close()
 
 def plot_predicted_curve(
     inv_result: Any, 
@@ -128,8 +154,9 @@ def plot_predicted_curve(
         smap = ScalarMappable(norm=norm, cmap=cmap_name)
         smap.set_array([])
 
-        # Generate curves in parallel and plot
-        curves = Parallel(n_jobs=n_jobs)(delayed(get_y)(*model.T) for model in models)
+        with tqdm_joblib(tqdm(desc="Calculating Curves", total=len(models))):
+            curves = Parallel(n_jobs=n_jobs)(delayed(get_y)(*model.T) for model in models)
+
         for curve, misfit in zip(curves, misfits):
             y = (1.0 / curve if yaxis == "slowness" else curve * 1e3)
             plot_func(x[: len(y)], y, color=smap.to_rgba(misfit), **_plot_args)
@@ -200,6 +227,9 @@ def plot_model(
     if plot_args:
         _plot_args.update(plot_args)
     cmap_name = _plot_args.pop("cmap")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 8))
     
     if show == 'percentage':
         idx = np.argsort(inv_result.misfits)
@@ -232,16 +262,13 @@ def plot_model(
         
         n_select = int(np.floor((percent / 100) * len(idx)))
         models = models[:n_select+1]
+
         print(f"Plotting mean of {len(models)} models.")
         print(f"Misfit range: {misfits[0]:.4f} to {misfits[n_select]:.4f}")
         
         model_mean = np.squeeze(np.mean(models, axis=0))
         depthplot(model_mean[:, 0]*1e3, model_mean[:, i_param]*1e3, zmax, plot_args=_plot_args, ax=ax)
-        
-    # Customize axes
-    if ax is None:
-        ax = plt.gca()
-        
+                
     labels = {
         "velocity_p": "P-wave velocity [m/s]", "vp": "$V_p$ [m/s]",
         "velocity_s": "S-wave velocity [m/s]", "vs": "$V_s$ [m/s]",
@@ -289,6 +316,9 @@ def plot_model_range(
     
     # Calculate cumulative depths for the lower bound array
     d2[-1] = np.sum(d1) - np.sum(d2[:-1])
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 8))
     
     depthplot(d1*1e3, vs1*1e3, None, plot_args=_plot_args, ax=ax)
     depthplot(d2*1e3, vs2*1e3, None, plot_args=_plot_args, ax=ax)
@@ -426,64 +456,44 @@ def save_profile_plot(
     """
     os.makedirs(save_dir, exist_ok=True)
     
-    # 1. Make the figure taller and wider
+    # Figure setup
     fig, ax = plt.subplots(figsize=(9, 10))
-
-    # 2. Add major AND minor grids for easier depth/velocity reading
     ax.grid(True, which='major', linestyle='--', linewidth=0.7, alpha=0.7)
     ax.grid(True, which='minor', linestyle=':', linewidth=0.5, alpha=0.4)
     ax.minorticks_on()
 
-    # A. Plot the Search Boundaries (Prior)
-    plot_model_range(
-        prior_model, 
-        plot_args={"color": "gray", "linestyle": ":", "linewidth": 2.5, "alpha": 0.8}, 
-        ax=ax
-    )
+    # A. Prior Bounds (Black Solid)
+    plot_model_range(prior_model, plot_args={"color": "black", "linestyle": "-", "linewidth": 2}, ax=ax)
+    
+    # B. All Models (Ensemble Density - Grayscale)
+    plot_model(res, parameter="vs", show="percentage", percent=100, stride=10, zmax=zmax, 
+               cmap_on=True, cmap_range=(0.8, 2.0), # Matches your Hayashi reference
+               plot_args={"cmap": "Greys_r", "alpha": 0.05, "linewidth": 1}, ax=ax)
+    
+    # C. Top 30% Mean (Cyan Dashed)
+    plot_model(res, parameter="vs", show="mean", percent=30, zmax=zmax, 
+               plot_args={"color": "cyan", "linewidth": 2.5, "linestyle": "--"}, ax=ax)
+    
+    # D. Best Model (Red Solid)
+    plot_model(res, parameter="vs", show="best", zmax=zmax, 
+               plot_args={"color": "red", "linewidth": 3.5, "linestyle": "-"}, ax=ax)
 
-    # B. Plot the Ensemble of Top Models (Posterior Uncertainty)
-    plot_model(
-        res, parameter="vs", show="percentage", percent=percent, zmax=zmax, 
-        cmap_on=True, plot_args={"cmap": "turbo", "alpha": 0.4}, ax=ax
-    )
-
-    # C. Plot the Single Best Model on top (thicker line for emphasis)
-    plot_model(
-        res, parameter="vs", show="best", zmax=zmax, 
-        plot_args={"color": "black", "linewidth": 3.5, "linestyle": "-"}, ax=ax
-    )
-
-    # 3. Enhanced Typography
     ax.set_title(f"Inverted 1D $V_s$ Profile | Station: {dist}m", pad=15)
     ax.set_xlabel("$V_s$ (m/s)")
     ax.set_ylabel("Depth (m)")
-    ax.tick_params(axis='both', which='major')
+    ax.set_xlim(xlim)
 
-    # Optional: Add a bit of padding to the x-axis so the bounds don't touch the frame
-    ax.set_xlim(xlim) 
-
-    # 4. Create a Custom Legend
     legend_elements = [
-        Line2D([0], [0], color='black', lw=3.5, linestyle='-', label='Best Inverted Model'),
-        Line2D([0], [0], color='orange', lw=3, alpha=0.6, label=f'Top {percent}% Models (Ensemble)'),
-        Line2D([0], [0], color='gray', lw=2.5, linestyle=':', label='Prior Search Bounds')
+        Line2D([0], [0], color='red', lw=3.5, label='Best Inverted Model'),
+        Line2D([0], [0], color='cyan', lw=2.5, linestyle='--', label='Mean of Top 30% Models'),
+        Line2D([0], [0], color='gray', lw=2, alpha=0.5, label='Evaluated Models (Misfit Scale)'),
+        Line2D([0], [0], color='black', lw=2, label='Prior Search Bounds')
     ]
 
-    ax.legend(
-        handles=legend_elements, 
-        loc='lower left',        
-        fontsize=13, 
-        framealpha=0.95,         
-        edgecolor='black',
-        borderpad=0.8
-    )
-
-    plt.tight_layout()
+    ax.legend(handles=legend_elements, loc='lower left', framealpha=0.95, edgecolor='black')
     
-    # 5. Save and Close (No Display)
-    filename = f"Vs_profile_{dist}m.png"
-    filepath = os.path.join(save_dir, filename)
-    plt.savefig(filepath, dpi=300, bbox_inches='tight')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"Vs_profile_{dist}m.png"), dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 def plot_dispersion_fit(
@@ -674,6 +684,7 @@ def plot_2d_contour_section(
     smooth_sigma: tuple[float, float] = (1, 2), 
     tick_step: int = 100, 
     contour: bool = False, 
+    x_flip: bool = False,
     save_path: str | None = None
 ) -> None:
     """
@@ -703,6 +714,8 @@ def plot_2d_contour_section(
     :type tick_step: int, optional
     :param contour: Whether to overlay discrete contour lines. Default is False.
     :type contour: bool, optional
+    :param x_flip: Whether to invert the X-axis (e.g., to match map orientation). Default is False.
+    :type x_flip: bool, optional
     :param save_path: If provided, saves the figure to this path instead of showing inline. Default is None.
     :type save_path: str, optional
     """
@@ -736,6 +749,14 @@ def plot_2d_contour_section(
     # Formatting
     ax.invert_yaxis()
     ax.set_ylim(max_depth, 0)
+    
+    # Set explicit X-limits and handle the flip
+    x_min, x_max = np.min(positions), np.max(positions)
+    if x_flip:
+        ax.set_xlim(x_max, x_min)
+    else:
+        ax.set_xlim(x_min, x_max)
+
     ax.set_title(f"Contoured 2D Shear-Wave Velocity ($V_s$) Profile", fontsize=16, pad=15)
     ax.set_xlabel("Distance Along Cable (m)", fontsize=14)
     ax.set_ylabel("Depth (m)", fontsize=14)

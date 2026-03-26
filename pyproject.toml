@@ -61,6 +61,11 @@ notebooks = [
   "ipykernel>=6.29",
 ]
 
+# Test features (not for production)
+experimental = [
+  "daspack-dev",
+]
+
 # -----------------------
 # setuptools configuration
 # -----------------------
