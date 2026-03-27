@@ -27,8 +27,7 @@ from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
 
 from evodcinv import EarthModel, Layer, Curve
-from disba import PhaseDispersion, depthplot, surf96
-from disba._common import ifunc
+from disba import PhaseSensitivity
 
 np.Inf = np.inf
 
@@ -773,3 +772,114 @@ def plot_2d_contour_section(
         print(f"Figure successfully saved to: {save_path}")
         
     plt.show()
+
+def animate_sensitivity_kernels(
+    positions: np.ndarray, 
+    vs_matrix: np.ndarray, 
+    z_grid: np.ndarray, 
+    test_frequencies: list[float] | None = None, 
+    vp_vs_ratio: float = 2.0, 
+    density: float = 1.0, 
+    x_max: float = 0.08, 
+    step: int | None = None, 
+    interval: int = 150
+) -> HTML:
+    """
+    Generates Rayleigh wave sensitivity kernels along a 2D seismic profile.
+    
+    :param positions: 1D array of horizontal positions along the cable (in meters).
+    :type positions: array_like
+    :param vs_matrix: 2D shear wave velocity matrix (depth x positions) in m/s.
+    :type vs_matrix: numpy.ndarray
+    :param z_grid: 1D array of depths (in meters).
+    :type z_grid: array_like
+    :param test_frequencies: Frequencies to test in Hz. Default is [2.0, 3.0, 4.0, 5.0, 6.0].
+    :type test_frequencies: list of float, optional
+    :param vp_vs_ratio: Ratio used to estimate Vp from Vs. Default is 2.0.
+    :type vp_vs_ratio: float, optional
+    :param density: Constant density assumption in g/cm^3. Default is 1.0.
+    :type density: float, optional
+    :param x_max: Maximum limit for the X-axis to keep the animation stable. Default is 0.08.
+    :type x_max: float, optional
+    :param step: Frame step size. E.g., step=5 animates every 5th position. Default is None.
+    :type step: int or None, optional
+    :param interval: Milliseconds between frames. Lower is faster. Default is 150.
+    :type interval: int, optional
+    :return: Interactive HTML widget displaying the animation in a Jupyter Notebook.
+    :rtype: IPython.display.HTML
+    """
+    if test_frequencies is None:
+        test_frequencies = [2.0, 3.0, 4.0, 5.0, 6.0]
+    
+    # 1. Pre-calculate static variables
+    z_depths = np.abs(z_grid)
+    thickness_m = np.append(np.diff(z_depths), 10.0) # Required half-space
+    thickness_km = thickness_m / 1000.0
+
+    # 2. Setup the static figure
+    fig, ax = plt.subplots(figsize=(5, 7))
+    lines = []
+    
+    # Generate distinct colors for however many frequencies you pass
+    colors = plt.cm.tab10(np.linspace(0, 1, len(test_frequencies)))
+
+    for idx, f in enumerate(test_frequencies):
+        line, = ax.plot([], [], label=f"{f} Hz", linewidth=2.5, color=colors[idx])
+        lines.append(line)
+
+    ax.set_ylim(np.max(z_depths), 0) 
+    ax.set_xlim(0, x_max)
+    
+    ax.set_xlabel("Sensitivity Kernel ($\partial c / \partial V_s$)", fontsize=14)
+    ax.set_ylabel("Depth (m)", fontsize=14)
+    
+    title = ax.set_title("", fontsize=16, pad=20)
+
+    ax.grid(True, linestyle='--', alpha=0.7)
+    ax.legend(loc="lower right", fontsize=12)
+    
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+
+    # Animation internal functions
+    def init():
+        for line in lines:
+            line.set_data([], [])
+        title.set_text("")
+        return lines + [title]
+
+    def update(idx):
+        pos_m = positions[idx]
+        vs_1d_ms = vs_matrix[:, idx]
+        
+        # Build local 1D velocity model for this specific position
+        vs_kms = vs_1d_ms / 1000.0
+        vp_kms = vs_kms * vp_vs_ratio
+        rho_gcm3 = np.full_like(vs_kms, density)
+        velocity_model = np.column_stack((thickness_km, vp_kms, vs_kms, rho_gcm3))
+        
+        # Initialize Disba
+        ps = PhaseSensitivity(*velocity_model.T)
+        
+        for f_idx, f in enumerate(test_frequencies):
+            period = 1.0 / f
+            k = ps(period, mode=0, wave="rayleigh", parameter="velocity_s")
+            
+            # Update line data
+            lines[f_idx].set_data(k.kernel, k.depth * 1000.0)
+            
+        title.set_text(f"Rayleigh Wave Sensitivity\nat Position = {pos_m:.1f} m")
+        return lines + [title]
+
+    # Render
+    if step is None:
+        step = max(1, len(positions) // 100) # Auto-scale to ~100 frames max
+        
+    frames_to_render = range(0, len(positions), step)
+
+    ani = FuncAnimation(
+        fig, update, frames=frames_to_render, 
+        init_func=init, blit=True, interval=interval
+    )
+
+    plt.close(fig) # Prevent ghost plots
+    return HTML(ani.to_jshtml())

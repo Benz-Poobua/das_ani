@@ -24,9 +24,6 @@ from tqdm.auto import tqdm
 from typing import Tuple, List, Literal, Callable, Any
 from scipy.interpolate import griddata
 
-from disba import depthplot, surf96
-from disba._common import ifunc
-
 from src.utils import parse_ncf_stack_filename, fk_filter
 from src.disp import prep_ncf
 
