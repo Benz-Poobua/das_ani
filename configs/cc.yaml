@@ -3,7 +3,7 @@ paths:
   output_root: ./data/ncf_raw
 
 runtime:
-  njobs: 6
+  njobs: 4
   use_gpu: false
   mmap: true
   frac_mem: 0.25
@@ -29,10 +29,7 @@ preprocess:
 
 xcorr:
   # method switch
-  mode: conventional # conventional or v1
-
-  # benchmark switch
-  use_cpp: false # set to false to use pure python benchmark
+  mode: v1 # conventional or v1
 
   # whitening
   is_spectral_whitening: false # do whitening, but now done in prewhiten stage

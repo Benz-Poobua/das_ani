@@ -4,8 +4,7 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: DAS preprocessing (Bensen et al., 2007) + cross-correlation (conventional + Zhang 2025 v1),
-          with optional CPU C++ extension for v1.
+:purpose: DAS preprocessing (Bensen et al., 2007) + cross-correlation (conventional + Zhang 2025 v1).
 :reference: Modified from Yan Yang (2022-07-10).
 """
 from __future__ import annotations
@@ -29,71 +28,7 @@ try:
 except Exception:
     lambertw = None
 
-# Optional JIT loader (CPU extension)
-try:
-    from torch.utils.cpp_extension import load as torch_cpp_load  # type: ignore
-except Exception:
-    torch_cpp_load = None  # type: ignore
-
 logger = logging.getLogger(__name__)
-
-# ==============================================================
-# 0. Optional C++ extension (lazy, safe fallback)
-#    Key change: compile once per *run* (preferably in main), and use a stable name
-#    so workers can reuse the cached build rather than compiling N times.
-# ==============================================================
-_CPP_MODULE: Any = None
-_CPP_TRIED: bool = False
-
-def _maybe_load_cpp_extension(*, force_rebuild: bool = False) -> Any:
-    """
-    Try to JIT-compile/load cc_v1.cpp once per process.
-    Returns module or None.
-
-    Notes:
-    - Uses a stable extension name to maximize cache reuse across processes/runs.
-    - In multiprocessing, best practice is to call this ONCE in the main process
-      before spawning workers (see cc.py main()).
-    """
-    global _CPP_MODULE, _CPP_TRIED
-    if _CPP_TRIED and (not force_rebuild):
-        return _CPP_MODULE
-    _CPP_TRIED = True
-
-    if torch_cpp_load is None:
-        logger.debug("torch.utils.cpp_extension.load unavailable; C++ v1 disabled.")
-        _CPP_MODULE = None
-        return None
-
-    src_path = Path(__file__).resolve().parent / "cc_v1.cpp"
-    if not src_path.exists():
-        logger.debug("C++ source not found at %s; C++ v1 disabled.", src_path)
-        _CPP_MODULE = None
-        return None
-
-    # Stable name -> better cache reuse. Avoid per-PID names unless debugging.
-    ext_name = "cc_v1_cpp_jit"
-
-    # Optional: user can set TORCH_EXTENSIONS_DIR to control build cache location.
-    build_dir = os.environ.get("TORCH_EXTENSIONS_DIR", None)
-
-    try:
-        logger.info("Loading/Compiling C++ extension: %s (build_dir=%s)", ext_name, build_dir or "<default>")
-        _CPP_MODULE = torch_cpp_load(
-            name=ext_name,
-            sources=[str(src_path)],
-            verbose=False,
-            build_directory=build_dir,
-            is_python_module=True,
-            extra_cflags=["-O3"],
-        )
-        logger.info("C++ v1 extension loaded OK.")
-        return _CPP_MODULE
-    except Exception as e:
-        logger.warning("Could not compile/load C++ extension (%s). Using Python v1 FFT.", e)
-        _CPP_MODULE = None
-        return None
-
 
 # ==============================================================
 # 1. Preprocessing utilities (numpy)
@@ -407,7 +342,7 @@ def choose_block_size_v2(
 class TorchCrossCorrelation(nn.Module):
     """
     mode="conventional": full-lag (2N-1), standard lag ordering
-    mode="v1": short-lag (2M+1) using Zhang block-FFT; optional CPU C++ acceleration
+    mode="v1": short-lag (2M+1) using Zhang block-FFT
     """
 
     def __init__(
@@ -419,7 +354,6 @@ class TorchCrossCorrelation(nn.Module):
         whitening_params: Optional[tuple[float, float, float, float]] = None,
         v1_fft_snap_pow2: bool = True,
         v1_fallback: Literal["v1_2M", "v1_Mp1"] = "v1_2M",
-        use_cpp: bool = True,
     ) -> None:
         super().__init__()
 
@@ -438,7 +372,6 @@ class TorchCrossCorrelation(nn.Module):
 
         self.v1_fft_snap_pow2 = bool(v1_fft_snap_pow2)
         self.v1_fallback = v1_fallback
-        self.use_cpp = bool(use_cpp)
 
         # conventional cache
         self._conv_L: Optional[int] = None
@@ -470,7 +403,6 @@ class TorchCrossCorrelation(nn.Module):
             self.mode,
             self.max_lag_samples,
             self.is_spectral_whitening,
-            self.use_cpp,
         )
 
     def _forward_conventional(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
@@ -575,8 +507,7 @@ class TorchCrossCorrelation(nn.Module):
             end = min(start + K, N)
             klen = end - start
 
-            # Full zero is simple but slower than the C++ “region clear”.
-            # Keep it for correctness; C++ path is the speed path.
+            # Full zero is simple and reliable for Pure Python
             x_t.zero_()
             y_t.zero_()
 
@@ -612,29 +543,5 @@ class TorchCrossCorrelation(nn.Module):
     def forward(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
         if self.mode == "conventional":
             return self._forward_conventional(data1, data2)
-
-        # v1: only try C++ when:
-        # - enabled
-        # - whitening is NOT inside v1
-        # - tensors are on CPU
-        if (
-            self.use_cpp
-            and (not self.is_spectral_whitening)
-            and data1.device.type == "cpu"
-            and data2.device.type == "cpu"
-        ):
-            mod = _maybe_load_cpp_extension()
-            if mod is not None:
-                try:
-                    assert self._v1_M is not None and self._v1_K is not None and self._v1_Lfft is not None
-                    return mod.correlation_v1(
-                        data1.contiguous(),
-                        data2.contiguous(),
-                        int(self._v1_M),
-                        int(self._v1_K),
-                        int(self._v1_Lfft),
-                    )
-                except Exception as e:
-                    logger.warning("C++ v1 failed (%s). Falling back to Python v1 FFT.", e)
-
+            
         return self._forward_v1_python_fft(data1, data2)

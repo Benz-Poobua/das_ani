@@ -40,7 +40,7 @@ from src.utils import (
     write_perf_row,
 )
 
-from src.ani import preprocess, TorchCrossCorrelation, whiten_per_segment_torch, _maybe_load_cpp_extension
+from src.ani import preprocess, TorchCrossCorrelation, whiten_per_segment_torch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -64,7 +64,6 @@ def _worker_warmup(
     max_lag_samples: int,
     v1_fft_snap_pow2: bool,
     v1_fallback: str,
-    use_cpp: bool,
     threads_per_proc: int,
 ) -> None:
     """
@@ -91,7 +90,6 @@ def _worker_warmup(
         whitening_params=None,
         v1_fft_snap_pow2=bool(v1_fft_snap_pow2),
         v1_fallback=str(v1_fallback),
-        use_cpp=bool(use_cpp),
     ).to(device)
     model.eval()
 
@@ -107,7 +105,6 @@ def _worker_warmup(
     logger.info(
         "Worker warm-up done | mode=%s | use_cpp=%s | npts_seg=%d | M=%d | threads=%d",
         mode,
-        use_cpp,
         npts_seg,
         max_lag_samples,
         threads_per_proc,
@@ -166,7 +163,6 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     window_freq_hz = float(get_cfg(cfg, ["xcorr", "window_freq_hz"], 0.0))
     max_lag_sec = float(get_cfg(cfg, ["xcorr", "max_lag_sec"], 4.0))
     xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec"], 8.0))
-    use_cpp = bool(get_cfg(cfg, ["xcorr", "use_cpp"], True))
 
     mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
     if mode not in {"conventional", "v1"}:
@@ -209,8 +205,8 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         return None
 
     logger.info(
-        "XCORR config | mode=%s | use_cpp=%s | npts_seg=%d | M=%d | out_len=%d",
-        mode, use_cpp, npts_seg, npts_lag, cc_out_len
+        "XCORR config | mode=%s | npts_seg=%d | M=%d | out_len=%d",
+        mode, npts_seg, npts_lag, cc_out_len
     )
 
     data_proc = preprocess(data_raw, fs_raw, f1, f2, decimation, diff, ram_win_sec).astype(np.float32, copy=False)
@@ -286,7 +282,6 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         whitening_params=whitening_params_cc,
         v1_fft_snap_pow2=v1_fft_snap_pow2,
         v1_fallback=v1_fallback,
-        use_cpp=use_cpp,
     )
 
     multi_gpu = device.type == "cuda" and use_gpu and (torch.cuda.device_count() > 1)
@@ -391,12 +386,6 @@ def main(config_path: str | Path) -> None:
     njobs = max(1, int(get_cfg(cfg, ["runtime", "njobs"], 4)))
 
     mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
-    use_cpp = bool(get_cfg(cfg, ["xcorr", "use_cpp"], True))
-
-    # ---- IMPORTANT CHANGE ----
-    # Pre-compile/load C++ ONCE in main (prevents “compile storm” in workers)
-    if mode == "v1" and use_cpp:
-        _maybe_load_cpp_extension()
 
     filelist = sorted(data_root.rglob("*.npz"))
     logger.info("Found %d files in %s", len(filelist), data_root)
@@ -429,7 +418,6 @@ def main(config_path: str | Path) -> None:
         max_lag_samples=M,
         v1_fft_snap_pow2=v1_fft_snap_pow2,
         v1_fallback=v1_fallback,
-        use_cpp=use_cpp,
         threads_per_proc=threads_per_proc,
     )
 
@@ -462,3 +450,6 @@ if __name__ == "__main__":
         logger.debug("Verbose logging enabled.")
 
     main(args.config)
+
+# Example:
+# python -m src.cc --config cc.yaml --verbose
