@@ -64,5 +64,4 @@ notebooks/data/
 *.npz
 *.pt
 *.tar
-*.zip
 pages/ncf.html

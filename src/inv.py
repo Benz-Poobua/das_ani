@@ -27,7 +27,8 @@ from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
 
 from evodcinv import EarthModel, Layer, Curve
-from disba import PhaseSensitivity
+from disba import PhaseSensitivity, surf96, depthplot
+from disba._common import ifunc
 
 np.Inf = np.inf
 
@@ -746,7 +747,6 @@ def plot_2d_contour_section(
     cbar.set_label('$V_s$ (m/s)', fontsize=12)
 
     # Formatting
-    ax.invert_yaxis()
     ax.set_ylim(max_depth, 0)
     
     # Set explicit X-limits and handle the flip

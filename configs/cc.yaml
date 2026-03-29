@@ -32,7 +32,7 @@ xcorr:
   mode: v1 # conventional or v1
 
   # whitening
-  is_spectral_whitening: false # do whitening, but now done in prewhiten stage
+  is_spectral_whitening: false 
   window_freq_hz: 0.0
 
   # lags of interest
