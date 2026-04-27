@@ -1,0 +1,73 @@
+# =============================================================================
+# Configuration: Stanford Bridge DAS Ambient Noise Interferometry
+# Target: Structural Guided Waves (1.0 - 50.0 Hz) 
+# =============================================================================
+paths:
+  data_root: ./data/raw_bridge
+  output_root: ./data/ncf_raw_bridge
+
+runtime:
+  njobs: 8
+  use_gpu: false
+  mmap: true
+  frac_mem: 0.25
+  min_chunk: 64
+  max_chunk: 4096
+  torch_compile: false
+  compile_mode: max-autotune
+
+data:
+  fs_raw: 250.0
+  first_chan: 0
+  last_chan: 420
+  dx: 2.45
+  src_stride: 10         # every 10th channel
+  min_length_sec: 60.0
+
+preprocess:
+  decimation: 1
+  f1: 1.0
+  f2: 50.0
+  diff: false
+  ram_win_sec: 0.5
+
+xcorr:
+  # method switch
+  mode: conventional # conventional or v1
+  auto_cc: false      # set to true for Coda Wave Interferometry (ACF)
+
+
+  # whitening
+  is_spectral_whitening: true 
+  window_freq_hz: 0.5
+
+  # lags of interest
+  max_lag_sec: 1.0
+
+  # window for benchmark and v1
+  xcorr_seg_sec: 10.0
+  xcorr_seg_sec_v1: 10.0
+
+  # v1 block settings
+  v1_fft_snap_pow2: true     # snap (K+2M) to power-of-two FFT length
+  v1_fallback: v1_2M         # "v1_2M" or "v1_Mp1"
+
+perf:
+  enabled: true
+  out_path: ./data/runlogs/perf_cc.csv   # append rows per run (mode/file/vs)
+  log_every_vs: true
+  log_every_chunk: false
+
+stacking:
+  enabled: true
+  raw_root: ./data/ncf_raw_bridge
+  stacks_root: ./data/ncf_stacks_bridge
+  overwrite: false
+
+  base_stack: 1d # fundamental unit; 1d or 1h
+
+  windows:
+    #72h: true
+    3d: true
+    15d: false
+    30d: false

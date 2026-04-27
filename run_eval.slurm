@@ -20,11 +20,12 @@ export NUMEXPR_NUM_THREADS=1
 
 # Run workload
 python3 -m src.eval_robustness \
-  --cc_config configs/cc.yaml \
-  --outdir data/benchmarks/rob_w60 \
+  --cc_config configs/bridge_cc.yaml \
+  --outdir data/benchmarks/bridge \
   --n_files 16 \
   --repeats 4 \
   --cores 1 2 4 8 16 \
-  --window_sec 60 \
+  --window_sec 10 \
   --njobs_complexity 16 \
-  --lags 0.5 1 2 4 5 10
+  --lags 0.1 0.5 1 2 
+  # --auto_cc

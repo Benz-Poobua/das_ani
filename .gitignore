@@ -65,3 +65,6 @@ notebooks/data/
 *.pt
 *.tar
 pages/ncf.html
+notebooks/ncf_urban_tutorial.ipynb
+notebooks/ncf_urban_tutorial.ipynb
+notebooks/look_offshore.ipynb

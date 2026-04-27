@@ -296,13 +296,14 @@ def fk_filter(
     vmin: float,
     vmax: float,
     mode: Literal["eliminate", "extract"] = "eliminate",
+    direction: Literal["both", "right", "left"] = "both",  # Direction control
     pad_factor: Tuple[int, int] = (1, 1),
     smooth: Literal["no", "gaussian", "uniform"] = "no",
     sigma: float = 1.0,
     uniform_size: int = 1,
 ) -> np.ndarray:
     """
-    Apply velocity filtering in the f–k domain.
+    Apply velocity filtering in the f–k domain with optional directional masking.
 
     :param data: 2D data array (nx, nt).
     :param dt: Time sampling interval (s).
@@ -310,6 +311,7 @@ def fk_filter(
     :param vmin: Min absolute velocity to target (m/s).
     :param vmax: Max absolute velocity to target (m/s).
     :param mode: 'eliminate' (remove band) or 'extract' (keep band).
+    :param direction: 'both' (symmetric), 'right' (keep +k only), 'left' (keep -k only).
     :param pad_factor: Factors (nx_mul, nt_mul) for FFT padding. Default (1, 1).
     :param smooth: Mask smoothing method: 'no', 'gaussian', or 'uniform'.
     :param sigma: Sigma for gaussian smoothing (if smooth='gaussian').
@@ -341,6 +343,12 @@ def fk_filter(
 
     # Use absolute velocity to keep both Left and Right going waves
     mask[(np.abs(v_grid) >= vmin) & (np.abs(v_grid) <= vmax)] = 0.0
+
+    # --- NEW: Directional Override ---
+    if direction == "right":
+        mask[k_grid < 0] = 1.0  # Force eliminate all negative wavenumbers
+    elif direction == "left":
+        mask[k_grid > 0] = 1.0  # Force eliminate all positive wavenumbers
 
     # 3. Apply Smoothing
     if smooth == "gaussian":
@@ -658,13 +666,12 @@ def parse_ncf_filename(fname: str) -> Tuple[str, str, str]:
 def parse_ncf_stack_filename(fname: str) -> Tuple[str, str, str, str]:
     """
     Parse STACKED NCF filename of format:
-        YYYYMMDD_cc_XXX_<window>_<mode>.npy
+        {prefix}_cc_{vs}_{window}_{mode}.npy
 
     Examples:
         20210928_cc_070_daily_conventional.npy
-        20210928_cc_070_7d_v1.npy
-        20210928_cc_070_15d_v1.npy
-        20210928_cc_070_30d_conventional.npy
+        20210928_cc_2120_7d_v1.npy
+        20210928_cc_3191_30d_v2.npy
 
     :param fname: Path or filename of the NCF stack
     :type fname: str
@@ -672,8 +679,16 @@ def parse_ncf_stack_filename(fname: str) -> Tuple[str, str, str, str]:
     :rtype: Tuple[str, str, str, str]
     """
     base = os.path.basename(fname)
-    m = re.match(r"(\d{8})_cc_(\d{3})_(daily|\d+d)_(conventional|v1)\.npy$", base)
+    
+    # 1. (.+?)     -> Captures any date or prefix before '_cc_'
+    # 2. (\d+)     -> Captures any number of digits for the VS index (0, 000, 3191)
+    # 3. ([^_]+)   -> Captures the window string (daily, 7d, etc.)
+    # 4. (.+)      -> Captures the mode string (v1, conventional)
+    # 5. \.np[yz]$ -> Allows both .npy and compressed .npz formats
+    m = re.match(r"(.+?)_cc_(\d+)_([^_]+)_(.+)\.np[yz]$", base)
+    
     if m is None:
         raise ValueError(f"Stack filename not recognized: {fname}")
+        
     date, vs, window, mode = m.groups()
     return date, vs, window, mode

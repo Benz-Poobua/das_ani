@@ -1,0 +1,89 @@
+io:
+  ncf_root: "data/ncf_stacks"
+  results_root: "results/dispersion"
+
+  # Process these folders under ncf_root/
+  # Ideally, run on 15d or 30d for cleaner images than 7d
+  stack_windows:
+    # - daily
+    # - 7d
+    # - 15d
+    - 30d
+
+  # If true: results/<stack_window>/VS_###/
+  vs_subdir: true
+
+geometry:
+  fs: 250.0                  # Hz
+  dx: 8.16                   # meters
+
+# ==========================================
+# Dispersion options
+# ==========================================
+dispersion:
+  # Fold/slice symmetric NCF (-T..0..+T) -> one-sided (0..+T)
+  mode: "causal"             # Recommended: "both" averages causal & acausal for better SNR
+
+# ==========================================
+# FK velocity filtering (CRITICAL FIX)
+# ==========================================
+fk:
+  enabled: true
+  vmin: 100.0
+  vmax: 2000.0               
+  taper_frac: 0.10
+
+# ==========================================
+# f–v transform parameters
+# ==========================================
+fv:
+  vmin: 100.0
+  vmax: 2000.0               
+  dv: 10.0
+
+  fmin: 0.1
+  fmax: 50.0
+
+  normalize: true
+
+# ==========================================
+# Runtime control
+# ==========================================
+runtime:
+  njobs: 6
+  device: "auto"             # "auto", "cpu", "cuda", "mps"
+  batch_size_v: null         
+  empty_cache: true
+
+# ==========================================
+# Picking control (CRITICAL FIX)
+# ==========================================
+picking:
+  enabled: true
+  step: 5
+
+  # FIX: Multi-point constraints enabled.
+  # This forces the picker to look for a curve that starts high and goes lower.
+  # It prevents it from jumping to the 3200 m/s noise rail at high frequencies.
+  f_ref_set: null # [1.0, 5.0] # null
+  vmax_set:  null # [1800.0, 1500.0]
+
+# ==========================================
+# Save control
+# ==========================================
+save:
+  overwrite: false
+  save_panel: true
+  save_axes: true
+  save_pick: true
+  save_meta: true
+
+# ==========================================
+# Logging / perf
+# ==========================================
+runlog:
+  enabled: true
+
+perf:
+  enabled: true
+  out_path: "./data/runlogs/perf_disp.csv"

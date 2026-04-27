@@ -36,27 +36,50 @@ logger = logging.getLogger(__name__)
 def bandpass_filter_tukey(
     data: np.ndarray,
     fs: float,
-    f1: float,
-    f2: float,
+    f1: float | None = None,
+    f2: float | None = None,
     alpha: float = 0.05,
     order: int = 4,
 ) -> np.ndarray:
+    """
+    Applies a Tukey window and a Butterworth filter along the time axis.
+    Uses 'sos' (Second-Order Sections) for numerical stability at very low frequencies.
+    """
     if data.ndim != 2:
         raise ValueError("bandpass_filter_tukey: data must be 2D (nch × nt).")
 
-    nyq = fs / 2.0
-    if not (0.0 < f1 < f2 < nyq):
-        raise ValueError(f"Invalid f1/f2: require 0 < f1 < f2 < Nyquist={nyq}.")
+    if f1 is None and f2 is None:
+        raise ValueError("Must specify at least one frequency (f1 or f2).")
 
+    nyq = fs / 2.0
     nt = int(data.shape[1])
     window = signal.windows.tukey(nt, alpha=float(alpha))
 
-    low = f1 / nyq
-    high = f2 / nyq
-    b, a = butter(int(order), [low, high], btype="bandpass")
+    # 1. Determine filter type and critical frequencies
+    if f1 is not None and f2 is not None:
+        if not (0.0 < f1 < f2 < nyq):
+            raise ValueError(f"Invalid f1/f2: require 0 < f1 < f2 < Nyquist={nyq}.")
+        btype = "bandpass"
+        Wn = [f1 / nyq, f2 / nyq]
+        
+    elif f1 is None and f2 is not None:
+        if not (0.0 < f2 < nyq):
+            raise ValueError(f"Invalid f2: require 0 < f2 < Nyquist={nyq}.")
+        btype = "lowpass"
+        Wn = f2 / nyq
+        
+    elif f1 is not None and f2 is None:
+        if not (0.0 < f1 < nyq):
+            raise ValueError(f"Invalid f1: require 0 < f1 < Nyquist={nyq}.")
+        btype = "highpass"
+        Wn = f1 / nyq
 
+    # 2. Design the filter using 'sos' (Crucial for 0.1 Hz stability)
+    sos = signal.butter(int(order), Wn, btype=btype, output='sos')
+
+    # 3. Apply taper and filter using sosfiltfilt
     tapered = data * window
-    filtered = filtfilt(b, a, tapered, axis=1)
+    filtered = signal.sosfiltfilt(sos, tapered, axis=1)
 
     return filtered.astype(np.float32, copy=False)
 
@@ -399,7 +422,7 @@ class TorchCrossCorrelation(nn.Module):
             self._v1_nfreq = int(self._v1_Lfft // 2 + 1)
 
         logger.info(
-            "TorchCrossCorrelation init | mode=%s | max_lag=%s | whitening=%s | use_cpp=%s",
+            "TorchCrossCorrelation init | mode=%s | max_lag=%s | internal_whitening=%s",
             self.mode,
             self.max_lag_samples,
             self.is_spectral_whitening,

@@ -1,0 +1,74 @@
+# =============================================================================
+# Configuration: Urban DAS Ambient Noise Interferometry
+# Target: Rayleigh waves (1.0 - 10.0 Hz) in urban sediments
+# =============================================================================
+
+paths:
+  data_root: ./data/preprocessed
+  output_root: ./data/ncf_raw
+
+runtime:
+  njobs: 4
+  use_gpu: false
+  mmap: true
+  frac_mem: 0.25
+  min_chunk: 64
+  max_chunk: 4096
+  torch_compile: false
+  compile_mode: max-autotune
+
+data:
+  fs_raw: 250.0
+  first_chan: 399
+  last_chan: 748
+  dx: 8.16
+  src_stride: 10         # every 10th channel
+  min_length_sec: 60.0
+
+preprocess:
+  decimation: 1
+  f1: 1.0
+  f2: 10.0
+  diff: false
+  ram_win_sec: 0.0
+
+xcorr:
+  # method switch
+  mode: v1 # conventional or v1
+  auto_cc: true      # set to true for Coda Wave Interferometry (ACF)
+
+
+  # whitening
+  is_spectral_whitening: true 
+  window_freq_hz: 0.0
+
+  # lags of interest
+  max_lag_sec: 2.0
+
+  # window for benchmark and v1
+  xcorr_seg_sec: 60.0
+  xcorr_seg_sec_v1: 60.0
+
+  # v1 block settings
+  v1_fft_snap_pow2: true     # snap (K+2M) to power-of-two FFT length
+  v1_fallback: v1_2M         # "v1_2M" or "v1_Mp1"
+
+perf:
+  enabled: true
+  out_path: ./data/runlogs/perf_cc.csv   # append rows per run (mode/file/vs)
+  log_every_vs: true
+  log_every_chunk: false
+
+stacking:
+  enabled: true
+  raw_root: ./data/ncf_raw
+  stacks_root: ./data/ncf_stacks
+  overwrite: false
+
+  base_stack: 1d # fundamental unit; or 1h
+
+  windows:
+    # 2h: true
+    7d: true
+    15d: true
+    30d: true
