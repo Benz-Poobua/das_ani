@@ -21,8 +21,7 @@ from typing import Tuple, List, Literal, Callable, Any
 from scipy import signal
 
 from src.utils import parse_ncf_stack_filename, fk_filter, fk_transform
-from src.disp import prep_ncf
-from src.ncf import get_vs_number, process_single_file
+from src.ncf import get_vs_number, process_single_file, prep_ncf
 
 # ===========================================================================
 # Plotting Configuration
@@ -285,7 +284,8 @@ def plot_das_psd(
     ylim: Tuple[float | None, float | None] | None = (0, 60),
     xscale: str = "log",
     ylabel: str = "PSD (dB)",
-    figsize: Tuple[float, float] = (10, 5)
+    figsize: Tuple[float, float] = (10, 5),
+    title: str | None = None
 ) -> None:
     """
     Plots the Mean Power Spectral Density plot for a specific channel range.
@@ -302,6 +302,7 @@ def plot_das_psd(
     :param xscale: Scale of the x-axis ('linear' or 'log'). Default is "log".
     :param ylabel: Label for the Y-axis. Default is generic "PSD (dB)".
     :param figsize: Figure dimensions. Default (10, 5).
+    :param title: Optional custom title for the plot. If None, auto-generates based on channels.
     """
     # 1. Handle Channel Slicing
     s_ch = max(0, start_chan)
@@ -315,7 +316,7 @@ def plot_das_psd(
 
     # 2. Calculate physical distance for the title
     start_km = (s_ch * dx) / 1000.0
-    end_km = (e_ch * dx) / 1000.0
+    end_km = ((e_ch - 1) * dx) / 1000.0
 
     # 3. Compute PSD
     freqs, psd_values = signal.welch(data_section, fs=fs, nperseg=nperseg, axis=1)
@@ -341,12 +342,111 @@ def plot_das_psd(
         plt.ylim(ylim)
 
     # 7. Formatting
-    title_str = f'Mean PSD (Chans {s_ch}-{e_ch} | {start_km:.2f}-{end_km:.2f} km)'
-    plt.title(title_str)
+    if title is not None:
+        plt.title(title)
+    else:
+        title_str = f'Mean PSD (Chans {s_ch}-{e_ch} | {start_km:.2f}-{end_km:.2f} km)'
+        plt.title(title_str)
+        
     plt.xlabel('Frequency (Hz)')
     plt.ylabel(ylabel)
     plt.grid(True, which="both", ls="-", alpha=0.2)
 
+    plt.tight_layout()
+    plt.show()
+
+def plot_das_psd_2d(
+    data: np.ndarray, 
+    fs: float, 
+    dx: float, 
+    start_chan: int = 0, 
+    end_chan: int | None = None, 
+    nperseg: int = 4096,
+    flim: Tuple[float, float] | None = (0.0, 25.0),
+    pclip: Tuple[float, float] = (5.0, 95.0),
+    cmap: str = "jet",
+    figsize: Tuple[float, float] = (12, 6),
+    title: str | None = None
+) -> None:
+    """
+    Plots the 2D Space-Frequency Power Spectral Density (PSD) spectrogram 
+    to analyze localized spatial variations in noise across the DAS array.
+    
+    :param data: 2D array (Channels x Samples) of raw or continuous DAS data.
+    :param fs: Sampling frequency in Hz.
+    :param dx: Spatial channel spacing in meters.
+    :param start_chan: First channel index to include. Default is 0.
+    :param end_chan: Last channel index to include. If None, uses all remaining channels.
+    :param nperseg: Segment length for Welch's method. Higher values yield finer 
+                    frequency resolution but higher variance. Default is 4096.
+    :param flim: Frequency limits (min, max) in Hz for the Y-axis. Restricts the 
+                 computation and plotting to this band of interest. Default is (0.0, 25.0).
+    :param pclip: Percentiles (min, max) used to dynamically calculate the colormap 
+                  clipping limits, effectively dropping extreme outliers. Default is (5.0, 95.0).
+    :param cmap: Matplotlib colormap to use. Default is "jet".
+    :param figsize: Figure dimensions. Default is (12, 6).
+    :param title: Optional custom title for the plot. If None, auto-generates based on channels.
+    """
+    # 1. Handle Channel Slicing
+    s_ch = max(0, start_chan)
+    if end_chan is None:
+        e_ch = data.shape[0]
+    else:
+        e_ch = min(end_chan, data.shape[0])
+
+    data_section = data[s_ch:e_ch, :]
+
+    # 2. Create Spatial Axis (converted to kilometers for clean plotting)
+    x_axis_km = np.arange(s_ch, e_ch) * dx / 1000.0
+
+    # 3. Compute PSD using Welch's method
+    freqs, psd_values = signal.welch(data_section, fs=fs, nperseg=nperseg, axis=1)
+
+    # 4. Convert to Decibels (dB), adding a tiny epsilon to avoid log(0)
+    power_db = 10 * np.log10(psd_values + 1e-12)
+
+    # 5. Apply Frequency Mask (Y-axis bounds)
+    if flim is not None:
+        fmin, fmax = flim
+        freq_mask = (freqs >= fmin) & (freqs <= fmax)
+        freqs_plot = freqs[freq_mask]
+        power_plot = power_db[:, freq_mask]
+    else:
+        freqs_plot = freqs
+        power_plot = power_db
+        fmin, fmax = freqs[0], freqs[-1]
+
+    # 6. Calculate Dynamic Color Limits (Z-axis bounds)
+    vmin = np.percentile(power_plot, pclip[0])
+    vmax = np.percentile(power_plot, pclip[1])
+
+    # 7. Create Meshgrid and Plot
+    X, Y = np.meshgrid(x_axis_km, freqs_plot)
+
+    plt.figure(figsize=figsize)
+    
+    # Transpose power_plot (.T) so axes align: (len(freqs_plot), len(channels))
+    # Uses gouraud shading to prevent blocky artifacts in the spectrogram output
+    mesh = plt.pcolormesh(X, Y, power_plot.T, cmap=cmap, shading='gouraud', vmin=vmin, vmax=vmax)
+
+    # 8. Formatting
+    plt.colorbar(mesh, label='Power Spectral Density (dB/Hz)')
+    plt.ylim(fmin, fmax)
+    plt.xlim(x_axis_km[0], x_axis_km[-1])
+    
+    plt.xlabel('Distance along cable (km)')
+    plt.ylabel('Frequency (Hz)')
+    
+    start_km = (s_ch * dx) / 1000.0
+    end_km = ((e_ch - 1) * dx) / 1000.0
+    
+    if title is not None:
+        plt.title(title, pad=15)
+    else:
+        title_str = f'DAS Space-Frequency PSD (Chans {s_ch}-{e_ch} | {start_km:.2f}-{end_km:.2f} km)'
+        plt.title(title_str, pad=15)
+
+    plt.grid(True, which='both', color='white', linestyle='--', alpha=0.3)
     plt.tight_layout()
     plt.show()
 
@@ -363,7 +463,7 @@ def animate_ncf_section_mesh(
     clip: float | None = 0.05,
     pclip: float | None = None,
     cmap: str = "seismic",
-    gauge_length: float = 8.16,
+    dx: float = 8.16,
     range_m: float = 500.0,
     clip_lim: bool = True,
     interval_ms: int = 200,
@@ -392,7 +492,7 @@ def animate_ncf_section_mesh(
     :param pclip: Percentile for dynamic amplitude clipping (e.g., 99.0). If provided, computes 
                   a global median percentile across all frames for stable animation scaling.
     :param cmap: Matplotlib colormap to use. Default is "seismic".
-    :param gauge_length: Physical distance between adjacent channels (in meters). Default is 8.16.
+    :param dx: Spatial distance between adjacent channels (in meters). Default is 8.16.
     :param range_m: Spatial window size (in meters) to display around the active virtual source. 
                     Only applied if `clip_lim=True`.
     :param clip_lim: If True, dynamically updates the x-axis limits to track the active virtual 
@@ -470,7 +570,7 @@ def animate_ncf_section_mesh(
     if mode == "acausal": data0 = data0[:, order]
 
     mesh = ax.pcolormesh(plot_distance, y, data0.T, shading="gouraud", cmap=cmap, vmin=-c0, vmax=c0)
-    pos0_plot = (int(parsed[0][2]) * gauge_length) / dist_scale
+    pos0_plot = (int(parsed[0][2]) * dx) / dist_scale
     vline = ax.axvline(x=pos0_plot, color="black", linestyle="--", linewidth=1.2, alpha=0.6)
     
     fig.colorbar(mesh, ax=ax, label="Correlation amplitude")
@@ -487,7 +587,7 @@ def animate_ncf_section_mesh(
         if mode == "acausal": data = data[:, order]
 
         mesh.set_array(data.T.ravel())
-        pos_plot = (int(vs) * gauge_length) / dist_scale
+        pos_plot = (int(vs) * dx) / dist_scale
         vline.set_xdata([pos_plot, pos_plot])
 
         if clip_lim:
@@ -513,7 +613,7 @@ def animate_directional_ncf_section_mesh(
     clip: float | None = 0.05,
     pclip: float | None = None,
     cmap: str = "seismic",
-    gauge_length: float = 8.16,
+    dx: float = 8.16,
     range_m: float = 500.0,
     clip_lim: bool = True,
     view_side: Literal["both", "left", "right"] = "both",  
@@ -543,7 +643,7 @@ def animate_directional_ncf_section_mesh(
     :param pclip: Percentile for dynamic amplitude clipping (e.g., 99.0). Computes a global median 
                   percentile across all frames for stable animation scaling.
     :param cmap: Matplotlib colormap to use. Default is "seismic".
-    :param gauge_length: Physical distance between adjacent channels (in meters). Default is 8.16.
+    :param dx: Spatial distance between adjacent channels (in meters). Default is 8.16.
     :param range_m: Spatial window size (in meters) to display around the active virtual source. 
                     Only applied if `clip_lim=True`.
     :param clip_lim: If True, dynamically updates the x-axis limits to track the active virtual 
@@ -579,7 +679,7 @@ def animate_directional_ncf_section_mesh(
     def process_frame_data(path: str, vs_str: str) -> Tuple[np.ndarray, np.ndarray]:
         ncf_raw = np.load(path)
         if ncf_raw.shape == (lag_axis.size, distance_axis.size): ncf_raw = ncf_raw.T 
-        ncf_c, ncf_a, new_lag, s1, s2 = prep_ncf(ncf_raw, lag_axis, distance_axis, vs=vs_str, gauge_length=gauge_length)
+        ncf_c, ncf_a, new_lag, s1, s2 = prep_ncf(ncf_raw, lag_axis, distance_axis, vs=vs_str, dx=dx)
         return {"causal": ncf_c, "acausal": ncf_a, "s1": s1, "s2": s2}[target], new_lag
 
     if pclip is not None:
@@ -594,7 +694,7 @@ def animate_directional_ncf_section_mesh(
 
     data0, new_lag_axis = process_frame_data(parsed[0][0], parsed[0][2])
     mesh = ax.pcolormesh(plot_distance, new_lag_axis, data0.T, shading="gouraud", cmap=cmap, vmin=-c0, vmax=c0)
-    pos0_plot = (int(parsed[0][2]) * gauge_length) / dist_scale
+    pos0_plot = (int(parsed[0][2]) * dx) / dist_scale
     vline = ax.axvline(x=pos0_plot, color="black", linestyle="--", linewidth=1.2, alpha=0.6)
     fig.colorbar(mesh, ax=ax, label="Correlation amplitude")
     
@@ -607,7 +707,7 @@ def animate_directional_ncf_section_mesh(
         data, _ = process_frame_data(path, vs)
         mesh.set_array(data.T.ravel())
 
-        pos_plot = (int(vs) * gauge_length) / dist_scale
+        pos_plot = (int(vs) * dx) / dist_scale
         vline.set_xdata([pos_plot, pos_plot])
 
         if clip_lim:
@@ -735,7 +835,7 @@ def animate_preprocessed_ncf(
         current_offset = archive['offset'] / dist_scale
         lag_axis = archive['lag']
         
-        # --- CRITICAL FIX FOR VARIABLE GEOMETRY ---
+
         mesh.remove()
         mesh = ax.pcolormesh(current_offset, lag_axis, dA, shading="gouraud", cmap=cmap, vmin=-c0, vmax=c0)
         # ------------------------------------------
@@ -900,7 +1000,6 @@ def animate_preprocessed_fk(
         k_axis, f_axis, fk_power = process_fk_frame(path)
         plot_k = k_axis * dist_scale
         
-        # --- CRITICAL FIX: Redraw dynamic mesh ---
         mesh.remove()
         mesh = ax.pcolormesh(plot_k, f_axis, fk_power/c0, shading="gouraud", cmap=cmap, vmin=0, vmax=1.0)
         # -----------------------------------------
