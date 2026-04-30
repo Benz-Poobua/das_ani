@@ -18,6 +18,7 @@ import psutil
 import re
 import time
 import torch
+import zarr
 
 import numpy as np
 
@@ -28,38 +29,68 @@ from scipy.fft import fft2, fftshift, ifft2, ifftshift
 
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, TypeVar, Tuple, Union, overload, Literal
 
-
 logger = logging.getLogger(__name__)
 
 PathLike = Union[str, os.PathLike[str], Path]
-ArrayLike = Union[np.ndarray, torch.Tensor, list, tuple]
+ArrayLike = Union[np.ndarray, torch.Tensor, list, tuple, zarr.Array]
 T = TypeVar("T")
 F = TypeVar("F", bound=Callable[..., Any])
 
 # ==============================================================
+# 0. HPC Diagnostics Helpers
+# ==============================================================
+def _get_cpu_mem_available() -> int:
+    """
+    Safely calculates available CPU memory, respecting SLURM cgroup allocations.
+    psutil.virtual_memory() reports the whole node's memory, which causes OOM 
+    kills on shared HPC systems if the script overestimates its boundary.
+    """
+    sys_avail = int(psutil.virtual_memory().available)
+    
+    slurm_mem_mb = os.environ.get("SLURM_MEM_PER_NODE")
+    if slurm_mem_mb:
+        # SLURM total allocation in bytes
+        slurm_total_bytes = int(slurm_mem_mb) * 1024 * 1024
+        # Current RSS used by this specific python process
+        process_used = psutil.Process(os.getpid()).memory_info().rss
+        # True available memory inside the SLURM container
+        slurm_avail = max(0, slurm_total_bytes - process_used)
+        
+        # Return the stricter of the two limits
+        return min(sys_avail, slurm_avail)
+        
+    return sys_avail
+
+# ==============================================================
 # 1. Load data
 # ==============================================================
-def load_data(filepath: PathLike, mmap: bool = False) -> tuple[Any, np.ndarray, float, int, float]:
+def load_data(filepath: PathLike, mmap: bool = False) -> tuple[Any, ArrayLike, float, int, float]:
     """
-    Load DAS waveform data from a .npz file containing keys 'data' and 'dt'.
+    Load DAS waveform data from either a .npz archive or a .zarr directory.
 
-    :param filepath: Path to the `.npz` file.
-    :param mmap: If True, use memory-mapped IO via np.load(..., mmap_mode='r').
+    :param filepath: Path to the `.npz` file or `.zarr` folder.
+    :param mmap: If True, use memory-mapped IO. For Zarr, this is native.
 
-    :return: (data_dict, das_array, dt, N, T)
+    :return: (data_source, das_array, dt, N, T)
     """
     path = Path(filepath).expanduser()
 
     logger.info("[load_data] utils at: %s", __file__)
-    logger.info("Loading file: %s (mmap=%s)", path, mmap)
+    logger.info("Loading dataset: %s (mmap requested=%s)", path, mmap)
 
-    data_dict = np.load(path, mmap_mode='r' if mmap else None)
-
-    if "data" not in data_dict or "dt" not in data_dict:
-        raise KeyError("NPZ file must contain 'data' and 'dt'.")
-    
-    das_array = data_dict["data"]       # may be np.memmap if mmap=True
-    dt = float(data_dict["dt"])         # sampling interval (seconds)
+    if path.suffix == '.zarr':
+        z_root = zarr.open_group(str(path), mode='r')
+        das_array = z_root['data']
+        dt = float(das_array.attrs['dt'])
+        data_source = z_root
+    else:
+        # Fallback to legacy NPZ
+        data_source = np.load(path, mmap_mode='r' if mmap else None)
+        if "data" not in data_source or "dt" not in data_source:
+            raise KeyError("NPZ file must contain 'data' and 'dt'.")
+        
+        das_array = data_source["data"]
+        dt = float(data_source["dt"])
 
     if das_array.ndim != 2:
         raise ValueError(f"'data' must be 2D (nch × nt); got shape={das_array.shape}")
@@ -68,7 +99,7 @@ def load_data(filepath: PathLike, mmap: bool = False) -> tuple[Any, np.ndarray, 
     duration = n_samples * dt
 
     logger.info("DAS loaded: shape=%s, dt=%s", das_array.shape, dt)
-    return data_dict, das_array, dt, n_samples, duration
+    return data_source, das_array, dt, n_samples, duration
 
 # ==============================================================
 # 2. Tensor / Numpy conversions
@@ -81,7 +112,7 @@ def convert_to_tensor(
     """
     Convert input to PyTorch tensor on a specified device.
 
-    :param x: Input array/tensor.
+    :param x: Input array/tensor/zarr.
     :param device: Target device. If None, auto-select cuda if available else cpu.
     :param dtype: Optional dtype override. If None, uses float32 or complex64 based on input.
 
@@ -91,7 +122,6 @@ def convert_to_tensor(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     if isinstance(x, torch.Tensor):
-        # Respect dtype override if provided; else keep original
         out = x
         if dtype is not None and out.dtype != dtype:
             out = out.to(dtype=dtype)
@@ -99,11 +129,15 @@ def convert_to_tensor(
             out = out.to(device)
         return out
     
-    arr = np.asarray(x)
+    # Materialize Zarr arrays to numpy before tensor conversion
+    if isinstance(x, zarr.Array):
+        arr = x[:]
+    else:
+        arr = np.asarray(x)
+        
     if dtype is None:
         dtype = torch.complex64 if np.iscomplexobj(arr) else torch.float32
 
-    # torch.as_tensor is zero-copy for CPU numpy arrays when possible
     out = torch.as_tensor(arr)
     if out.dtype != dtype:
         out = out.to(dtype=dtype)
@@ -120,6 +154,8 @@ def convert_to_numpy(x: ArrayLike) -> np.ndarray:
     """
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
+    if isinstance(x, zarr.Array):
+        return x[:]
     return np.asarray(x)
 
 # ==============================================================
@@ -519,7 +555,8 @@ def auto_np_pair_chunk(
         free_bytes, _ = torch.cuda.mem_get_info()
         avail = int(free_bytes)
     else:
-        avail = int(psutil.virtual_memory().available)
+        # Utilize the SLURM-safe memory check
+        avail = _get_cpu_mem_available()
 
     # Divide by workers so total across processes respects frac_mem
     nworkers = max(1, int(nworkers))
@@ -680,11 +717,6 @@ def parse_ncf_stack_filename(fname: str) -> Tuple[str, str, str, str]:
     """
     base = os.path.basename(fname)
     
-    # 1. (.+?)     -> Captures any date or prefix before '_cc_'
-    # 2. (\d+)     -> Captures any number of digits for the VS index (0, 000, 3191)
-    # 3. ([^_]+)   -> Captures the window string (daily, 7d, etc.)
-    # 4. (.+)      -> Captures the mode string (v1, conventional)
-    # 5. \.np[yz]$ -> Allows both .npy and compressed .npz formats
     m = re.match(r"(.+?)_cc_(\d+)_([^_]+)_(.+)\.np[yz]$", base)
     
     if m is None:

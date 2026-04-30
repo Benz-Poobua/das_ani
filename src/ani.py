@@ -4,7 +4,7 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: DAS preprocessing (Bensen et al., 2007) + cross-correlation (conventional + Zhang 2025 v1).
+:purpose: DAS preprocessing (Bensen et al., 2007) + cross-correlation (conventional + Zhang 2026 v1).
 :reference: Modified from Yan Yang (2022-07-10).
 """
 from __future__ import annotations

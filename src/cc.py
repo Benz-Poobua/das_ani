@@ -7,6 +7,7 @@
 :purpose: DAS ambient noise interferometry (ANI).
           High-performance engine for Cross-Correlation (NCF generation) 
           and Auto-Correlation (ACF generation for Coda Wave Interferometry).
+          Includes internal profiling for I/O vs Compute benchmarking.
 """
 from __future__ import annotations
 
@@ -17,13 +18,12 @@ import os
 import time
 import gc
 import multiprocessing as mp
-# from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
-
+from typing import Any, Mapping, Optional, Sequence, Dict
 
 import numpy as np
 import torch
+import zarr
 from torch import nn
 from tqdm import tqdm
 
@@ -48,11 +48,20 @@ from src.ani import preprocess, TorchCrossCorrelation, whiten_per_segment_torch
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# Global flag to ensure the PyTorch model is only initialized once per worker process.
 _WARMED_UP = False
 
 
 def _set_thread_env(threads: int) -> None:
-    # Helps avoid BLAS/OpenMP oversubscription on mac/linux.
+    """
+    Sets environment variables to strictly control the number of threads used by 
+    underlying C/C++ math libraries (BLAS, OpenMP, MKL, NumExpr). 
+    
+    This prevents catastrophic thread oversubscription and CPU thrashing when 
+    running Python's multiprocessing pool on HPC nodes like Stanford Sherlock.
+
+    :param threads: The maximum number of threads allowed per library.
+    """
     threads = max(1, int(threads))
     os.environ.setdefault("OMP_NUM_THREADS", str(threads))
     os.environ.setdefault("MKL_NUM_THREADS", str(threads))
@@ -70,8 +79,18 @@ def _worker_warmup(
     threads_per_proc: int,
 ) -> None:
     """
-    Runs ONCE per worker process.
-    Warms up torch FFT dispatch + optional v1 path.
+    Initializes the PyTorch correlation model and performs a dummy inference pass.
+    
+    Executed exactly once per worker process when the multiprocessing pool starts.
+    This hides the overhead of model instantiation, memory allocation, and PyTorch 
+    JIT/FFT dispatch compilation from the actual file processing timings.
+
+    :param mode: Cross-correlation mode ('conventional' or 'v1').
+    :param npts_seg: Number of samples per time segment.
+    :param max_lag_samples: Maximum lag to compute (in samples).
+    :param v1_fft_snap_pow2: Whether to snap the v1 algorithm FFTs to powers of two.
+    :param v1_fallback: Fallback strategy for the v1 algorithm ('v1_2M' or 'v1_Mp1').
+    :param threads_per_proc: Number of PyTorch threads allocated to this worker.
     """
     global _WARMED_UP
     if _WARMED_UP:
@@ -100,6 +119,7 @@ def _worker_warmup(
     x = torch.zeros((Bwarm, int(npts_seg)), dtype=torch.float32, device=device)
     y = torch.zeros((Bwarm, int(npts_seg)), dtype=torch.float32, device=device)
 
+    # Perform a dummy forward pass to trigger low-level library initializations
     with torch.inference_mode():
         _ = model(x, y)
         _ = model(x, y)
@@ -115,24 +135,30 @@ def _worker_warmup(
 
 
 @timeit
-def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Optional[str]:
+def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Core processing loop for a single continuous DAS file.
+    Core processing loop for a single continuous DAS array file.
     
-    Reads preprocessed array data and routes it through one of two correlation pipelines:
-    1. Auto-Correlation (auto_cc=True): O(N) complexity. Bypasses the virtual source 
-       loop and correlates every channel strictly with itself. Outputs `_auto_` files 
-       optimized for Coda Wave Interferometry (dv/v) and temporal stretching.
-    2. Cross-Correlation (auto_cc=False): O(N^2) complexity. Iterates through the 
-       defined virtual sources, broadcasting them against the array to generate 
-       full-field NCFs for structural dispersion imaging.
+    This function handles I/O operations (supporting both .npz and chunked .zarr),
+    applies preprocessing (decimation, filtering, whitening), and executes the selected
+    correlation engine. It is instrumented to track exact wall-clock times spent on
+    I/O boundaries versus compute boundaries for Amdahl's Law benchmarking.
 
-    :param file_path: Path to the raw .npz file.
-    :param cfg: Configuration dictionary loaded from cc.yaml.
-    :return: String path to the final output file, or None if skipped/failed.
+    Modes of Operation:
+        - **Auto-Correlation (auto_cc=True):** Correlates every channel with itself (O(N)).
+        - **Cross-Correlation (auto_cc=False):** Loops through virtual sources (O(N^2)).
+
+    :param file_path: Absolute or relative path to the source dataset (.npz or .zarr).
+    :param cfg: Master configuration dictionary loaded from the YAML file.
+    :return: A dictionary containing performance metrics and the output path:
+             {"out_path": str, "io_time": float, "cc_time": float, "total_time": float}.
+             Returns None if the file is skipped or invalid.
     """
-    in_path = Path(file_path).expanduser().resolve()
+    t_total_start = time.perf_counter()
+    io_time = 0.0
+    cc_time = 0.0
 
+    in_path = Path(file_path).expanduser().resolve()
     out_dir = Path(get_cfg(cfg, ["paths", "output_root"], required=True)).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -141,21 +167,16 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     frac_mem = float(get_cfg(cfg, ["runtime", "frac_mem"], 0.25))
     min_chunk = int(get_cfg(cfg, ["runtime", "min_chunk"], 64))
     max_chunk = int(get_cfg(cfg, ["runtime", "max_chunk"], 4096))
-
     do_compile = bool(get_cfg(cfg, ["runtime", "torch_compile"], False))
     compile_mode = str(get_cfg(cfg, ["runtime", "compile_mode"], "max-autotune"))
-
-    njobs = int(get_cfg(cfg, ["runtime", "njobs"], 1))
-    njobs = max(1, njobs)
+    njobs = max(1, int(get_cfg(cfg, ["runtime", "njobs"], 1)))
 
     perf_enabled = bool(get_cfg(cfg, ["perf", "enabled"], False))
     perf_out_path = str(get_cfg(cfg, ["perf", "out_path"], "./data/runlogs/perf_cc.csv"))
     log_every_vs = bool(get_cfg(cfg, ["perf", "log_every_vs"], True))
 
-    # OPTIMIZATION: Force Python to respect SLURM limits instead of hardware limits
     slurm_cores = os.environ.get("SLURM_CPUS_PER_TASK")
     ncores = int(slurm_cores) if slurm_cores else (os.cpu_count() or 1)
-    
     threads_per_proc = max(1, ncores // njobs)
     torch.set_num_threads(threads_per_proc)
 
@@ -169,7 +190,6 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     first_chan = int(get_cfg(cfg, ["data", "first_chan"], required=True))
     last_chan = int(get_cfg(cfg, ["data", "last_chan"], required=True))
     nch_expected = last_chan - first_chan + 1
-
     src_stride = int(get_cfg(cfg, ["data", "src_stride"], 10))
     min_length_sec = float(get_cfg(cfg, ["data", "min_length_sec"], 60.0))
     min_npts = int(min_length_sec * fs_raw)
@@ -185,9 +205,9 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     window_freq_hz = float(get_cfg(cfg, ["xcorr", "window_freq_hz"], 0.0))
     max_lag_sec = float(get_cfg(cfg, ["xcorr", "max_lag_sec"], 4.0))
     xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec"], 8.0))
-
     mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
-    auto_cc = bool(get_cfg(cfg, ["xcorr", "auto_cc"], False)) 
+    auto_cc = bool(get_cfg(cfg, ["xcorr", "auto_cc"], False))
+
     if mode not in {"conventional", "v1"}:
         raise ValueError(f"xcorr.mode must be 'conventional' or 'v1'; got {mode}")
     if mode == "v1":
@@ -217,14 +237,28 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
 
-    _, data_raw, dt, N, T = load_data(in_path, mmap=mmap)
-    nch, npts = data_raw.shape
-    basename = in_path.name
+    # ==========================================================
+    # 1. DATA INGESTION (I/O BOUNDARY)
+    # ==========================================================
+    t_io_start = time.perf_counter()
+
+    _, das_array, dt, npts, _ = load_data(in_path, mmap=mmap)
+    
+    if isinstance(das_array, zarr.Array):
+        # Extract full Zarr chunk to RAM for consistent math baseline comparison
+        data_raw = das_array[:]
+    else:
+        # Standard NumPy array
+        data_raw = das_array
+
+    nch = data_raw.shape[0]
+    
+    io_time += (time.perf_counter() - t_io_start)
+    basename = in_path.name.replace('.zarr', '').replace('.npz', '')
 
     if nch != nch_expected:
         raise ValueError(f"Data shape mismatch in {in_path}: expected {nch_expected} channels, got {nch}")
     if npts < min_npts:
-        logger.warning("Skipping %s because npts=%d < min_npts=%d", in_path, npts, min_npts)
         return None
 
     logger.info(
@@ -232,6 +266,9 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         mode, npts_seg, npts_lag, cc_out_len
     )
 
+    # ==========================================================
+    # 2. PREPROCESSING
+    # ==========================================================
     data_proc = preprocess(data_raw, fs_raw, f1, f2, decimation, diff, ram_win_sec).astype(np.float32, copy=False)
     npts_proc = int(data_proc.shape[1])
 
@@ -246,8 +283,8 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
 
     data_proc = data_proc[:, :npts_new]
     flag_mean = int(nseg)
-
     prewhiten = bool(is_spectral_whitening)
+
     nyq_proc = fs_proc / 2.0
     if not (0.0 < f1 < f2 < nyq_proc):
         raise ValueError(f"Whitening band invalid after decimation: f1={f1}, f2={f2}, Nyquist={nyq_proc}")
@@ -287,10 +324,8 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         data_tensor = data_tensor.to(device, non_blocking=True)
 
     if mode == "conventional":
-        L_full = 2 * npts_seg - 1
-        center = npts_seg - 1
-        lag_start = center - npts_lag
-        lag_end = center + npts_lag + 1
+        lag_start = (npts_seg - 1) - npts_lag
+        lag_end = (npts_seg - 1) + npts_lag + 1
     else:
         lag_start = lag_end = 0
 
@@ -338,17 +373,25 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     last_out: Optional[Path] = None
     vs_bar = tqdm(src_ch_all, desc=f"VS {basename}", leave=True)
 
+    # ==========================================================
+    # 3. CORRELATION ENGINE (COMPUTE BOUNDARY)
+    # ==========================================================
     if auto_cc:
-        # ==========================================================
+        # ----------------------------------------------------------
         # AUTO-CORRELATION MODE (O(N) Complexity)
         # Bypasses the VS loop. Correlates every channel with itself.
-        # ==========================================================
-        out_path = out_dir / basename.replace(".npz", f"_auto_{mode}.npy")
+        # ----------------------------------------------------------
+        out_path = out_dir / f"{basename}_auto_{mode}.npy"
         expected_shape = (nch, cc_out_len)
 
         if check_existing_output(out_path, expected_shape):
             logger.info("Auto-CC already exists, skipping: %s", out_path)
-            return str(out_path)
+            return {
+                "out_path": str(out_path),
+                "io_time": io_time,
+                "cc_time": 0.0,
+                "total_time": time.perf_counter() - t_total_start
+            }
         
         write_runlog(f"Start Auto-CC: {gpu_memory() or ''} | {cpu_memory()}")
 
@@ -356,19 +399,16 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         nchunk = int(np.ceil(nch / npair_chunk))
         ccall = np.zeros((nch, cc_out_len), dtype=np.float32)
 
-        t0 = time.perf_counter()
-
+        t_cc_start = time.perf_counter()
         for ichunk in range(nchunk):
             start_idx = npair_chunk * ichunk
             end_idx = min(start_idx + npair_chunk, nch)
             batch_len = end_idx - start_idx
 
-            # Extract chunk and flatten segments
             full_data = data_tensor[start_idx:end_idx, :].contiguous()
             data_in = full_data.view(batch_len * nseg, npts_seg)
 
             with torch.inference_mode():
-                # Feed the exact same data into both ports of the correlation engine
                 cc_chunk = model(data_in, data_in)
 
             cc_sum_t = cc_chunk.reshape(batch_len, nseg, -1).sum(dim=1)
@@ -379,19 +419,24 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
                 ccall[start_idx:end_idx, :] += cc_sum_t.cpu().numpy()
 
         ccall /= float(flag_mean)
+        cc_time += (time.perf_counter() - t_cc_start)
+
+        t_io_start = time.perf_counter()
         np.save(out_path, ccall)
-        
-        logger.info(f"Auto-CC complete in {time.perf_counter() - t0:.2f}s")
+        io_time += (time.perf_counter() - t_io_start)
+
         last_out = out_path
+        
+        logger.info(f"Auto-CC complete in {time.perf_counter() - t_cc_start:.2f}s")
 
     else:
-        # ==========================================================
+        # ----------------------------------------------------------
         # CROSS-CORRELATION MODE (O(N^2) Complexity)
         # Original VS loop for structural dispersion imaging.
-        # ==========================================================
+        # ----------------------------------------------------------
         for src_idx in vs_bar:
             src_idx = int(src_idx)
-            out_path = out_dir / basename.replace(".npz", f"_cc_{src_idx:03d}_{mode}.npy")
+            out_path = out_dir / f"{basename}_cc_{src_idx:03d}_{mode}.npy"
             expected_shape = (nch, cc_out_len)
 
             if check_existing_output(out_path, expected_shape) or (src_idx in completed_src):
@@ -409,6 +454,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             src_trace = data_tensor[src_idx : src_idx + 1, :]
             t_vs0 = time.perf_counter()
 
+            t_cc_start = time.perf_counter()
             for ichunk in range(nchunk):
                 start_idx = npair_chunk * ichunk
                 end_idx = min(start_idx + npair_chunk, npair)
@@ -434,7 +480,11 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
                     ccall[start_idx:end_idx, :] += cc_sum_t.cpu().numpy()
 
             ccall /= float(flag_mean)
+            cc_time += (time.perf_counter() - t_cc_start)
+
+            t_io_start = time.perf_counter()
             np.save(out_path, ccall)
+            io_time += (time.perf_counter() - t_io_start)
 
             t_vs1 = time.perf_counter()
             if perf_enabled and log_every_vs:
@@ -459,14 +509,33 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             save_resume_state(meta_path, completed_src)
             last_out = out_path
 
-    return str(last_out) if last_out is not None else None
+    return {
+        "out_path": str(last_out) if last_out else None,
+        "io_time": io_time,
+        "cc_time": cc_time,
+        "total_time": time.perf_counter() - t_total_start
+    }
 
-def _process_unpack(args):
-    """Helper to unpack tuple arguments for imap_unordered."""
+def _process_unpack(args: tuple) -> Optional[Dict[str, Any]]:
+    """
+    Helper function to unpack tuple arguments for the multiprocessing map functions.
+
+    :param args: A tuple containing (file_path, cfg).
+    :return: The result dictionary from process_single_file.
+    """
     return process_single_file(*args)
 
 @timeit
 def main(config_path: str | Path) -> None:
+    """
+    Main orchestration function for the cross-correlation pipeline.
+
+    Reads the YAML configuration, discovers target data files, configures the 
+    multiprocessing pool to respect SLURM CPU allocations, and maps the 
+    processing routine across all files.
+
+    :param config_path: Path to the YAML configuration file.
+    """
     cfg = load_config(config_path)
 
     data_root = Path(get_cfg(cfg, ["paths", "data_root"], required=True)).expanduser().resolve()
@@ -474,19 +543,20 @@ def main(config_path: str | Path) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
 
     njobs = max(1, int(get_cfg(cfg, ["runtime", "njobs"], 4)))
-
     mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
 
-    filelist = sorted(data_root.rglob("*.npz"))
-    logger.info("Found %d files in %s", len(filelist), data_root)
+    # Safely find .npz files and .zarr directories (preventing nested sub-file errors)
+    npz_files = [p for p in data_root.rglob("*.npz") if p.is_file()]
+    zarr_dirs = [p for p in data_root.rglob("*.zarr") if p.is_dir()]
+    filelist = sorted(npz_files + zarr_dirs)
+    
+    logger.info("Found %d valid datasets in %s", len(filelist), data_root)
     if not filelist:
         logger.error("No input files found in %s", data_root)
         return
 
-    # OPTIMIZATION: Force Python to respect SLURM limits instead of hardware limits
     slurm_cores = os.environ.get("SLURM_CPUS_PER_TASK")
     ncores = int(slurm_cores) if slurm_cores else (os.cpu_count() or 1)
-    
     threads_per_proc = max(1, ncores // njobs)
 
     fs_raw = float(get_cfg(cfg, ["data", "fs_raw"], required=True))
@@ -514,35 +584,31 @@ def main(config_path: str | Path) -> None:
         threads_per_proc=threads_per_proc,
     )
 
-    # old version: 
-    # with ProcessPoolExecutor(max_workers=njobs, initializer=initializer) as executor:
-    #     futures = [executor.submit(process_single_file, str(fpath), cfg) for fpath in filelist]
-
-    #     for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
-    #         try:
-    #             result = fut.result()
-    #             if result:
-    #                 logger.info("Done: %s", result)
-    #         except Exception:
-    #             logger.exception("Error processing file")
-    #             write_runlog("Error: see stderr/logs for traceback.")
 
     logger.info("Starting multiprocessing.Pool with maxtasksperchild=1")
     with mp.Pool(processes=njobs, initializer=initializer, maxtasksperchild=1) as pool:
-        # Pack the arguments into a tuple for the unpacker
         task_args = [(str(fpath), cfg) for fpath in filelist]
         
-        # OPTIMIZATION: Use imap_unordered so tqdm updates in real-time after every file finishes
         try:
-            for result in tqdm(pool.imap_unordered(_process_unpack, task_args, chunksize=1), total=len(filelist), desc="Processing files"):
-                if result:
-                    logger.info("Done: %s", result)
+            for result_dict in tqdm(pool.imap_unordered(_process_unpack, task_args, chunksize=1), total=len(filelist), desc="Processing"):
+                if result_dict and result_dict.get("out_path"):
+                    logger.info("Done: %s | Total: %.2fs (I/O: %.2fs, CC: %.2fs)", 
+                                Path(result_dict["out_path"]).name, 
+                                result_dict["total_time"], 
+                                result_dict["io_time"], 
+                                result_dict["cc_time"])
         except Exception:
             logger.exception("Error processing file")
             write_runlog("Error: see stderr/logs for traceback.")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """
+    Parses command line arguments.
+
+    :param argv: Optional list of command line arguments (defaults to sys.argv).
+    :return: Parsed arguments namespace.
+    """
     parser = argparse.ArgumentParser(description="DAS ambient noise cross-correlation processing pipeline")
     parser.add_argument("--config", type=str, required=True, help="Path to config file (.yaml/.yml/.json)")
     parser.add_argument("--verbose", action="store_true", help="Enable debug/verbose logging output")
