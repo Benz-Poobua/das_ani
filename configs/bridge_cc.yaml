@@ -3,9 +3,8 @@
 # Target: Structural Guided Waves (1.0 - 50.0 Hz) 
 # =============================================================================
 paths:
-  data_root: ./data/raw_bridge
-  output_root: ./data/ncf_raw_bridge
-
+  data_root: ./data/raw_bridge #_zarr
+  output_root: ./data/ncf_raw_bridge #_zarr
 runtime:
   njobs: 8
   use_gpu: false
@@ -33,7 +32,7 @@ preprocess:
 
 xcorr:
   # method switch
-  mode: conventional # conventional or v1
+  mode: v1 # conventional or v1
   auto_cc: false      # set to true for Coda Wave Interferometry (ACF)
 
 

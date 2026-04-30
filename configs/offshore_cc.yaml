@@ -4,9 +4,9 @@
 # =============================================================================
 
 paths:
-  data_root: ./data/raw_offshore
-  output_root: ./data/ncf_raw_offshore
-
+  data_root: ./data/raw_offshore #_zarr
+  output_root: ./data/ncf_raw_offshore #_zarr
+ 
 runtime:
   njobs: 4
   use_gpu: false

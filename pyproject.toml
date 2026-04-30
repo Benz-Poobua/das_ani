@@ -23,6 +23,7 @@ dependencies = [
   "tqdm>=4.66",
   "psutil>=5.9",
   "pyyaml>=6.0",
+  "zarr>=2.14",
 
   # torch is platform-specific (CPU/CUDA/MPS)
   "torch>=2.1",

@@ -4,8 +4,8 @@
 # =============================================================================
 
 paths:
-  data_root: ./data/preprocessed
-  output_root: ./data/ncf_raw
+  data_root: ./data/preprocessed #_zarr
+  output_root: ./data/ncf_raw #_zarr
 
 runtime:
   njobs: 4
