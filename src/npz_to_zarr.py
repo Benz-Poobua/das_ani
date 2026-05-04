@@ -27,7 +27,6 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler("conversion_history.log"), 
         logging.StreamHandler()                        
     ]
 )
@@ -151,4 +150,4 @@ if __name__ == "__main__":
     convert_folder(args.folder, config_path=args.config)
 
 # Example
-# python -m src.npz_to_zarr raw_bridge --config configs/bridge_cc.yaml
+# python -m src.npz_to_zarr raw_offshore --config configs/offshore_cc.yaml
