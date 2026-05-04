@@ -13,9 +13,11 @@ import os
 import numpy as np
 
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
 from matplotlib import rcParams
 from matplotlib.animation import FuncAnimation
 
+from pathlib import Path
 from tqdm.auto import tqdm
 from typing import Tuple, List, Literal, Callable, Any
 from scipy import signal
@@ -449,6 +451,149 @@ def plot_das_psd_2d(
     plt.grid(True, which='both', color='white', linestyle='--', alpha=0.3)
     plt.tight_layout()
     plt.show()
+
+def animate_das_comparison(
+    file_paths: List[str],
+    fs: float,
+    dx: float,
+    start_sec: float = 0.0,
+    duration_sec: float | None = None,
+    start_chan: int = 0,
+    end_chan: int | None = None,
+    pclip: float = 98.0,
+    nperseg: int = 4096,
+    flim: Tuple[float, float] = (0.1, 15.0),
+    psd_ylim: Tuple[float, float] | None = (0, 70),
+    clabel: str = "Amplitude",  
+    figsize: Tuple[float, float] = (20, 6),
+    interval: int = 1000
+) -> animation.FuncAnimation:
+    """
+    Generates a synchronized 3-panel animation of DAS data with dedicated colorbars for 
+    spatial and spectral intensity tracking. Designed for monitoring transient 
+    cryosphere events like rapid sea ice refreezing.
+
+    The dashboard panels include:
+    1. DAS Wavefield: Space-time plot (Distance vs. Time) with a customizable colorbar label.
+    2. Mean PSD: 1D frequency-domain line plot averaged across the selected spatial window.
+    3. Space-Frequency PSD: 2D spectrogram (Frequency vs. Distance) with a 'PSD (dB/Hz)' colorbar.
+
+    All frames undergo automatic demeaning and linear detrending along the time axis 
+    to remove low-frequency drift before computation.
+
+    :param file_paths: Sequence of paths to the .npz data files to be animated.
+    :type file_paths: List[str]
+    :param fs: Sampling frequency of the DAS interrogator in Hz.
+    :type fs: float
+    :param dx: Spatial channel spacing in meters.
+    :type dx: float
+    :param start_sec: Temporal offset from the beginning of each file in seconds. Default 0.0.
+    :type start_sec: float, optional
+    :param duration_sec: Length of the time window to analyze (seconds). If None, uses full file.
+    :type duration_sec: float | None, optional
+    :param start_chan: Minimum channel index for the spatial slice. Default 0.
+    :type start_chan: int, optional
+    :param end_chan: Maximum channel index for the spatial slice. If None, uses all channels.
+    :type end_chan: int | None, optional
+    :param pclip: Percentile (0-100) for symmetric wavefield color clipping. Default 98.0.
+    :type pclip: float, optional
+    :param nperseg: Segment length for Welch's PSD estimation. Higher values improve frequency resolution.
+    :type nperseg: int, optional
+    :param flim: Frequency range (min, max) in Hz for the PSD-related axes. Default (0.1, 15.0).
+    :type flim: Tuple[float, float], optional
+    :param psd_ylim: Fixed Y-axis limits (dB) for the 1D PSD plot. Set to None for auto-scaling.
+    :type psd_ylim: Tuple[float, float] | None, optional
+    :param clabel: Label for the wavefield colorbar (e.g., 'Nano strain rate'). Default "Amplitude".
+    :type clabel: str, optional
+    :param figsize: Figure dimensions in inches. Default (20, 6).
+    :type figsize: Tuple[float, float], optional
+    :param interval: Frame delay in milliseconds. Default 1000.
+    :type interval: int, optional
+    :returns: A Matplotlib FuncAnimation object.
+    :rtype: matplotlib.animation.FuncAnimation
+    """
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=figsize, layout="constrained")
+    
+    # Initialize "placeholder" colorbars outside the loop
+    # We use a dummy array so we can establish the cbar objects early
+    dummy = np.zeros((10, 10))
+    im1 = ax1.imshow(dummy, cmap='seismic', extent=[0, 1, 0, 1])
+    cbar1 = fig.colorbar(im1, ax=ax1, location='right', shrink=0.8)
+    cbar1.set_label(clabel)
+
+    im3 = ax3.pcolormesh(dummy, cmap='jet', shading='gouraud')
+    cbar3 = fig.colorbar(im3, ax=ax3, location='right', shrink=0.8)
+    cbar3.set_label('PSD (dB/Hz)')
+
+    pbar = tqdm(total=len(file_paths), desc="Rendering Frames")
+    
+    def update(file_path):
+        # Clear main axes, but DO NOT clear the figure or cbars
+        ax1.clear()
+        ax2.clear()
+        ax3.clear()
+            
+        # 1. Load and Preprocess
+        data_dict = np.load(file_path)
+        data_detrended = signal.detrend(data_dict['data'], type='linear', axis=1)
+        
+        # 2. Slice Data
+        start_sample = int(start_sec * fs)
+        end_sample = int((start_sec + duration_sec) * fs) if duration_sec else data_detrended.shape[1]
+        s_ch, e_ch = start_chan, (end_chan if end_chan is not None else data_detrended.shape[0])
+        subset = data_detrended[s_ch:e_ch, start_sample:end_sample]
+        
+        # 3. Axes Setup
+        t_axis = np.arange(start_sample, end_sample) / fs
+        x_axis_km = np.arange(s_ch, e_ch) * dx / 1000.0
+        
+        # --- Panel 1: DAS Wavefield ---
+        clip = np.percentile(np.abs(subset), pclip)
+        curr_im1 = ax1.imshow(
+            subset, aspect='auto', cmap='seismic', vmin=-clip, vmax=clip,
+            extent=[t_axis[0], t_axis[-1], x_axis_km[-1], x_axis_km[0]]
+        )
+        # Update the existing colorbar's range to match the new image
+        cbar1.update_normal(curr_im1) 
+        
+        ax1.set_title(f"Wavefield: {Path(file_path).name}")
+        ax1.set_xlabel("Time [s]")
+        ax1.set_ylabel("Distance [km]")
+
+        # --- Panel 2: Mean PSD (1D) ---
+        freqs, psd_values = signal.welch(subset, fs=fs, nperseg=nperseg, axis=1)
+        mean_psd_db = 10 * np.log10(np.mean(psd_values, axis=0) + 1e-12)
+        ax2.plot(freqs, mean_psd_db, color='black', lw=1)
+        ax2.set(xscale='log', xlim=flim)
+        if psd_ylim: ax2.set_ylim(psd_ylim)
+        ax2.set_title("Mean PSD")
+        ax2.set_xlabel("Frequency [Hz]")
+        ax2.set_ylabel("PSD (dB)")
+        ax2.grid(True, which='both', alpha=0.2)
+
+        # --- Panel 3: Space-Frequency PSD (2D) ---
+        power_db = 10 * np.log10(psd_values + 1e-12)
+        f_mask = (freqs >= flim[0]) & (freqs <= flim[1])
+        X, Y = np.meshgrid(x_axis_km, freqs[f_mask])
+        
+        v_2d = power_db[:, f_mask]
+        vmin_2d, vmax_2d = np.percentile(v_2d, 5), np.percentile(v_2d, 95)
+        
+        curr_im3 = ax3.pcolormesh(X, Y, v_2d.T, cmap='jet', shading='gouraud', vmin=vmin_2d, vmax=vmax_2d)
+        # Update the existing 2D colorbar's range
+        cbar3.update_normal(curr_im3)
+
+        ax3.set_title("Space-Frequency PSD")
+        ax3.set_xlabel("Distance [km]")
+        ax3.set_ylabel("Frequency [Hz]")
+        ax3.set_ylim(flim)
+
+        pbar.update(1)
+
+    ani = animation.FuncAnimation(fig, update, frames=file_paths, interval=interval, repeat=False)
+    plt.close(fig)
+    return ani
 
 # ===========================================================================
 # 2. Plot NCF

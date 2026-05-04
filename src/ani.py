@@ -19,6 +19,7 @@ import numpy as np
 import scipy.signal as signal
 import torch
 from scipy.signal import butter, convolve, detrend, filtfilt
+from scipy.ndimage import uniform_filter1d
 from torch import nn
 
 from src.utils import convert_to_numpy, convert_to_tensor, nextpow2
@@ -84,40 +85,28 @@ def bandpass_filter_tukey(
     return filtered.astype(np.float32, copy=False)
 
 
-def running_absolute_mean(trace: np.ndarray, nwin: int) -> np.ndarray:
-    if trace.ndim != 1:
-        raise ValueError("running_absolute_mean: 'trace' must be 1D.")
-    if nwin <= 1:
-        return trace.copy()
-
-    npts = int(trace.size)
-    abs_trace = np.abs(trace)
-
-    padded = np.empty(npts + 2 * nwin, dtype=trace.dtype)
-    padded[nwin:-nwin] = abs_trace
-    padded[:nwin] = abs_trace[0]
-    padded[-nwin:] = abs_trace[-1]
-
-    kernel = np.ones(int(nwin), dtype=np.float64) / float(nwin)
-    ram = convolve(padded, kernel, mode="same")[nwin:-nwin]
-    ram = np.where(ram == 0, np.nan, ram)
-
-    return np.nan_to_num(trace / ram, nan=0.0)
-
-
 def temporal_normalization(data: np.ndarray, fs: float, window_time: float) -> np.ndarray:
+    """
+    Vectorized temporal normalization using a running absolute mean.
+    """
     if data.ndim != 2:
         raise ValueError("temporal_normalization: data must be 2D (nch × nt).")
 
+    # 1-Bit Normalization shortcut
     if float(window_time) == 0.0:
         return np.sign(data).astype(np.float32, copy=False)
 
-    nwin = int(round(fs * float(window_time)))
-    nwin = max(nwin, 1)
+    nwin = max(int(round(fs * float(window_time))), 1)
 
-    out = data.copy()
-    for i in range(out.shape[0]):
-        out[i, :] = running_absolute_mean(out[i, :], nwin)
+    # 1. Compute running absolute mean vectorized across the time axis (axis=1)
+    # mode='nearest' automatically handles the edge padding exactly like your old code
+    ram = uniform_filter1d(np.abs(data), size=nwin, axis=1, mode='nearest')
+    
+    # 2. Avoid division by zero
+    ram = np.where(ram == 0, np.nan, ram)
+    
+    # 3. Normalize and replace NaNs with 0.0
+    out = np.nan_to_num(data / ram, nan=0.0)
 
     return out.astype(np.float32, copy=False)
 

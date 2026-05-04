@@ -24,6 +24,7 @@ dependencies = [
   "psutil>=5.9",
   "pyyaml>=6.0",
   "zarr>=2.14",
+  "numcodecs>=0.11",
 
   # torch is platform-specific (CPU/CUDA/MPS)
   "torch>=2.1",

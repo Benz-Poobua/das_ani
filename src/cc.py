@@ -511,8 +511,8 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
 
     return {
         "out_path": str(last_out) if last_out else None,
-        "io_time": io_time,
-        "cc_time": cc_time,
+        "io_sec": io_time,
+        "cc_sec": cc_time,
         "total_time": time.perf_counter() - t_total_start
     }
 
