@@ -99,7 +99,7 @@ def temporal_normalization(data: np.ndarray, fs: float, window_time: float) -> n
     nwin = max(int(round(fs * float(window_time))), 1)
 
     # 1. Compute running absolute mean vectorized across the time axis (axis=1)
-    # mode='nearest' automatically handles the edge padding exactly like your old code
+    # mode='nearest' automatically handles the edge padding 
     ram = uniform_filter1d(np.abs(data), size=nwin, axis=1, mode='nearest')
     
     # 2. Avoid division by zero
@@ -183,16 +183,19 @@ def spectral_whitening(
 
     idxf1 = max(0, min(idxf1, nfreq))
     idxf2 = max(0, min(idxf2, nfreq))
+
     if idxf2 <= idxf1:
         return torch.zeros_like(rfftdata)
-
-    phase = torch.angle(rfftdata)
-
+    
     df = float(df)
     window_freq = float(window_freq)
-
+    
+    # Optimize
     if window_freq == 0.0:
-        rfft_out = torch.exp(1j * phase)
+        # Full whitening: Set all amplitudes to 1.0 while keeping original phase
+        amp = torch.abs(rfftdata).clamp_(min=1e-10)
+        rfft_out = rfftdata / amp
+
     else:
         nwin = max(int(window_freq / df), 1) if df > 0 else 1
         if nwin % 2 == 0:
@@ -205,6 +208,7 @@ def spectral_whitening(
         pad = nwin // 2
         amp_smooth = torch.nn.functional.conv1d(amp_3d, kernel, padding=pad).squeeze(1)
 
+        # Handle potential padding mismatch
         if amp_smooth.shape[-1] != amp.shape[-1]:
             if amp_smooth.shape[-1] > amp.shape[-1]:
                 amp_smooth = amp_smooth[..., : amp.shape[-1]]
@@ -212,9 +216,13 @@ def spectral_whitening(
                 amp_smooth = torch.nn.functional.pad(
                     amp_smooth, (0, amp.shape[-1] - amp_smooth.shape[-1]), mode="replicate"
                 )
+        
+        # Fast in-place clamp to avoid division by zero
+        amp_smooth.clamp_(min=1e-10)
 
-        amp_smooth = torch.where(amp_smooth == 0, torch.ones_like(amp_smooth), amp_smooth)
-        rfft_out = torch.exp(1j * phase) * (amp / amp_smooth)
+        # ALGEBRAIC SHORTCUT: Direct complex/real division
+        # This replaces: torch.exp(1j * phase) * (amp / amp_smooth)
+        rfft_out = rfftdata / amp_smooth
 
     t1 = _WHITEN_CACHE.get_taper1(device, dtype_amp, idxf1)
     if t1 is not None and 0 < idxf1 < nfreq:
