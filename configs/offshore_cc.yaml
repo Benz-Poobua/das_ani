@@ -15,7 +15,7 @@ runtime:
   min_chunk: 64
   max_chunk: 4096
   torch_compile: false
-  compile_mode: max-autotune
+  compile_mode: reduce-overhead
 
 data:
   fs_raw: 10.0

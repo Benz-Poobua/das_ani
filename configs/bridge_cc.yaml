@@ -2,9 +2,11 @@
 # Configuration: Stanford Bridge DAS Ambient Noise Interferometry
 # Target: Structural Guided Waves (1.0 - 50.0 Hz) 
 # =============================================================================
+
 paths:
   data_root: ./data/raw_bridge #_zarr
   output_root: ./data/ncf_raw_bridge #_zarr
+  
 runtime:
   njobs: 8
   use_gpu: false
@@ -13,7 +15,7 @@ runtime:
   min_chunk: 64
   max_chunk: 4096
   torch_compile: false
-  compile_mode: max-autotune
+  compile_mode: reduce-overhead
 
 data:
   fs_raw: 250.0

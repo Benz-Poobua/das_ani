@@ -4,8 +4,8 @@
 # =============================================================================
 
 paths:
-  data_root: ./data/preprocessed #_zarr
-  output_root: ./data/ncf_raw #_zarr
+  data_root: ./data/raw_urban #_zarr
+  output_root: ./data/ncf_raw_urban #_zarr
 
 runtime:
   njobs: 4
@@ -15,7 +15,7 @@ runtime:
   min_chunk: 64
   max_chunk: 4096
   torch_compile: false
-  compile_mode: max-autotune
+  compile_mode: reduce-overhead
 
 data:
   fs_raw: 250.0
