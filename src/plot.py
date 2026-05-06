@@ -19,7 +19,7 @@ from matplotlib.animation import FuncAnimation
 
 from pathlib import Path
 from tqdm.auto import tqdm
-from typing import Tuple, List, Literal, Callable, Any
+from typing import Tuple, List, Literal, Callable, Any, Union, Optional
 from scipy import signal
 
 from src.utils import parse_ncf_stack_filename, fk_filter, fk_transform
@@ -55,6 +55,7 @@ def plot_das_wavefield(
     start_chan: int | None = None,
     end_chan: int | None = None,
     pclip: float = 99.0,
+    wave_clim: Optional[Tuple[float, float]] = None,
     cmap: str = "seismic",
     clabel: str = "Amplitude",
     figsize: Tuple[float, float] = (12, 6),
@@ -63,30 +64,26 @@ def plot_das_wavefield(
     """
     Plots a static 2D space-time wavefield slice with selectable time and channel ranges.
 
+    Processing Pipeline:
+    1. Temporal & Spatial Slicing: Isolates the specific time window and spatial subset of the array.
+    2. Color Clipping: Uses `wave_clim` for strict absolute amplitude limits. If `wave_clim` is None, 
+       falls back to statistical symmetric clipping using `pclip` to dynamically accommodate the data range.
+
     :param data: 2D array of DAS data (Channels x Time Samples).
-    :type data: np.ndarray
     :param fs: Sampling frequency in Hz.
-    :type fs: float
     :param dx: Spatial channel spacing in meters.
-    :type dx: float
     :param start_sec: Start time of the slice in seconds. Default is 0.0.
-    :type start_sec: float, optional
     :param duration_sec: Total time duration in seconds. If None, plots until the end of the data.
-    :type duration_sec: float | None, optional
     :param start_chan: First channel index to plot. Default is 0.
-    :type start_chan: int | None, optional
-    :param end_chan: Last channel index to plot. Default is the total channel count.
-    :type end_chan: int | None, optional
-    :param pclip: Percentile limit for symmetric color clipping. Default is 99.0.
-    :type pclip: float, optional
-    :param cmap: Matplotlib colormap to use. Default is "seismic".
-    :type cmap: str, optional
-    :param clabel: Label for the colorbar. Default is "Amplitude".
-    :type clabel: str, optional
-    :param figsize: Tuple defining figure dimensions. Default is (12, 6).
-    :type figsize: Tuple[float, float], optional
-    :param title: Custom title. If None, an automatic title is generated.
-    :type title: str | None, optional
+    :param end_chan: Last channel index to plot. If None, plots to the end of the array.
+    :param pclip: Percentile (0 to 100) used for dynamic symmetric color clipping if `wave_clim` is None.
+                  Defaults to 99.0 (clips the top 1% of extreme absolute values).
+    :param wave_clim: Optional tuple (vmin, vmax) to manually set absolute physical amplitude limits for the colorbar. 
+                      If provided, overrides `pclip` to ensure true amplitude scaling across different datasets.
+    :param cmap: Matplotlib colormap string. Default is "seismic".
+    :param clabel: Label for the colorbar (e.g., 'Nano strain rate'). Default is "Amplitude".
+    :param figsize: Tuple defining figure dimensions in inches. Default is (12, 6).
+    :param title: Optional custom title for the plot. If None, auto-generates based on channels and duration.
     :returns: None
     """
     # 1. Handle Time Slicing dynamically
@@ -111,20 +108,23 @@ def plot_das_wavefield(
     # 4. Construct physical axes
     t_axis = np.arange(start_sample, end_sample) / fs
     # Distance axis reflects the actual position on the cable
-    x_axis = np.arange(s_ch, e_ch) * dx / 1000.0  
+    x_axis_km = np.arange(s_ch, e_ch) * dx / 1000.0  
 
-    # 5. Compute clipping
-    das_clip = float(np.percentile(np.abs(data_subset), pclip))
+    # 5. Calculate Color Limits (Manual Override vs. Statistical)
+    if wave_clim is not None:
+        vmin, vmax = wave_clim
+    else:
+        das_clip = float(np.percentile(np.abs(data_subset), pclip))
+        vmin, vmax = -das_clip, das_clip
 
     # 6. Plotting
-    # fig, ax = plt.subplots(figsize=figsize)
     fig, ax = plt.subplots(figsize=figsize, layout="constrained")
 
     im = ax.imshow(
         data_subset, 
         aspect='auto',
-        extent=[t_axis[0], t_axis[-1], x_axis[-1], x_axis[0]],
-        vmin=-das_clip, vmax=das_clip,
+        extent=[t_axis[0], t_axis[-1], x_axis_km[-1], x_axis_km[0]],
+        vmin=vmin, vmax=vmax,
         cmap=cmap
     )
 
@@ -137,7 +137,6 @@ def plot_das_wavefield(
         title = f'DAS Wavefield ({actual_duration_sec:.0f}s Window, {chan_info})'
     ax.set_title(title)
 
-    # fig.tight_layout()
     plt.show()
 
 def animate_das_wavefield(
@@ -282,33 +281,40 @@ def plot_das_psd(
     start_chan: int = 0, 
     end_chan: int | None = None, 
     nperseg: int = 4096,
-    xlim: Tuple[float | None, float | None] | None = (0.01, None),
-    ylim: Tuple[float | None, float | None] | None = (0, 60),
+    flim: Optional[Tuple[float | None, float | None]] = (0.01, None),
+    psd_ylim: Optional[Tuple[float, float]] = (0.0, 60.0),
     xscale: str = "log",
     ylabel: str = "PSD (dB)",
     figsize: Tuple[float, float] = (10, 5),
     title: str | None = None
 ) -> None:
     """
-    Plots the Mean Power Spectral Density plot for a specific channel range.
+    Plots the Mean Power Spectral Density (1D) for a specific spatial range.
     
-    :param data: 2D array (Channels x Samples) of DAS data.
+    Processing Pipeline:
+    1. Channel Slicing: Isolates the specific spatial subset of the array for analysis.
+    2. Welch's Method: Computes the Power Spectral Density across the time axis for every channel, 
+       then averages them spatially into a single 1D mean PSD curve.
+    3. Axis Alignment: Applies `flim` to the X-axis (Frequency) and `psd_ylim` to the Y-axis (Power) 
+       to ensure visual and absolute amplitude consistency with external 2D spectrograms.
+
+    :param data: 2D array (Channels x Samples) of raw or continuous DAS data.
     :param fs: Sampling frequency in Hz.
     :param dx: Spatial channel spacing in meters.
     :param start_chan: First channel index to include. Default is 0.
     :param end_chan: Last channel index to include. If None, uses all remaining channels.
-    :param nperseg: Segment length for Welch's method. Default 4096.
-    :param xlim: X-axis limits (low, high). If None, auto-scales. 
-                 If high is None, defaults to Nyquist (fs/2). Default (0.01, None).
-    :param ylim: Y-axis limits (low, high). If None, auto-scales. Default (0, 60).
-    :param xscale: Scale of the x-axis ('linear' or 'log'). Default is "log".
-    :param ylabel: Label for the Y-axis. Default is generic "PSD (dB)".
-    :param figsize: Figure dimensions. Default (10, 5).
+    :param nperseg: Segment length for Welch's method. Default is 4096.
+    :param flim: Frequency limits (min_Hz, max_Hz) for the X-axis. If None, auto-scales. 
+                 If max_Hz is None, defaults to the Nyquist frequency (fs/2). Default is (0.01, None).
+    :param psd_ylim: Physical dB limits (min_dB, max_dB) for the Y-axis. If None, auto-scales. 
+                     Locking this matches the `psd_clim` of 2D plots. Default is (0.0, 60.0).
+    :param xscale: Scale of the X-axis ('linear' or 'log'). Default is "log".
+    :param ylabel: Label for the Y-axis. Default is "PSD (dB)".
+    :param figsize: Tuple defining figure dimensions in inches. Default is (10, 5).
     :param title: Optional custom title for the plot. If None, auto-generates based on channels.
     """
     # 1. Handle Channel Slicing
     s_ch = max(0, start_chan)
-    
     if end_chan is None:
         e_ch = data.shape[0]
     else:
@@ -320,7 +326,7 @@ def plot_das_psd(
     start_km = (s_ch * dx) / 1000.0
     end_km = ((e_ch - 1) * dx) / 1000.0
 
-    # 3. Compute PSD
+    # 3. Compute PSD using Welch's method
     freqs, psd_values = signal.welch(data_section, fs=fs, nperseg=nperseg, axis=1)
     mean_psd = np.mean(psd_values, axis=0)
 
@@ -328,22 +334,23 @@ def plot_das_psd(
     psd_db = 10 * np.log10(mean_psd + 1e-12)
 
     # 5. Plotting
-    plt.figure(figsize=figsize)
+    plt.figure(figsize=figsize, layout="constrained")
     plt.plot(freqs, psd_db, color='black', linewidth=1)
     
     # Apply chosen scale
     plt.xscale(xscale)
 
-    # 6. Handle Dynamic Limits
-    if xlim is not None:
-        x_low = xlim[0]
-        x_high = xlim[1] if xlim[1] is not None else fs / 2.0
-        plt.xlim(x_low, x_high)
+    # 6. Handle Dynamic Frequency Limits (flim)
+    if flim is not None:
+        f_low = flim[0] if flim[0] is not None else freqs[1]  # Avoid 0 if log scale
+        f_high = flim[1] if flim[1] is not None else fs / 2.0
+        plt.xlim(f_low, f_high)
         
-    if ylim is not None:
-        plt.ylim(ylim)
+    # 7. Handle Dynamic Y-Axis Limits (psd_ylim)
+    if psd_ylim is not None:
+        plt.ylim(psd_ylim)
 
-    # 7. Formatting
+    # 8. Formatting
     if title is not None:
         plt.title(title)
     else:
@@ -352,9 +359,8 @@ def plot_das_psd(
         
     plt.xlabel('Frequency (Hz)')
     plt.ylabel(ylabel)
-    plt.grid(True, which="both", ls="-", alpha=0.2)
+    plt.grid(True, which="both", color='gray', linestyle='--', alpha=0.3)
 
-    plt.tight_layout()
     plt.show()
 
 def plot_das_psd_2d(
@@ -363,9 +369,10 @@ def plot_das_psd_2d(
     dx: float, 
     start_chan: int = 0, 
     end_chan: int | None = None, 
+    pclip: float = 95.0,
+    psd_clim: Optional[Tuple[float, float]] = None,
     nperseg: int = 4096,
     flim: Tuple[float, float] | None = (0.0, 25.0),
-    pclip: Tuple[float, float] = (5.0, 95.0),
     cmap: str = "jet",
     figsize: Tuple[float, float] = (12, 6),
     title: str | None = None
@@ -374,19 +381,28 @@ def plot_das_psd_2d(
     Plots the 2D Space-Frequency Power Spectral Density (PSD) spectrogram 
     to analyze localized spatial variations in noise across the DAS array.
     
+    Processing Pipeline:
+    1. Channel Slicing: Isolates the specific spatial subset of the array for analysis.
+    2. Welch's Method: Computes the Power Spectral Density across the time axis for every channel.
+    3. Frequency Cropping: Masks the output to only include the frequency band specified by `flim`.
+    4. Color Clipping: Uses `psd_clim` for strict physical dB limits. If `psd_clim` is None, 
+       falls back to statistical global clipping using `pclip` to dynamically drop extreme outliers.
+
     :param data: 2D array (Channels x Samples) of raw or continuous DAS data.
     :param fs: Sampling frequency in Hz.
     :param dx: Spatial channel spacing in meters.
     :param start_chan: First channel index to include. Default is 0.
     :param end_chan: Last channel index to include. If None, uses all remaining channels.
+    :param pclip: Percentile (0 to 100) used for dynamic color clipping if `psd_clim` is None. 
+                  Defaults to 95.0 (clips the top and bottom 5% of extreme values).
+    :param psd_clim: Optional tuple (vmin, vmax) to manually set absolute physical dB limits for the colorbar. 
+                     If provided, overrides `pclip` to ensure true amplitude scaling across different datasets.
     :param nperseg: Segment length for Welch's method. Higher values yield finer 
                     frequency resolution but higher variance. Default is 4096.
-    :param flim: Frequency limits (min, max) in Hz for the Y-axis. Restricts the 
-                 computation and plotting to this band of interest. Default is (0.0, 25.0).
-    :param pclip: Percentiles (min, max) used to dynamically calculate the colormap 
-                  clipping limits, effectively dropping extreme outliers. Default is (5.0, 95.0).
-    :param cmap: Matplotlib colormap to use. Default is "jet".
-    :param figsize: Figure dimensions. Default is (12, 6).
+    :param flim: Frequency limits (min_Hz, max_Hz) for the Y-axis. The data is cropped to this band 
+                 *before* color limits are calculated to prevent out-of-band noise from skewing the colormap.
+    :param cmap: Matplotlib colormap string. Default is "jet".
+    :param figsize: Tuple defining the figure dimensions in inches. Default is (12, 6).
     :param title: Optional custom title for the plot. If None, auto-generates based on channels.
     """
     # 1. Handle Channel Slicing
@@ -418,14 +434,17 @@ def plot_das_psd_2d(
         power_plot = power_db
         fmin, fmax = freqs[0], freqs[-1]
 
-    # 6. Calculate Dynamic Color Limits (Z-axis bounds)
-    vmin = np.percentile(power_plot, pclip[0])
-    vmax = np.percentile(power_plot, pclip[1])
+    # 6. Calculate Color Limits (Manual Override vs. Statistical)
+    if psd_clim is not None:
+        vmin, vmax = psd_clim
+    else:
+        vmin = np.percentile(power_plot, 100.0 - pclip)
+        vmax = np.percentile(power_plot, pclip)
 
     # 7. Create Meshgrid and Plot
     X, Y = np.meshgrid(x_axis_km, freqs_plot)
 
-    plt.figure(figsize=figsize)
+    plt.figure(figsize=figsize, layout="constrained")
     
     # Transpose power_plot (.T) so axes align: (len(freqs_plot), len(channels))
     # Uses gouraud shading to prevent blocky artifacts in the spectrogram output
@@ -449,11 +468,10 @@ def plot_das_psd_2d(
         plt.title(title_str, pad=15)
 
     plt.grid(True, which='both', color='white', linestyle='--', alpha=0.3)
-    plt.tight_layout()
     plt.show()
 
-def animate_das_comparison(
-    file_paths: List[str],
+def plot_das_spectrogram(
+    file_paths: List[Union[str, Path]],
     fs: float,
     dx: float,
     start_sec: float = 0.0,
@@ -461,137 +479,323 @@ def animate_das_comparison(
     start_chan: int = 0,
     end_chan: int | None = None,
     pclip: float = 98.0,
+    psd_clim: Optional[Tuple[float, float]] = None,
+    nperseg: int = 4096,
+    flim: Tuple[float, float] = (0.1, 15.0),
+    cmap: str = "viridis",
+    figsize: Tuple[float, float] = (14, 6),
+    interval: int = 1000
+) -> animation.FuncAnimation:
+    """
+    Creates an animated Time-Frequency Spectrogram across a sequence of DAS files.
+    
+    Processing Pipeline:
+    1. Spatial Stacking: Averages the specified channel range (start_chan to end_chan) 
+       into a single 1D time-series trace to significantly boost the Signal-to-Noise Ratio (SNR).
+    2. STFT: Computes the Short-Time Fourier Transform using SciPy's spectrogram.
+    3. Frequency Cropping: Masks the output to only include the frequency band specified by `flim`.
+    4. Color Clipping: Uses `psd_clim` for strict physical dB limits. If `psd_clim` is None, 
+       falls back to statistical global clipping (`pclip`) based on the first file in the sequence. 
+       This prevents "flashing" during animation and ensures colors represent absolute energy consistently.
+
+    :param file_paths: List of file paths to the raw DAS data arrays (.npy or .npz).
+    :param fs: Sampling frequency of the DAS instrument in Hz.
+    :param dx: Spatial channel spacing in meters.
+    :param start_sec: Temporal offset from the beginning of each file to start processing (seconds).
+    :param duration_sec: Length of the time window to process per file (seconds). If None, processes the whole file.
+    :param start_chan: Minimum channel index to include in the spatial average. Default is 0.
+    :param end_chan: Maximum channel index to include in the spatial average. If None, processes to the end of the cable.
+    :param pclip: Percentile (0 to 100) used for dynamic color clipping if `psd_clim` is None.
+    :param psd_clim: Optional tuple (vmin, vmax) to manually set absolute physical dB limits for the colorbar. 
+                     If provided, overrides `pclip` to ensure true amplitude scaling across different datasets.
+    :param nperseg: Number of points per segment for the STFT. Controls the Time-Frequency Uncertainty trade-off. 
+                    Larger values (e.g., 4096) give high frequency resolution but low temporal resolution.
+    :param flim: Frequency limits (min_Hz, max_Hz) for the Y-axis. The data is cropped to this band 
+                 *before* color limits are calculated to prevent out-of-band noise from skewing the colormap.
+    :param cmap: Matplotlib colormap string. Default is "viridis".
+    :param figsize: Tuple defining the figure dimensions in inches.
+    :param interval: Delay between animated frames in milliseconds. Default is 1000 (1 second).
+    
+    :returns: A Matplotlib FuncAnimation object ready to be rendered (e.g., via HTML(ani.to_jshtml())).
+    """
+    if not file_paths:
+        raise ValueError("file_paths list cannot be empty.")
+
+    # 1. Helper to load and crop a single file
+    def load_and_stack(filepath: Union[str, Path]) -> np.ndarray:
+        data = np.load(filepath)
+        if isinstance(data, np.lib.npyio.NpzFile):
+            keys = data.files
+            arr = data['data'] if 'data' in keys else data[keys[0]]
+        else:
+            arr = data
+            
+        e_ch = arr.shape[0] if end_chan is None else min(end_chan, arr.shape[0])
+        s_ch = max(0, start_chan)
+        
+        s_samp = int(start_sec * fs)
+        e_samp = arr.shape[1] if duration_sec is None else int((start_sec + duration_sec) * fs)
+        e_samp = min(e_samp, arr.shape[1])
+        
+        trace = np.mean(arr[s_ch:e_ch, s_samp:e_samp], axis=0)
+        return trace, s_ch, e_ch
+
+    # 2. Setup initial frame to configure the plot axes
+    first_trace, s_ch, e_ch = load_and_stack(file_paths[0])
+    
+    freqs, times, Sxx = signal.spectrogram(first_trace, fs=fs, nperseg=nperseg)
+    power_db = 10 * np.log10(Sxx + 1e-12)
+    
+    fmin, fmax = flim
+    f_mask = (freqs >= fmin) & (freqs <= fmax)
+    freqs_plot = freqs[f_mask]
+    power_plot = power_db[f_mask, :]
+    
+    # Calculate Color Limits (Manual Override vs. Statistical)
+    if psd_clim is not None:
+        vmin, vmax = psd_clim
+    else:
+        vmin = np.percentile(power_plot, 100.0 - pclip)
+        vmax = np.percentile(power_plot, pclip)
+
+    # 3. Initialize Figure
+    fig, ax = plt.subplots(figsize=figsize, layout="constrained")
+    
+    X, Y = np.meshgrid(times, freqs_plot)
+    mesh = ax.pcolormesh(X, Y, power_plot, cmap=cmap, shading='gouraud', vmin=vmin, vmax=vmax)
+    fig.colorbar(mesh, ax=ax, label='Power (dB/Hz)')
+    
+    ax.set_ylabel('Frequency (Hz)')
+    ax.set_xlabel('Time within file (s)')
+    ax.set_ylim(fmin, fmax)
+    
+    start_km = (s_ch * dx) / 1000.0
+    end_km = ((e_ch - 1) * dx) / 1000.0
+    chan_str = f"Chans {s_ch}-{e_ch} ({start_km:.2f}-{end_km:.2f} km)"
+
+    # 4. Animation Update Function
+    def update(frame_idx: int):
+        filepath = file_paths[frame_idx]
+        trace, _, _ = load_and_stack(filepath)
+        
+        _, _, Sxx_new = signal.spectrogram(trace, fs=fs, nperseg=nperseg)
+        power_db_new = 10 * np.log10(Sxx_new + 1e-12)
+        power_plot_new = power_db_new[f_mask, :]
+        
+        mesh.set_array(power_plot_new.ravel())
+        
+        filename = Path(filepath).name
+        ax.set_title(f"Spectrogram | {chan_str}\nFile [{frame_idx+1}/{len(file_paths)}]: {filename}")
+        
+        return mesh,
+
+    # 5. Create and return the animation
+    ani = FuncAnimation(
+        fig, 
+        update, 
+        frames=tqdm(range(len(file_paths)), desc="Rendering Animation", unit="frame"), 
+        interval=interval, 
+        blit=False 
+    )
+    
+    plt.close(fig) 
+    return ani
+
+def animate_das_dashboard(
+    file_paths: List[Union[str, Path]],
+    fs: float,
+    dx: float,
+    start_sec: float = 0.0,
+    duration_sec: float | None = None,
+    start_chan: int = 0,
+    end_chan: int | None = None,
+    pclip: float = 98.0,
+    wave_clim: Optional[Tuple[float, float]] = None,
+    psd_clim: Optional[Tuple[float, float]] = None,
     nperseg: int = 4096,
     flim: Tuple[float, float] = (0.1, 15.0),
     psd_ylim: Tuple[float, float] | None = (0, 70),
     clabel: str = "Amplitude",  
-    figsize: Tuple[float, float] = (20, 6),
+    figsize: Tuple[float, float] = (16, 12),
     interval: int = 1000
 ) -> animation.FuncAnimation:
     """
-    Generates a synchronized 3-panel animation of DAS data with dedicated colorbars for 
-    spatial and spectral intensity tracking. Designed for monitoring transient 
-    cryosphere events like rapid sea ice refreezing.
+    Generates a synchronized 2x2 dashboard animation of DAS data using global color clipping.
+    
+    Panels:
+    1. (Top-Left) DAS Wavefield: Distance vs. Time.
+    2. (Top-Right) Mean PSD: 1D Frequency plot.
+    3. (Bottom-Left) Space-Frequency PSD: Distance vs. Frequency.
+    4. (Bottom-Right) Time-Frequency Spectrogram: Time vs. Frequency (spatially stacked).
 
-    The dashboard panels include:
-    1. DAS Wavefield: Space-time plot (Distance vs. Time) with a customizable colorbar label.
-    2. Mean PSD: 1D frequency-domain line plot averaged across the selected spatial window.
-    3. Space-Frequency PSD: 2D spectrogram (Frequency vs. Distance) with a 'PSD (dB/Hz)' colorbar.
+    Processing Pipeline:
+    1. Temporal & Spatial Slicing: Isolates the specific time window and spatial subset of the array for all panels.
+    2. Signal Processing: Applies linear detrending, Welch's method (Mean and Space-Freq PSD), and STFT (Spectrogram).
+    3. Frequency Cropping: Masks the PSD and Spectrogram outputs to only include the frequency band specified by `flim`.
+    4. Color Clipping: Uses `wave_clim` and `psd_clim` for strict absolute amplitude/dB limits. If None, falls back to 
+       statistical global clipping using `pclip` based on the first file to ensure consistent animation frames without flashing.
 
-    All frames undergo automatic demeaning and linear detrending along the time axis 
-    to remove low-frequency drift before computation.
-
-    :param file_paths: Sequence of paths to the .npz data files to be animated.
-    :type file_paths: List[str]
-    :param fs: Sampling frequency of the DAS interrogator in Hz.
-    :type fs: float
+    :param file_paths: List of file paths to the raw DAS data arrays (.npy or .npz).
+    :param fs: Sampling frequency of the DAS instrument in Hz.
     :param dx: Spatial channel spacing in meters.
-    :type dx: float
-    :param start_sec: Temporal offset from the beginning of each file in seconds. Default 0.0.
-    :type start_sec: float, optional
-    :param duration_sec: Length of the time window to analyze (seconds). If None, uses full file.
-    :type duration_sec: float | None, optional
-    :param start_chan: Minimum channel index for the spatial slice. Default 0.
-    :type start_chan: int, optional
-    :param end_chan: Maximum channel index for the spatial slice. If None, uses all channels.
-    :type end_chan: int | None, optional
-    :param pclip: Percentile (0-100) for symmetric wavefield color clipping. Default 98.0.
-    :type pclip: float, optional
-    :param nperseg: Segment length for Welch's PSD estimation. Higher values improve frequency resolution.
-    :type nperseg: int, optional
-    :param flim: Frequency range (min, max) in Hz for the PSD-related axes. Default (0.1, 15.0).
-    :type flim: Tuple[float, float], optional
-    :param psd_ylim: Fixed Y-axis limits (dB) for the 1D PSD plot. Set to None for auto-scaling.
-    :type psd_ylim: Tuple[float, float] | None, optional
-    :param clabel: Label for the wavefield colorbar (e.g., 'Nano strain rate'). Default "Amplitude".
-    :type clabel: str, optional
-    :param figsize: Figure dimensions in inches. Default (20, 6).
-    :type figsize: Tuple[float, float], optional
-    :param interval: Frame delay in milliseconds. Default 1000.
-    :type interval: int, optional
-    :returns: A Matplotlib FuncAnimation object.
-    :rtype: matplotlib.animation.FuncAnimation
+    :param start_sec: Temporal offset from the beginning of each file to start processing (seconds).
+    :param duration_sec: Length of the time window to process per file (seconds). If None, processes the whole file.
+    :param start_chan: Minimum channel index to include in the analysis. Default is 0.
+    :param end_chan: Maximum channel index to include in the analysis. If None, processes to the end of the cable.
+    :param pclip: Percentile (0 to 100) used for dynamic color clipping if manual limits are not provided.
+    :param wave_clim: Optional tuple (vmin, vmax) to manually set absolute limits for the Wavefield colorbar.
+    :param psd_clim: Optional tuple (vmin, vmax) to manually set absolute physical dB limits for the PSD/Spectrogram colorbars.
+    :param nperseg: Number of points per segment for the STFT and Welch's method. Default is 4096.
+    :param flim: Frequency limits (min_Hz, max_Hz) for the Y-axis across all spectral plots.
+    :param psd_ylim: Fixed Y-axis limits (dB) for the 1D Mean PSD plot. Set to None for auto-scaling.
+    :param clabel: Label for the wavefield colorbar (e.g., 'Nano strain rate'). Default is "Amplitude".
+    :param figsize: Tuple defining the figure dimensions in inches. Default is (16, 12).
+    :param interval: Delay between animated frames in milliseconds. Default is 1000 (1 second).
+    
+    :returns: A Matplotlib FuncAnimation object ready to be rendered.
     """
-    
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=figsize, layout="constrained")
-    
-    # Initialize "placeholder" colorbars outside the loop
-    # We use a dummy array so we can establish the cbar objects early
-    dummy = np.zeros((10, 10))
-    im1 = ax1.imshow(dummy, cmap='seismic', extent=[0, 1, 0, 1])
-    cbar1 = fig.colorbar(im1, ax=ax1, location='right', shrink=0.8)
-    cbar1.set_label(clabel)
+    if not file_paths:
+        raise ValueError("file_paths cannot be empty.")
 
-    im3 = ax3.pcolormesh(dummy, cmap='jet', shading='gouraud')
-    cbar3 = fig.colorbar(im3, ax=ax3, location='right', shrink=0.8)
-    cbar3.set_label('PSD (dB/Hz)')
+    # Robust file loader with memory leak prevention
+    def _get_array(filepath: Union[str, Path]) -> np.ndarray:
+        data = np.load(filepath)
+        if isinstance(data, np.lib.npyio.NpzFile):
+            keys = data.files
+            arr = data['data'] if 'data' in keys else data[keys[0]]
+            data.close()  # <-- PATCH 1: Closes file handle to prevent OS crash on large loops
+            return arr
+        return data
 
-    pbar = tqdm(total=len(file_paths), desc="Rendering Frames")
+    # ==========================================
+    # 1. Global Setup & Pre-Flight Scan
+    # ==========================================
+    first_path = file_paths[0]
+    raw_array = _get_array(first_path)
+    data_detrended = signal.detrend(raw_array, type='linear', axis=1)
     
-    def update(file_path):
-        # Clear main axes, but DO NOT clear the figure or cbars
-        ax1.clear()
-        ax2.clear()
-        ax3.clear()
-            
-        # 1. Load and Preprocess
-        data_dict = np.load(file_path)
-        data_detrended = signal.detrend(data_dict['data'], type='linear', axis=1)
+    start_sample = int(start_sec * fs)
+    end_sample = int((start_sec + duration_sec) * fs) if duration_sec else data_detrended.shape[1]
+    end_sample = min(end_sample, data_detrended.shape[1])  # <-- PATCH 2: Prevent time-axis out-of-bounds
+    
+    s_ch = max(0, start_chan)
+    e_ch = end_chan if end_chan is not None else data_detrended.shape[0]
+    e_ch = min(e_ch, data_detrended.shape[0])
+    
+    first_subset = data_detrended[s_ch:e_ch, start_sample:end_sample]
+    
+    t_axis = np.arange(start_sample, end_sample) / fs
+    x_axis_km = np.arange(s_ch, e_ch) * dx / 1000.0
+
+    # --- Wavefield Limits ---
+    if wave_clim is not None:
+        vmin_wave, vmax_wave = wave_clim
+    else:
+        vclip_wave = np.percentile(np.abs(first_subset), pclip)
+        vmin_wave, vmax_wave = -vclip_wave, vclip_wave
+
+    # --- PSD/Spectrogram Limits ---
+    freqs, psd_values = signal.welch(first_subset, fs=fs, nperseg=nperseg, axis=1)
+    power_db = 10 * np.log10(psd_values + 1e-12)
+    f_mask = (freqs >= flim[0]) & (freqs <= flim[1])
+    v_2d = power_db[:, f_mask]
+    
+    if psd_clim is not None:
+        vmin_psd, vmax_psd = psd_clim
+    else:
+        vmin_psd = np.percentile(v_2d, 100.0 - pclip)
+        vmax_psd = np.percentile(v_2d, pclip)
+
+    # ==========================================
+    # 2. Initialize the 2x2 Figure
+    # ==========================================
+    fig, axes = plt.subplots(2, 2, figsize=figsize, layout="constrained")
+    (ax1, ax2), (ax3, ax4) = axes
+
+    # Panel 1: Wavefield
+    im1 = ax1.imshow(
+        first_subset, aspect='auto', cmap='seismic', vmin=vmin_wave, vmax=vmax_wave,
+        extent=[t_axis[0], t_axis[-1], x_axis_km[-1], x_axis_km[0]]
+    )
+    fig.colorbar(im1, ax=ax1, label=clabel)
+    ax1.set_xlabel("Time [s]")
+    ax1.set_ylabel("Distance [km]")
+
+    # Panel 2: Mean PSD
+    mean_psd_db = 10 * np.log10(np.mean(psd_values, axis=0) + 1e-12)
+    line2, = ax2.plot(freqs, mean_psd_db, color='black', lw=1.5)
+    ax2.set(xscale='log', xlim=flim)
+    if psd_ylim: ax2.set_ylim(psd_ylim)
+    ax2.set_title("Mean PSD")
+    ax2.set_xlabel("Frequency [Hz]")
+    ax2.set_ylabel("PSD (dB)")
+    ax2.grid(True, which='both', alpha=0.3)
+
+    # Panel 3: Space-Frequency PSD
+    X3, Y3 = np.meshgrid(x_axis_km, freqs[f_mask])
+    im3 = ax3.pcolormesh(X3, Y3, v_2d.T, cmap='jet', shading='gouraud', vmin=vmin_psd, vmax=vmax_psd)
+    fig.colorbar(im3, ax=ax3, label='PSD (dB/Hz)')
+    ax3.set_title("Space-Frequency PSD")
+    ax3.set_xlabel("Distance [km]")
+    ax3.set_ylabel("Frequency [Hz]")
+    ax3.set_ylim(flim)
+
+    # Panel 4: Time-Frequency Spectrogram (Spatially Stacked)
+    _, times_stft, Sxx = signal.spectrogram(np.mean(first_subset, axis=0), fs=fs, nperseg=nperseg)
+    power_stft_db = 10 * np.log10(Sxx + 1e-12)
+    X4, Y4 = np.meshgrid(times_stft, freqs[f_mask])
+    im4 = ax4.pcolormesh(X4, Y4, power_stft_db[f_mask, :], cmap='viridis', shading='gouraud', vmin=vmin_psd, vmax=vmax_psd)
+    fig.colorbar(im4, ax=ax4, label='PSD (dB/Hz)')
+    ax4.set_title("Time-Frequency Spectrogram (Stacked)")
+    ax4.set_xlabel("Time within file [s]")
+    ax4.set_ylabel("Frequency [Hz]")
+    ax4.set_ylim(flim)
+
+    # ==========================================
+    # 3. Fast Update Function
+    # ==========================================
+    def update(frame_idx: int):
+        file_path = file_paths[frame_idx]
         
-        # 2. Slice Data
-        start_sample = int(start_sec * fs)
-        end_sample = int((start_sec + duration_sec) * fs) if duration_sec else data_detrended.shape[1]
-        s_ch, e_ch = start_chan, (end_chan if end_chan is not None else data_detrended.shape[0])
-        subset = data_detrended[s_ch:e_ch, start_sample:end_sample]
+        # Load and slice
+        raw_arr = _get_array(file_path)
+        d_detrend = signal.detrend(raw_arr, type='linear', axis=1)
         
-        # 3. Axes Setup
-        t_axis = np.arange(start_sample, end_sample) / fs
-        x_axis_km = np.arange(s_ch, e_ch) * dx / 1000.0
+        # Apply the safe clamps here as well
+        s_idx = int(start_sec * fs)
+        e_idx = int((start_sec + duration_sec) * fs) if duration_sec else d_detrend.shape[1]
+        e_idx = min(e_idx, d_detrend.shape[1])
         
-        # --- Panel 1: DAS Wavefield ---
-        clip = np.percentile(np.abs(subset), pclip)
-        curr_im1 = ax1.imshow(
-            subset, aspect='auto', cmap='seismic', vmin=-clip, vmax=clip,
-            extent=[t_axis[0], t_axis[-1], x_axis_km[-1], x_axis_km[0]]
-        )
-        # Update the existing colorbar's range to match the new image
-        cbar1.update_normal(curr_im1) 
+        subset = d_detrend[s_ch:e_ch, s_idx:e_idx]
         
+        # Update 1: Wavefield
+        im1.set_array(subset)
         ax1.set_title(f"Wavefield: {Path(file_path).name}")
-        ax1.set_xlabel("Time [s]")
-        ax1.set_ylabel("Distance [km]")
 
-        # --- Panel 2: Mean PSD (1D) ---
-        freqs, psd_values = signal.welch(subset, fs=fs, nperseg=nperseg, axis=1)
-        mean_psd_db = 10 * np.log10(np.mean(psd_values, axis=0) + 1e-12)
-        ax2.plot(freqs, mean_psd_db, color='black', lw=1)
-        ax2.set(xscale='log', xlim=flim)
-        if psd_ylim: ax2.set_ylim(psd_ylim)
-        ax2.set_title("Mean PSD")
-        ax2.set_xlabel("Frequency [Hz]")
-        ax2.set_ylabel("PSD (dB)")
-        ax2.grid(True, which='both', alpha=0.2)
+        # Update 2: Mean PSD
+        _, psd_vals = signal.welch(subset, fs=fs, nperseg=nperseg, axis=1)
+        mean_db = 10 * np.log10(np.mean(psd_vals, axis=0) + 1e-12)
+        line2.set_ydata(mean_db)
 
-        # --- Panel 3: Space-Frequency PSD (2D) ---
-        power_db = 10 * np.log10(psd_values + 1e-12)
-        f_mask = (freqs >= flim[0]) & (freqs <= flim[1])
-        X, Y = np.meshgrid(x_axis_km, freqs[f_mask])
-        
-        v_2d = power_db[:, f_mask]
-        vmin_2d, vmax_2d = np.percentile(v_2d, 5), np.percentile(v_2d, 95)
-        
-        curr_im3 = ax3.pcolormesh(X, Y, v_2d.T, cmap='jet', shading='gouraud', vmin=vmin_2d, vmax=vmax_2d)
-        # Update the existing 2D colorbar's range
-        cbar3.update_normal(curr_im3)
+        # Update 3: Space-Freq
+        pow_db = 10 * np.log10(psd_vals + 1e-12)
+        im3.set_array(pow_db[:, f_mask].T.ravel())
 
-        ax3.set_title("Space-Frequency PSD")
-        ax3.set_xlabel("Distance [km]")
-        ax3.set_ylabel("Frequency [Hz]")
-        ax3.set_ylim(flim)
+        # Update 4: Time-Freq Spectrogram
+        _, _, Sxx_new = signal.spectrogram(np.mean(subset, axis=0), fs=fs, nperseg=nperseg)
+        pow_stft_db = 10 * np.log10(Sxx_new + 1e-12)
+        im4.set_array(pow_stft_db[f_mask, :].ravel())
 
-        pbar.update(1)
+        return im1, line2, im3, im4
 
-    ani = animation.FuncAnimation(fig, update, frames=file_paths, interval=interval, repeat=False)
+    ani = animation.FuncAnimation(
+        fig, 
+        update, 
+        frames=tqdm(range(len(file_paths)), desc="Rendering Dashboard", unit="frame"), 
+        interval=interval, 
+        blit=False
+    )
+    
     plt.close(fig)
     return ani
 
@@ -925,7 +1129,6 @@ def animate_preprocessed_ncf(
 
     parsed = []
     for p in files:
-        # Assumes parse_ncf_stack_filename is available in your namespace
         date, vs, window, xmode = parse_ncf_stack_filename(p)
         parsed.append((p, date, vs, xmode))
 
