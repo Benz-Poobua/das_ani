@@ -62,12 +62,14 @@ def _set_thread_env(threads: int) -> None:
 
     :param threads: The maximum number of threads allowed per library.
     """
-    threads = max(1, int(threads))
-    os.environ.setdefault("OMP_NUM_THREADS", str(threads))
-    os.environ.setdefault("MKL_NUM_THREADS", str(threads))
-    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(threads))
-    os.environ.setdefault("NUMEXPR_NUM_THREADS", str(threads))
+    threads_str = str(max(1, int(threads)))
 
+    # HARD OVERRIDE: Do not use setdefault. Force the OS to respect these limits.
+    os.environ["OMP_NUM_THREADS"] = threads_str
+    os.environ["MKL_NUM_THREADS"] = threads_str
+    os.environ["VECLIB_MAXIMUM_THREADS"] = threads_str
+    os.environ["NUMEXPR_NUM_THREADS"] = threads_str
+    os.environ["OPENBLAS_NUM_THREADS"] = threads_str
 
 def _worker_warmup(
     *,
@@ -77,13 +79,16 @@ def _worker_warmup(
     v1_fft_snap_pow2: bool,
     v1_fallback: str,
     threads_per_proc: int,
+    do_compile: bool = False,
+    compile_mode: str = "reduce-overhead",
 ) -> None:
     """
     Initializes the PyTorch correlation model and performs a dummy inference pass.
     
     Executed exactly once per worker process when the multiprocessing pool starts.
-    This hides the overhead of model instantiation, memory allocation, and PyTorch 
-    JIT/FFT dispatch compilation from the actual file processing timings.
+    This hides the overhead of model instantiation, memory allocation, PyTorch 
+    JIT/FFT dispatch compilation, and — when enabled — torch.compile trace +
+    Inductor codegen from the actual file processing timings.
 
     :param mode: Cross-correlation mode ('conventional' or 'v1').
     :param npts_seg: Number of samples per time segment.
@@ -91,17 +96,24 @@ def _worker_warmup(
     :param v1_fft_snap_pow2: Whether to snap the v1 algorithm FFTs to powers of two.
     :param v1_fallback: Fallback strategy for the v1 algorithm ('v1_2M' or 'v1_Mp1').
     :param threads_per_proc: Number of PyTorch threads allocated to this worker.
+    :param do_compile: Whether to apply torch.compile to the model.
+    :param compile_mode: Inductor compile mode ('reduce-overhead' or 'default').
     """
     global _WARMED_UP
     if _WARMED_UP:
         return
 
     _set_thread_env(threads_per_proc)
+
+    # Configure PyTorch Threads
     torch.set_num_threads(max(1, threads_per_proc))
     try:
         torch.set_num_interop_threads(1)
     except Exception:
         pass
+
+    # Explicitly enable Intel MKL for Sherlock's Xeon nodes
+    torch.backends.mkl.enabled = True
 
     device = torch.device("cpu")
 
@@ -115,22 +127,30 @@ def _worker_warmup(
     ).to(device)
     model.eval()
 
+    if do_compile:
+        try:
+            model = torch.compile(model, backend="inductor", mode=compile_mode)
+            logger.info("torch.compile() applied in warmup | mode=%s", compile_mode)
+        except Exception as e:
+            logger.warning("torch.compile() failed in warmup (continuing uncompiled): %s", e)
+
     Bwarm = 32
     x = torch.zeros((Bwarm, int(npts_seg)), dtype=torch.float32, device=device)
     y = torch.zeros((Bwarm, int(npts_seg)), dtype=torch.float32, device=device)
 
-    # Perform a dummy forward pass to trigger low-level library initializations
+    # First pass triggers compile trace + codegen. Second confirms steady-state.
     with torch.inference_mode():
         _ = model(x, y)
         _ = model(x, y)
 
     _WARMED_UP = True
     logger.info(
-        "Worker warm-up done | mode=%s | npts_seg=%d | M=%d | threads=%d",
+        "Worker warm-up done | mode=%s | npts_seg=%d | M=%d | threads=%d | compiled=%s",
         mode,
         npts_seg,
         max_lag_samples,
         threads_per_proc,
+        do_compile,
     )
 
 
@@ -151,7 +171,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     :param file_path: Absolute or relative path to the source dataset (.npz or .zarr).
     :param cfg: Master configuration dictionary loaded from the YAML file.
     :return: A dictionary containing performance metrics and the output path:
-             {"out_path": str, "io_time": float, "cc_time": float, "total_time": float}.
+             {"out_path": str, "io_sec": float, "cc_sec": float, "total_time": float}.
              Returns None if the file is skipped or invalid.
     """
     t_total_start = time.perf_counter()
@@ -168,7 +188,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     min_chunk = int(get_cfg(cfg, ["runtime", "min_chunk"], 64))
     max_chunk = int(get_cfg(cfg, ["runtime", "max_chunk"], 4096))
     do_compile = bool(get_cfg(cfg, ["runtime", "torch_compile"], False))
-    compile_mode = str(get_cfg(cfg, ["runtime", "compile_mode"], "max-autotune"))
+    compile_mode = str(get_cfg(cfg, ["runtime", "compile_mode"], "reduce-overhead"))
     njobs = max(1, int(get_cfg(cfg, ["runtime", "njobs"], 1)))
 
     perf_enabled = bool(get_cfg(cfg, ["perf", "enabled"], False))
@@ -320,8 +340,9 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         gc.collect()
         
         if device.type == "cuda":
-            data_tensor = data_tensor.pin_memory()
-        data_tensor = data_tensor.to(device, non_blocking=True)
+            data_tensor = data_tensor.pin_memory().to(device, non_blocking=True)
+        else:
+            data_tensor = data_tensor.to(device)
 
     if mode == "conventional":
         lag_start = (npts_seg - 1) - npts_lag
@@ -358,12 +379,12 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     multi_gpu = device.type == "cuda" and use_gpu and (torch.cuda.device_count() > 1)
     model = nn.DataParallel(model).to(device) if multi_gpu else model.to(device)
 
-    if do_compile and (device.type == "cuda") and (not multi_gpu):
+    if do_compile and (not multi_gpu):
         try:
-            model = torch.compile(model, mode=compile_mode)
-            logger.info("Enabled torch.compile() mode=%s", compile_mode)
+            model = torch.compile(model, backend="inductor", mode=compile_mode)
+            logger.info("Enabled torch.compile() backend=inductor mode=%s", compile_mode)
         except Exception as e:
-            logger.warning("torch.compile() failed: %s", e)
+            logger.warning("torch.compile() failed (continuing without): %s", e)
 
     model.eval()
 
@@ -388,8 +409,8 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             logger.info("Auto-CC already exists, skipping: %s", out_path)
             return {
                 "out_path": str(out_path),
-                "io_time": io_time,
-                "cc_time": 0.0,
+                "io_sec": io_time,
+                "cc_sec": 0.0,
                 "total_time": time.perf_counter() - t_total_start
             }
         
@@ -574,6 +595,9 @@ def main(config_path: str | Path) -> None:
     v1_fft_snap_pow2 = bool(get_cfg(cfg, ["xcorr", "v1_fft_snap_pow2"], True))
     v1_fallback = str(get_cfg(cfg, ["xcorr", "v1_fallback"], "v1_2M"))
 
+    do_compile   = bool(get_cfg(cfg, ["runtime", "torch_compile"], False))
+    compile_mode = str(get_cfg(cfg, ["runtime", "compile_mode"], "reduce-overhead"))
+
     initializer = functools.partial(
         _worker_warmup,
         mode=mode,
@@ -582,6 +606,8 @@ def main(config_path: str | Path) -> None:
         v1_fft_snap_pow2=v1_fft_snap_pow2,
         v1_fallback=v1_fallback,
         threads_per_proc=threads_per_proc,
+        do_compile=do_compile,
+        compile_mode=compile_mode,
     )
 
 
@@ -595,8 +621,8 @@ def main(config_path: str | Path) -> None:
                     logger.info("Done: %s | Total: %.2fs (I/O: %.2fs, CC: %.2fs)", 
                                 Path(result_dict["out_path"]).name, 
                                 result_dict["total_time"], 
-                                result_dict["io_time"], 
-                                result_dict["cc_time"])
+                                result_dict["io_sec"], 
+                                result_dict["cc_sec"])
         except Exception:
             logger.exception("Error processing file")
             write_runlog("Error: see stderr/logs for traceback.")

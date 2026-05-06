@@ -102,7 +102,7 @@ def _output_path_for(cfg: Dict[str, Any], file_path: Path, *, vs_idx: int, mode:
         return out_root / f"{base_no_ext}_cc_{vs_idx:03d}_{mode}.npy"
 
 def _load_npy(path: Path) -> np.ndarray:
-    return np.load(path)
+    return np.load(path, mmap_mode='r')
 
 # -----------------------------------------------------------------------------
 # Metrics (fidelity)
@@ -209,6 +209,8 @@ class BenchmarkRunner:
         initializer = None
         if npts_seg > 0 and M > 0:
             from functools import partial
+            do_compile   = bool(get_cfg(cfg, ["runtime", "torch_compile"], False))
+            compile_mode = str(get_cfg(cfg, ["runtime", "compile_mode"], "reduce-overhead"))
             initializer = partial(
                 _worker_warmup,
                 mode=mode,
@@ -217,6 +219,8 @@ class BenchmarkRunner:
                 v1_fft_snap_pow2=v1_fft_snap_pow2,
                 v1_fallback=v1_fallback,
                 threads_per_proc=threads_per_proc,
+                do_compile=do_compile,
+                compile_mode=compile_mode,
             )
 
         io_times = []

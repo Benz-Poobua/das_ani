@@ -11,14 +11,12 @@ from __future__ import annotations
 
 import logging
 import math
-import os
-from pathlib import Path
 from typing import Any, Optional, Literal
 
 import numpy as np
 import scipy.signal as signal
 import torch
-from scipy.signal import butter, convolve, detrend, filtfilt
+from scipy.signal import detrend
 from scipy.ndimage import uniform_filter1d
 from torch import nn
 
@@ -42,81 +40,47 @@ def bandpass_filter_tukey(
     alpha: float = 0.05,
     order: int = 4,
 ) -> np.ndarray:
-    """
-    Applies a Tukey window and a Butterworth filter along the time axis.
-    Uses 'sos' (Second-Order Sections) for numerical stability at very low frequencies.
-    """
     if data.ndim != 2:
         raise ValueError("bandpass_filter_tukey: data must be 2D (nch × nt).")
-
-    if f1 is None and f2 is None:
-        raise ValueError("Must specify at least one frequency (f1 or f2).")
 
     nyq = fs / 2.0
     nt = int(data.shape[1])
     window = signal.windows.tukey(nt, alpha=float(alpha))
 
-    # 1. Determine filter type and critical frequencies
     if f1 is not None and f2 is not None:
-        if not (0.0 < f1 < f2 < nyq):
-            raise ValueError(f"Invalid f1/f2: require 0 < f1 < f2 < Nyquist={nyq}.")
         btype = "bandpass"
         Wn = [f1 / nyq, f2 / nyq]
-        
     elif f1 is None and f2 is not None:
-        if not (0.0 < f2 < nyq):
-            raise ValueError(f"Invalid f2: require 0 < f2 < Nyquist={nyq}.")
         btype = "lowpass"
         Wn = f2 / nyq
-        
     elif f1 is not None and f2 is None:
-        if not (0.0 < f1 < nyq):
-            raise ValueError(f"Invalid f1: require 0 < f1 < Nyquist={nyq}.")
         btype = "highpass"
         Wn = f1 / nyq
+    else:
+        raise ValueError("Must specify at least one frequency (f1 or f2).")
 
-    # 2. Design the filter using 'sos' (Crucial for 0.1 Hz stability)
     sos = signal.butter(int(order), Wn, btype=btype, output='sos')
-
-    # 3. Apply taper and filter using sosfiltfilt
     tapered = data * window
     filtered = signal.sosfiltfilt(sos, tapered, axis=1)
-
     return filtered.astype(np.float32, copy=False)
 
-
 def temporal_normalization(data: np.ndarray, fs: float, window_time: float) -> np.ndarray:
-    """
-    Vectorized temporal normalization using a running absolute mean.
-    """
     if data.ndim != 2:
         raise ValueError("temporal_normalization: data must be 2D (nch × nt).")
-
-    # 1-Bit Normalization shortcut
     if float(window_time) == 0.0:
         return np.sign(data).astype(np.float32, copy=False)
 
     nwin = max(int(round(fs * float(window_time))), 1)
-
-    # 1. Compute running absolute mean vectorized across the time axis (axis=1)
-    # mode='nearest' automatically handles the edge padding 
     ram = uniform_filter1d(np.abs(data), size=nwin, axis=1, mode='nearest')
-    
-    # 2. Avoid division by zero
     ram = np.where(ram == 0, np.nan, ram)
-    
-    # 3. Normalize and replace NaNs with 0.0
     out = np.nan_to_num(data / ram, nan=0.0)
-
     return out.astype(np.float32, copy=False)
 
-
 # ==============================================================
-# 2. Spectral whitening (torch) - cached kernels/tapers
+# 2. Spectral whitening (torch)
 # ==============================================================
 class _WhiteningCache:
     __slots__ = ("kernel", "taper1", "taper2")
-
     def __init__(self) -> None:
         self.kernel: dict[tuple[Any, ...], torch.Tensor] = {}
         self.taper1: dict[tuple[Any, ...], torch.Tensor] = {}
@@ -128,110 +92,52 @@ class _WhiteningCache:
 
     def get_kernel(self, device: torch.device, dtype: torch.dtype, nwin: int) -> torch.Tensor:
         key = self._key(device, dtype, nwin)
-        k = self.kernel.get(key)
-        if k is None:
-            k = torch.ones((1, 1, nwin), device=device, dtype=dtype) / float(nwin)
-            self.kernel[key] = k
-        return k
+        if key not in self.kernel:
+            self.kernel[key] = torch.ones((1, 1, nwin), device=device, dtype=dtype) / float(nwin)
+        return self.kernel[key]
 
     def get_taper1(self, device: torch.device, dtype: torch.dtype, idxf1: int) -> Optional[torch.Tensor]:
-        if idxf1 <= 0:
-            return None
+        if idxf1 <= 0: return None
         key = self._key(device, dtype, idxf1)
-        t = self.taper1.get(key)
-        if t is None:
-            t = torch.cos(torch.linspace(torch.pi / 2, torch.pi, idxf1, device=device, dtype=dtype)) ** 2
-            self.taper1[key] = t
-        return t
+        if key not in self.taper1:
+            self.taper1[key] = torch.cos(torch.linspace(torch.pi / 2, torch.pi, idxf1, device=device, dtype=dtype)) ** 2
+        return self.taper1[key]
 
     def get_taper2(self, device: torch.device, dtype: torch.dtype, nfreq: int, idxf2: int) -> Optional[torch.Tensor]:
-        if idxf2 >= nfreq:
-            return None
+        if idxf2 >= nfreq: return None
         key = self._key(device, dtype, nfreq, idxf2)
-        t = self.taper2.get(key)
-        if t is None:
+        if key not in self.taper2:
             n = nfreq - idxf2
-            t = torch.cos(torch.linspace(torch.pi, torch.pi / 2, n, device=device, dtype=dtype)) ** 2
-            self.taper2[key] = t
-        return t
-
+            self.taper2[key] = torch.cos(torch.linspace(torch.pi, torch.pi / 2, n, device=device, dtype=dtype)) ** 2
+        return self.taper2[key]
 
 _WHITEN_CACHE = _WhiteningCache()
 
-
-def spectral_whitening(
-    rfftdata: torch.Tensor,
-    df: float,
-    window_freq: float,
-    f1: float,
-    f2: float,
-) -> torch.Tensor:
-    if not isinstance(rfftdata, torch.Tensor):
-        raise TypeError("spectral_whitening: rfftdata must be torch.Tensor.")
-    if not rfftdata.is_complex():
-        raise ValueError("spectral_whitening: rfftdata must be complex.")
-
+def spectral_whitening(rfftdata: torch.Tensor, df: float, window_freq: float, f1: float, f2: float) -> torch.Tensor:
+    if rfftdata.ndim < 2:
+        raise ValueError("spectral_whitening: rfftdata must be at least 2D.")
     device = rfftdata.device
     dtype_amp = rfftdata.real.dtype
-    nfreq = int(rfftdata.shape[1])
+    nfreq = rfftdata.shape[-1]
+    idxf1 = max(0, min(int(f1 / df), nfreq))
+    idxf2 = max(0, min(int(math.ceil(f2 / df)), nfreq))
+    if idxf2 <= idxf1: return torch.zeros_like(rfftdata)
 
-    if df <= 0:
-        idxf1, idxf2 = 0, nfreq
-    else:
-        idxf1 = int(f1 / df)
-        idxf2 = int(math.ceil(f2 / df))
-
-    idxf1 = max(0, min(idxf1, nfreq))
-    idxf2 = max(0, min(idxf2, nfreq))
-
-    if idxf2 <= idxf1:
-        return torch.zeros_like(rfftdata)
-    
-    df = float(df)
-    window_freq = float(window_freq)
-    
-    # Optimize
     if window_freq == 0.0:
-        # Full whitening: Set all amplitudes to 1.0 while keeping original phase
         amp = torch.abs(rfftdata).clamp_(min=1e-10)
         rfft_out = rfftdata / amp
-
     else:
-        nwin = max(int(window_freq / df), 1) if df > 0 else 1
-        if nwin % 2 == 0:
-            nwin += 1
-
+        nwin = max(int(window_freq / df), 1); nwin = nwin + 1 if nwin % 2 == 0 else nwin
         amp = torch.abs(rfftdata)
-        amp_3d = amp.unsqueeze(1)
-
         kernel = _WHITEN_CACHE.get_kernel(device, dtype_amp, nwin)
-        pad = nwin // 2
-        amp_smooth = torch.nn.functional.conv1d(amp_3d, kernel, padding=pad).squeeze(1)
-
-        # Handle potential padding mismatch
-        if amp_smooth.shape[-1] != amp.shape[-1]:
-            if amp_smooth.shape[-1] > amp.shape[-1]:
-                amp_smooth = amp_smooth[..., : amp.shape[-1]]
-            else:
-                amp_smooth = torch.nn.functional.pad(
-                    amp_smooth, (0, amp.shape[-1] - amp_smooth.shape[-1]), mode="replicate"
-                )
-        
-        # Fast in-place clamp to avoid division by zero
-        amp_smooth.clamp_(min=1e-10)
-
-        # ALGEBRAIC SHORTCUT: Direct complex/real division
-        # This replaces: torch.exp(1j * phase) * (amp / amp_smooth)
-        rfft_out = rfftdata / amp_smooth
+        amp_smooth = torch.nn.functional.conv1d(amp.unsqueeze(1), kernel, padding=nwin//2).squeeze(1)
+        if amp_smooth.shape[-1] > amp.shape[-1]: amp_smooth = amp_smooth[..., :amp.shape[-1]]
+        rfft_out = rfftdata / amp_smooth.clamp_(min=1e-10)
 
     t1 = _WHITEN_CACHE.get_taper1(device, dtype_amp, idxf1)
-    if t1 is not None and 0 < idxf1 < nfreq:
-        rfft_out[:, :idxf1] *= t1
-
+    if t1 is not None: rfft_out[..., :idxf1] *= t1
     t2 = _WHITEN_CACHE.get_taper2(device, dtype_amp, nfreq, idxf2)
-    if t2 is not None and 0 <= idxf2 < nfreq:
-        rfft_out[:, idxf2:] *= t2
-
+    if t2 is not None: rfft_out[..., idxf2:] *= t2
     return rfft_out
 
 
@@ -245,6 +151,20 @@ def whiten_per_segment_torch(
     f1: float,
     f2: float,
 ) -> torch.Tensor:
+    """
+    Apply spectral whitening independently to each segment of a multichannel signal.
+
+    Reshapes (nch, npts_new) → (nch*nseg, npts_seg), whitens in the frequency domain,
+    then reshapes back to (nch, npts_new).
+
+    :param x: Input tensor, shape (nch, npts_new). Must be float32.
+    :param fs_proc: Sampling rate after decimation (Hz).
+    :param npts_seg: Samples per segment (must divide npts_new evenly).
+    :param window_freq_hz: Smoothing window width for amplitude spectrum (Hz). 0 = full whitening.
+    :param f1: Low frequency bound for whitening passband (Hz).
+    :param f2: High frequency bound for whitening passband (Hz).
+    :return: Whitened tensor, same shape as input (nch, npts_new), float32.
+    """
     if not isinstance(x, torch.Tensor):
         raise TypeError("whiten_per_segment_torch: x must be a torch.Tensor")
     if x.ndim != 2:
@@ -267,226 +187,105 @@ def whiten_per_segment_torch(
     xw = torch.fft.irfft(Xw, n=npts_seg, dim=-1).to(torch.float32)
     return xw.reshape(nch, npts_new)
 
-
 # ==============================================================
 # 3. Full preprocessing pipeline
 # ==============================================================
-def preprocess(
-    x: np.ndarray | torch.Tensor,
-    fs_raw: float,
-    f1: float,
-    f2: float,
-    decimation: int,
-    diff: bool,
-    ram_win: float,
-) -> np.ndarray | torch.Tensor:
-    if decimation < 1:
-        raise ValueError("preprocess: decimation must be >= 1.")
-
+def preprocess(x: np.ndarray | torch.Tensor, fs_raw: float, f1: float, f2: float, 
+               decimation: int, diff: bool, ram_win: float) -> np.ndarray | torch.Tensor:
     is_tensor = isinstance(x, torch.Tensor)
-    orig_device: Optional[torch.device] = x.device if is_tensor else None
-
+    orig_device = x.device if is_tensor else None
     x_np = convert_to_numpy(x) if is_tensor else np.asarray(x)
-    if x_np.ndim != 2:
-        raise ValueError(f"preprocess: expected 2D (nch × nt); got shape={x_np.shape}")
 
-    if diff:
-        x_np = np.gradient(x_np, axis=-1) * float(fs_raw)
-
+    if diff: x_np = np.gradient(x_np, axis=-1) * float(fs_raw)
     x_np = detrend(x_np, axis=-1)
     x_np = bandpass_filter_tukey(x_np, fs_raw, f1, f2)
-
-    if decimation > 1:
-        x_np = x_np[:, :: int(decimation)]
+    if decimation > 1: x_np = x_np[:, ::int(decimation)]
 
     fs_proc = float(fs_raw) / float(decimation)
-
     x_np -= np.median(x_np, axis=0)
     x_np = temporal_normalization(x_np, fs_proc, float(ram_win))
-    x_np = x_np.astype(np.float32, copy=False)
-
-    if is_tensor:
-        assert orig_device is not None
-        return convert_to_tensor(x_np, device=orig_device)
-
-    return x_np
-
+    
+    return convert_to_tensor(x_np, device=orig_device) if is_tensor else x_np.astype(np.float32)
 
 # ==============================================================
-# 4. Zhang (2025) helper: choose block size
+# 4. Zhang (2026) helper: choose block size
 # ==============================================================
-def choose_block_size_v2(
-    M: int,
-    *,
-    fft_snap_pow2: bool = True,
-    fallback: Literal["v1_2M", "v1_Mp1"] = "v1_2M",
-) -> tuple[int, int]:
-    if M <= 0:
-        raise ValueError("choose_block_size_v2: M must be > 0")
-
-    K_star: Optional[float] = None
+def choose_block_size_v2(M: int, *, fft_snap_pow2: bool = True, 
+                        fallback: Literal["v1_2M", "v1_Mp1"] = "v1_2M") -> tuple[int, int]:
+    K_star = None
     if lambertw is not None:
         z = -1.0 / (4.0 * math.e * float(M))
         try:
             w = lambertw(z, k=-1)
-            w_real = float(w.real)
-            K_star = 2.0 * float(M) * (-w_real - 1.0)
-            if not math.isfinite(K_star) or K_star <= 0.0:
-                K_star = None
-        except Exception:
-            K_star = None
-
-    if K_star is None:
-        K = int(2 * M) if fallback == "v1_2M" else int(M + 1)
-    else:
-        K = int(max(1, round(K_star)))
-
+            K_star = 2.0 * float(M) * (-w.real - 1.0)
+        except Exception: pass
+    
+    K = int(max(1, round(K_star))) if K_star is not None else (int(2*M) if fallback=="v1_2M" else M+1)
     L = int(K + 2 * M)
-    if fft_snap_pow2:
-        L = int(nextpow2(L))
-        K = int(L - 2 * M)
-
-    if K < M + 1:
-        K = M + 1
-        L = int(K + 2 * M)
-        if fft_snap_pow2:
-            L = int(nextpow2(L))
-            K = int(L - 2 * M)
-
+    if fft_snap_pow2: L = int(nextpow2(L)); K = L - 2*M
+    if K < M + 1: K = M + 1; L = int(K + 2*M); L = int(nextpow2(L)) if fft_snap_pow2 else L; K = L - 2*M
     return K, L
-
 
 # ==============================================================
 # 5. Cross-correlation module
 # ==============================================================
 class TorchCrossCorrelation(nn.Module):
-    """
-    mode="conventional": full-lag (2N-1), standard lag ordering
-    mode="v1": short-lag (2M+1) using Zhang block-FFT
-    """
-
-    def __init__(
-        self,
-        *,
-        mode: str = "conventional",
-        max_lag_samples: Optional[int] = None,
-        is_spectral_whitening: bool = False,
-        whitening_params: Optional[tuple[float, float, float, float]] = None,
-        v1_fft_snap_pow2: bool = True,
-        v1_fallback: Literal["v1_2M", "v1_Mp1"] = "v1_2M",
-    ) -> None:
+    def __init__(self, *, mode: str = "conventional", max_lag_samples: Optional[int] = None,
+                 is_spectral_whitening: bool = False, whitening_params: Optional[tuple] = None,
+                 v1_fft_snap_pow2: bool = True, v1_fallback: str = "v1_2M") -> None:
         super().__init__()
-
-        self.mode = str(mode).lower()
-        if self.mode not in {"conventional", "v1"}:
-            raise ValueError(f"Unknown mode={self.mode}. Use 'conventional' or 'v1'.")
-
-        self.max_lag_samples = int(max_lag_samples) if max_lag_samples is not None else None
-        if self.mode == "v1" and self.max_lag_samples is None:
-            raise ValueError("TorchCrossCorrelation(mode='v1'): max_lag_samples is required.")
-
-        self.is_spectral_whitening = bool(is_spectral_whitening)
+        self.mode = mode.lower()
+        self.max_lag_samples = max_lag_samples
+        self.is_spectral_whitening = is_spectral_whitening
         self.whitening_params = whitening_params
-        if self.is_spectral_whitening and self.whitening_params is None:
-            raise ValueError("TorchCrossCorrelation: whitening_params required when whitening enabled.")
-
-        self.v1_fft_snap_pow2 = bool(v1_fft_snap_pow2)
+        self.v1_fft_snap_pow2 = v1_fft_snap_pow2
         self.v1_fallback = v1_fallback
 
-        # conventional cache
-        self._conv_L: Optional[int] = None
-        self._conv_N: Optional[int] = None
-        self._conv_df: Optional[float] = None
-
-        # v1 cache (params + buffers)
-        self._v1_M: Optional[int] = None
-        self._v1_K: Optional[int] = None
-        self._v1_Lfft: Optional[int] = None
-        self._v1_nfreq: Optional[int] = None
-
-        self._v1_buf_key: Optional[tuple[int, int, torch.dtype, torch.device]] = None
-        self._v1_x_t: Optional[torch.Tensor] = None
-        self._v1_y_t: Optional[torch.Tensor] = None
-
-        self._rspec_key: Optional[tuple[int, int, torch.device]] = None
-        self._rspec: Optional[torch.Tensor] = None
+        self._conv_L = self._conv_N = self._conv_df = None
+        self._v1_M = self._v1_K = self._v1_Lfft = self._v1_nfreq = None
+        
+        # Legacy buffers (needed for A-B testing/benchmarking)
+        self._v1_buf_key = self._v1_x_t = self._v1_y_t = None
+        self._rspec_key = self._rspec = None
 
         if self.mode == "v1":
-            self._v1_M = int(self.max_lag_samples)
-            self._v1_K, self._v1_Lfft = choose_block_size_v2(
-                self._v1_M, fft_snap_pow2=self.v1_fft_snap_pow2, fallback=self.v1_fallback
-            )
-            self._v1_nfreq = int(self._v1_Lfft // 2 + 1)
-
-        logger.info(
-            "TorchCrossCorrelation init | mode=%s | max_lag=%s | internal_whitening=%s",
-            self.mode,
-            self.max_lag_samples,
-            self.is_spectral_whitening,
-        )
+            self._v1_M = int(max_lag_samples)
+            self._v1_K, self._v1_Lfft = choose_block_size_v2(self._v1_M, fft_snap_pow2=v1_fft_snap_pow2, fallback=v1_fallback)
+            self._v1_nfreq = self._v1_Lfft // 2 + 1
 
     def _forward_conventional(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
-        if data1.ndim != 2 or data2.ndim != 2:
-            raise ValueError("conventional: inputs must be 2D (B × N).")
-        if data1.shape != data2.shape:
-            raise ValueError("conventional: shape mismatch")
-        if data1.device != data2.device:
-            raise ValueError("conventional: device mismatch")
-
-        N = int(data1.shape[1])
-
+        N = data1.shape[1]
         if self._conv_L is None or self._conv_N != N:
-            L_lin = 2 * N - 1
-            L = int(nextpow2(L_lin))
-            self._conv_L = L
-            self._conv_N = N
-            if self.is_spectral_whitening:
-                assert self.whitening_params is not None
-                fs = float(self.whitening_params[0])
-                self._conv_df = fs / float(L)
-            else:
-                self._conv_df = None
-
-        L = int(self._conv_L)
-        X = torch.fft.rfft(data1, n=L, dim=-1)
-        Y = torch.fft.rfft(data2, n=L, dim=-1)
-
+            self._conv_L = int(nextpow2(2 * N - 1)); self._conv_N = N
+            self._conv_df = self.whitening_params[0] / self._conv_L if self.is_spectral_whitening else None
+        
+        X = torch.fft.rfft(data1, n=self._conv_L, dim=-1)
+        Y = torch.fft.rfft(data2, n=self._conv_L, dim=-1)
         if self.is_spectral_whitening:
-            assert self.whitening_params is not None
-            _, window_freq, f1, f2 = self.whitening_params
-            df = float(self._conv_df) if self._conv_df is not None else float(self.whitening_params[0]) / float(L)
-            X = spectral_whitening(X, df, float(window_freq), float(f1), float(f2))
-            Y = spectral_whitening(Y, df, float(window_freq), float(f1), float(f2))
+            X = spectral_whitening(X, self._conv_df, *self.whitening_params[1:])
+            Y = spectral_whitening(Y, self._conv_df, *self.whitening_params[1:])
+        
+        r = torch.fft.irfft(torch.conj(X) * Y, n=self._conv_L, dim=-1)
+        return torch.cat([r[:, self._conv_L-(N-1):], r[:, :N]], dim=-1).to(torch.float32)
 
-        r = torch.fft.irfft(torch.conj(X) * Y, n=L, dim=-1)
-        cc_full = torch.cat([r[:, L - (N - 1) : L], r[:, :N]], dim=-1)
-        return cc_full.to(dtype=torch.float32)
-
-    def _v1_get_buffers(
-        self,
-        B: int,
-        Lfft: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (int(B), int(Lfft), dtype, device)
-        if self._v1_buf_key != key or self._v1_x_t is None or self._v1_y_t is None:
+    def _v1_get_buffers(self, B, Lfft, dtype, device):
+        key = (B, Lfft, dtype, device)
+        if self._v1_buf_key != key:
             self._v1_buf_key = key
             self._v1_x_t = torch.zeros((B, Lfft), device=device, dtype=dtype)
             self._v1_y_t = torch.zeros((B, Lfft), device=device, dtype=dtype)
         return self._v1_x_t, self._v1_y_t
 
-    def _v1_get_rspec(self, B: int, nfreq: int, device: torch.device) -> torch.Tensor:
-        key = (int(B), int(nfreq), device)
-        if self._rspec_key != key or self._rspec is None:
+    def _v1_get_rspec(self, B, nfreq, device):
+        key = (B, nfreq, device)
+        if self._rspec_key != key:
             self._rspec_key = key
             self._rspec = torch.zeros((B, nfreq), dtype=torch.complex64, device=device)
-        else:
-            self._rspec.zero_()
+        else: self._rspec.zero_()
         return self._rspec
 
     @torch.no_grad()
-    def _forward_v1_python_fft(self, signal_1: torch.Tensor, signal_2: torch.Tensor) -> torch.Tensor:
+    def _forward_v1_batched(self, signal_1: torch.Tensor, signal_2: torch.Tensor) -> torch.Tensor:
         if signal_1.ndim != 2 or signal_2.ndim != 2:
             raise ValueError("v1: inputs must be 2D (B × N).")
         if signal_1.shape != signal_2.shape:
@@ -497,71 +296,63 @@ class TorchCrossCorrelation(nn.Module):
             raise ValueError("v1: dtype mismatch")
         if signal_1.is_complex() or signal_2.is_complex():
             raise ValueError("v1: expects real tensors")
+        if self._v1_M is None or self._v1_K is None or self._v1_Lfft is None or self._v1_nfreq is None:
+            raise RuntimeError("v1: module not initialised (M/K/Lfft/nfreq is None).")
 
-        assert self._v1_M is not None and self._v1_K is not None and self._v1_Lfft is not None and self._v1_nfreq is not None
-
-        M = int(self._v1_M)
-        K = int(self._v1_K)
-        Lfft = int(self._v1_Lfft)
-
-        B, N = int(signal_1.shape[0]), int(signal_1.shape[1])
+        M, K, Lfft = self._v1_M, self._v1_K, self._v1_Lfft
+        B, N = signal_1.shape[0], signal_1.shape[1]
         nblocks = (N + K - 1) // K
-        nfreq = int(self._v1_nfreq)
+        
+        x_blocked = torch.zeros((B, nblocks, Lfft), dtype=signal_1.dtype, device=signal_1.device)
+        y_blocked = torch.zeros((B, nblocks, Lfft), dtype=signal_1.dtype, device=signal_1.device)
 
-        Rspec = self._v1_get_rspec(B, nfreq, signal_1.device)
-        x_t, y_t = self._v1_get_buffers(B, Lfft, signal_1.dtype, signal_1.device)
-
-        if self.is_spectral_whitening:
-            assert self.whitening_params is not None
-            fs, window_freq, f1, f2 = self.whitening_params
-            df = float(fs) / float(Lfft)
-            window_freq = float(window_freq)
-            f1 = float(f1)
-            f2 = float(f2)
-
-        rfft = torch.fft.rfft
-        irfft = torch.fft.irfft
-
-        for l in range(nblocks):
-            start = l * K
+        for blk in range(nblocks):
+            start = blk * K
             end = min(start + K, N)
             klen = end - start
-
-            # Full zero is simple and reliable for Pure Python
-            x_t.zero_()
-            y_t.zero_()
-
-            # Narrow+copy_ is usually faster than advanced indexing
-            y_dst = y_t.narrow(1, M, klen)
-            y_src = signal_2.narrow(1, start, klen)
-            y_dst.copy_(y_src)
-
-            x0 = start - M
-            x1 = start + K + M
-            ix0 = max(0, x0)
-            ix1 = min(N, x1)
+            y_blocked[:, blk, M : M + klen] = signal_2[:, start : end]
+            x0 = start - M; ix0 = max(0, x0); ix1 = min(N, start + K + M)
             if ix1 > ix0:
-                length = ix1 - ix0
-                dst0 = ix0 - x0
-                x_dst = x_t.narrow(1, dst0, length)
-                x_src = signal_1.narrow(1, ix0, length)
-                x_dst.copy_(x_src)
+                x_blocked[:, blk, (ix0 - x0) : (ix0 - x0) + (ix1 - ix0)] = signal_1[:, ix0 : ix1]
 
-            X = rfft(x_t, n=Lfft, dim=-1)
-            Y = rfft(y_t, n=Lfft, dim=-1)
+        X = torch.fft.rfft(x_blocked, n=Lfft, dim=-1)
+        Y = torch.fft.rfft(y_blocked, n=Lfft, dim=-1)
+        del x_blocked, y_blocked
 
+        if self.is_spectral_whitening:
+            df = self.whitening_params[0] / Lfft
+            Bnb, nfreq = B * nblocks, self._v1_nfreq
+            X = spectral_whitening(X.reshape(Bnb, nfreq), df, *self.whitening_params[1:]).reshape(B, nblocks, nfreq)
+            Y = spectral_whitening(Y.reshape(Bnb, nfreq), df, *self.whitening_params[1:]).reshape(B, nblocks, nfreq)
+
+        Rspec = (X.conj() * Y).sum(dim=1)
+        r = torch.fft.irfft(Rspec, n=Lfft, dim=-1)
+        return torch.cat([r[:, Lfft - M : Lfft], r[:, 0 : M + 1]], dim=-1).to(torch.float32)
+
+    @torch.no_grad()
+    def _forward_v1_python_fft(self, signal_1, signal_2):
+        M, K, Lfft, nfreq = self._v1_M, self._v1_K, self._v1_Lfft, self._v1_nfreq
+        B, N = signal_1.shape[0], signal_1.shape[1]
+        nblocks = (N + K - 1) // K
+        Rspec = self._v1_get_rspec(B, nfreq, signal_1.device)
+        x_t, y_t = self._v1_get_buffers(B, Lfft, signal_1.dtype, signal_1.device)
+        
+        df = self.whitening_params[0] / Lfft if self.is_spectral_whitening else 0
+        for l in range(nblocks):
+            start = l * K; end = min(start + K, N); klen = end - start
+            x_t.zero_(); y_t.zero_()
+            y_t.narrow(1, M, klen).copy_(signal_2.narrow(1, start, klen))
+            ix0 = max(0, start - M); ix1 = min(N, start + K + M)
+            if ix1 > ix0:
+                x_t.narrow(1, ix0-(start-M), ix1-ix0).copy_(signal_1.narrow(1, ix0, ix1-ix0))
+            X, Y = torch.fft.rfft(x_t, n=Lfft, dim=-1), torch.fft.rfft(y_t, n=Lfft, dim=-1)
             if self.is_spectral_whitening:
-                X = spectral_whitening(X, df, window_freq, f1, f2)
-                Y = spectral_whitening(Y, df, window_freq, f1, f2)
-
+                X = spectral_whitening(X, df, *self.whitening_params[1:])
+                Y = spectral_whitening(Y, df, *self.whitening_params[1:])
             Rspec.addcmul_(X.conj(), Y)
-
-        r = irfft(Rspec, n=Lfft, dim=-1)
-        out = torch.cat([r[:, Lfft - M : Lfft], r[:, 0 : M + 1]], dim=-1)
-        return out.to(dtype=torch.float32)
+        r = torch.fft.irfft(Rspec, n=Lfft, dim=-1)
+        return torch.cat([r[:, Lfft - M : Lfft], r[:, 0 : M + 1]], dim=-1).to(torch.float32)
 
     def forward(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
-        if self.mode == "conventional":
-            return self._forward_conventional(data1, data2)
-            
-        return self._forward_v1_python_fft(data1, data2)
+        if self.mode == "conventional": return self._forward_conventional(data1, data2)
+        return self._forward_v1_batched(data1, data2)
