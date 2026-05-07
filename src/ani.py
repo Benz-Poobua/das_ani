@@ -129,10 +129,18 @@ def spectral_whitening(rfftdata: torch.Tensor, df: float, window_freq: float, f1
     else:
         nwin = max(int(window_freq / df), 1); nwin = nwin + 1 if nwin % 2 == 0 else nwin
         amp = torch.abs(rfftdata)
+        
+        # Flattens all leading dimensions so conv1d handles 2D, 3D, or 4D tensors seamlessly
+        orig_shape = amp.shape
+        amp_flat = amp.reshape(-1, 1, nfreq)
+        
         kernel = _WHITEN_CACHE.get_kernel(device, dtype_amp, nwin)
-        amp_smooth = torch.nn.functional.conv1d(amp.unsqueeze(1), kernel, padding=nwin//2).squeeze(1)
-        if amp_smooth.shape[-1] > amp.shape[-1]: amp_smooth = amp_smooth[..., :amp.shape[-1]]
-        rfft_out = rfftdata / amp_smooth.clamp_(min=1e-10)
+        amp_smooth = torch.nn.functional.conv1d(amp_flat, kernel, padding=nwin//2).squeeze(1)
+        
+        if amp_smooth.shape[-1] > nfreq: 
+            amp_smooth = amp_smooth[..., :nfreq]
+            
+        rfft_out = rfftdata / amp_smooth.reshape(orig_shape).clamp_(min=1e-10)
 
     t1 = _WHITEN_CACHE.get_taper1(device, dtype_amp, idxf1)
     if t1 is not None: rfft_out[..., :idxf1] *= t1
@@ -151,20 +159,6 @@ def whiten_per_segment_torch(
     f1: float,
     f2: float,
 ) -> torch.Tensor:
-    """
-    Apply spectral whitening independently to each segment of a multichannel signal.
-
-    Reshapes (nch, npts_new) → (nch*nseg, npts_seg), whitens in the frequency domain,
-    then reshapes back to (nch, npts_new).
-
-    :param x: Input tensor, shape (nch, npts_new). Must be float32.
-    :param fs_proc: Sampling rate after decimation (Hz).
-    :param npts_seg: Samples per segment (must divide npts_new evenly).
-    :param window_freq_hz: Smoothing window width for amplitude spectrum (Hz). 0 = full whitening.
-    :param f1: Low frequency bound for whitening passband (Hz).
-    :param f2: High frequency bound for whitening passband (Hz).
-    :return: Whitened tensor, same shape as input (nch, npts_new), float32.
-    """
     if not isinstance(x, torch.Tensor):
         raise TypeError("whiten_per_segment_torch: x must be a torch.Tensor")
     if x.ndim != 2:
@@ -254,18 +248,29 @@ class TorchCrossCorrelation(nn.Module):
             self._v1_nfreq = self._v1_Lfft // 2 + 1
 
     def _forward_conventional(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
-        N = data1.shape[1]
+        # Auto-unsqueeze 2D -> 3D for generic processing
+        if data1.ndim == 2:
+            data1 = data1.unsqueeze(1)
+            data2 = data2.unsqueeze(1)
+            
+        B, nseg, N = data1.shape
         if self._conv_L is None or self._conv_N != N:
             self._conv_L = int(nextpow2(2 * N - 1)); self._conv_N = N
             self._conv_df = self.whitening_params[0] / self._conv_L if self.is_spectral_whitening else None
         
+        # 1. Forward FFT along the time dimension
         X = torch.fft.rfft(data1, n=self._conv_L, dim=-1)
         Y = torch.fft.rfft(data2, n=self._conv_L, dim=-1)
+        
         if self.is_spectral_whitening:
             X = spectral_whitening(X, self._conv_df, *self.whitening_params[1:])
             Y = spectral_whitening(Y, self._conv_df, *self.whitening_params[1:])
         
-        r = torch.fft.irfft(torch.conj(X) * Y, n=self._conv_L, dim=-1)
+        # 2. Multiply and Frequency-Domain Stacking (sum over nseg)
+        Rspec = (torch.conj(X) * Y).sum(dim=1)
+        
+        # 3. SINGLE Inverse FFT
+        r = torch.fft.irfft(Rspec, n=self._conv_L, dim=-1)
         return torch.cat([r[:, self._conv_L-(N-1):], r[:, :N]], dim=-1).to(torch.float32)
 
     def _v1_get_buffers(self, B, Lfft, dtype, device):
@@ -286,51 +291,58 @@ class TorchCrossCorrelation(nn.Module):
 
     @torch.no_grad()
     def _forward_v1_batched(self, signal_1: torch.Tensor, signal_2: torch.Tensor) -> torch.Tensor:
-        if signal_1.ndim != 2 or signal_2.ndim != 2:
-            raise ValueError("v1: inputs must be 2D (B × N).")
+        if signal_1.ndim == 2:
+            signal_1 = signal_1.unsqueeze(1)
+            signal_2 = signal_2.unsqueeze(1)
+            
+        if signal_1.ndim != 3 or signal_2.ndim != 3:
+            raise ValueError("v1: inputs must be 2D (B, N) or 3D (B, nseg, N).")
         if signal_1.shape != signal_2.shape:
             raise ValueError("v1: shape mismatch")
-        if signal_1.device != signal_2.device:
-            raise ValueError("v1: device mismatch")
-        if signal_1.dtype != signal_2.dtype:
-            raise ValueError("v1: dtype mismatch")
-        if signal_1.is_complex() or signal_2.is_complex():
-            raise ValueError("v1: expects real tensors")
-        if self._v1_M is None or self._v1_K is None or self._v1_Lfft is None or self._v1_nfreq is None:
-            raise RuntimeError("v1: module not initialised (M/K/Lfft/nfreq is None).")
-
+            
         M, K, Lfft = self._v1_M, self._v1_K, self._v1_Lfft
-        B, N = signal_1.shape[0], signal_1.shape[1]
+        B, nseg, N = signal_1.shape
         nblocks = (N + K - 1) // K
         
-        x_blocked = torch.zeros((B, nblocks, Lfft), dtype=signal_1.dtype, device=signal_1.device)
-        y_blocked = torch.zeros((B, nblocks, Lfft), dtype=signal_1.dtype, device=signal_1.device)
+        # 4D Block Allocation: (Batch, Segments, Blocks, Time)
+        x_blocked = torch.zeros((B, nseg, nblocks, Lfft), dtype=signal_1.dtype, device=signal_1.device)
+        y_blocked = torch.zeros((B, nseg, nblocks, Lfft), dtype=signal_1.dtype, device=signal_1.device)
 
         for blk in range(nblocks):
             start = blk * K
             end = min(start + K, N)
             klen = end - start
-            y_blocked[:, blk, M : M + klen] = signal_2[:, start : end]
+            y_blocked[:, :, blk, M : M + klen] = signal_2[:, :, start : end]
             x0 = start - M; ix0 = max(0, x0); ix1 = min(N, start + K + M)
             if ix1 > ix0:
-                x_blocked[:, blk, (ix0 - x0) : (ix0 - x0) + (ix1 - ix0)] = signal_1[:, ix0 : ix1]
+                x_blocked[:, :, blk, (ix0 - x0) : (ix0 - x0) + (ix1 - ix0)] = signal_1[:, :, ix0 : ix1]
 
+        # 1. Forward FFT along the block-time dimension
         X = torch.fft.rfft(x_blocked, n=Lfft, dim=-1)
         Y = torch.fft.rfft(y_blocked, n=Lfft, dim=-1)
         del x_blocked, y_blocked
 
         if self.is_spectral_whitening:
             df = self.whitening_params[0] / Lfft
-            Bnb, nfreq = B * nblocks, self._v1_nfreq
-            X = spectral_whitening(X.reshape(Bnb, nfreq), df, *self.whitening_params[1:]).reshape(B, nblocks, nfreq)
-            Y = spectral_whitening(Y.reshape(Bnb, nfreq), df, *self.whitening_params[1:]).reshape(B, nblocks, nfreq)
+            X = spectral_whitening(X, df, *self.whitening_params[1:])
+            Y = spectral_whitening(Y, df, *self.whitening_params[1:])
 
-        Rspec = (X.conj() * Y).sum(dim=1)
+        # 2. Multiply and Frequency-Domain Stacking (Sum over nseg AND nblocks)
+        Rspec = (X.conj() * Y).sum(dim=(1, 2))
+        
+        # 3. SINGLE Inverse FFT
         r = torch.fft.irfft(Rspec, n=Lfft, dim=-1)
         return torch.cat([r[:, Lfft - M : Lfft], r[:, 0 : M + 1]], dim=-1).to(torch.float32)
 
     @torch.no_grad()
     def _forward_v1_python_fft(self, signal_1, signal_2):
+        # Legacy loop: Flattens 3D back to 2D internally to maintain backward compatibility for tests
+        is_3d = signal_1.ndim == 3
+        if is_3d:
+            B, nseg, N = signal_1.shape
+            signal_1 = signal_1.reshape(B * nseg, N)
+            signal_2 = signal_2.reshape(B * nseg, N)
+            
         M, K, Lfft, nfreq = self._v1_M, self._v1_K, self._v1_Lfft, self._v1_nfreq
         B, N = signal_1.shape[0], signal_1.shape[1]
         nblocks = (N + K - 1) // K
@@ -351,7 +363,13 @@ class TorchCrossCorrelation(nn.Module):
                 Y = spectral_whitening(Y, df, *self.whitening_params[1:])
             Rspec.addcmul_(X.conj(), Y)
         r = torch.fft.irfft(Rspec, n=Lfft, dim=-1)
-        return torch.cat([r[:, Lfft - M : Lfft], r[:, 0 : M + 1]], dim=-1).to(torch.float32)
+        out = torch.cat([r[:, Lfft - M : Lfft], r[:, 0 : M + 1]], dim=-1)
+        
+        if is_3d:
+            # Re-sum over segments to match the output shape of the new batched methods
+            out = out.reshape(-1, nseg, out.shape[-1]).sum(dim=1)
+            
+        return out.to(torch.float32)
 
     def forward(self, data1: torch.Tensor, data2: torch.Tensor) -> torch.Tensor:
         if self.mode == "conventional": return self._forward_conventional(data1, data2)
