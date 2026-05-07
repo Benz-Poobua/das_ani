@@ -16,7 +16,7 @@ from typing import Any, Optional, Literal
 import numpy as np
 import scipy.signal as signal
 import torch
-from scipy.signal import detrend
+from scipy.signal import decimate, detrend
 from scipy.ndimage import uniform_filter1d
 from torch import nn
 
@@ -65,16 +65,41 @@ def bandpass_filter_tukey(
     return filtered.astype(np.float32, copy=False)
 
 def temporal_normalization(data: np.ndarray, fs: float, window_time: float) -> np.ndarray:
+    """
+    Vectorized temporal normalization using a running absolute mean (RAM).
+
+    For window_time == 0.0: applies 1-bit normalization (np.sign).
+    Otherwise: divides each sample by the local running absolute mean computed
+    over a window of length round(fs * window_time) samples.
+
+    Memory layout:
+        ram  : float64, shape (nch, nt)  — running absolute mean
+        out  : float32, shape (nch, nt)  — result, pre-allocated as zeros
+
+    np.divide(..., out=out, where=ram > 0) writes directly into out only where
+    the denominator is nonzero, leaving zeros elsewhere. This replaces the
+    previous three-array chain (np.where → nan intermediate → nan_to_num)
+    with a single in-place division — halving allocations and eliminating
+    two full array passes over (nch × nt) data.
+
+    :param data: Input array, shape (nch, nt), float32 or float64.
+    :param fs: Sampling rate (Hz).
+    :param window_time: RAM window duration (seconds). 0.0 = 1-bit normalization.
+    :return: Normalized array, shape (nch, nt), float32.
+    """
     if data.ndim != 2:
         raise ValueError("temporal_normalization: data must be 2D (nch × nt).")
     if float(window_time) == 0.0:
         return np.sign(data).astype(np.float32, copy=False)
 
     nwin = max(int(round(fs * float(window_time))), 1)
-    ram = uniform_filter1d(np.abs(data), size=nwin, axis=1, mode='nearest')
-    ram = np.where(ram == 0, np.nan, ram)
-    out = np.nan_to_num(data / ram, nan=0.0)
-    return out.astype(np.float32, copy=False)
+    ram  = uniform_filter1d(np.abs(data), size=nwin, axis=1, mode='nearest')
+
+    # Pre-allocate output as float32 zeros. Locations where ram == 0 stay zero
+    # (same semantic as the previous nan → 0.0 path, without the NaN intermediate).
+    out = np.zeros(data.shape, dtype=np.float32)
+    np.divide(data, ram, out=out, where=ram > 0)
+    return out
 
 # ==============================================================
 # 2. Spectral whitening (torch)
@@ -158,7 +183,34 @@ def whiten_per_segment_torch(
     window_freq_hz: float,
     f1: float,
     f2: float,
+    chunk_nch: int = 64,
 ) -> torch.Tensor:
+    """
+    Apply spectral whitening independently to each segment of a multichannel signal.
+
+    Processes channels in groups of chunk_nch to cap peak memory usage.
+    Without chunking, the full (nch × nseg, npts_seg) tensor is materialised at
+    once — for Bridge (421 ch, nseg=60, npts_seg=2500) this produces three
+    simultaneous ~240 MB complex tensors (~720 MB peak). With chunk_nch=64 the
+    peak drops to ~115 MB regardless of total channel count, keeping the working
+    set closer to L3 cache.
+
+    Memory per chunk (three tensors live simultaneously):
+        chunk_nch × nseg × npts_seg × 4B × 3
+        e.g. 64 × 60 × 2500 × 4 × 3 ≈ 115 MB  (Bridge)
+        e.g. 64 × 10 × 15000 × 4 × 3 ≈ 115 MB  (Urban)
+
+    :param x: Input tensor, shape (nch, npts_new). Must be float32.
+    :param fs_proc: Sampling rate after decimation (Hz).
+    :param npts_seg: Samples per segment (must divide npts_new evenly).
+    :param window_freq_hz: Smoothing window for amplitude spectrum (Hz). 0 = full whitening.
+    :param f1: Low frequency bound of whitening passband (Hz).
+    :param f2: High frequency bound of whitening passband (Hz).
+    :param chunk_nch: Number of channels to whiten per chunk. Tune this to
+        balance memory vs loop overhead. Default 64 works well for all current
+        datasets. Reduce if RAM is tight; increase for low-nseg datasets.
+    :return: Whitened tensor, same shape as input (nch, npts_new), float32.
+    """
     if not isinstance(x, torch.Tensor):
         raise TypeError("whiten_per_segment_torch: x must be a torch.Tensor")
     if x.ndim != 2:
@@ -169,36 +221,114 @@ def whiten_per_segment_torch(
         raise ValueError("whiten_per_segment_torch: npts_seg must be > 0")
     if npts_new % npts_seg != 0:
         raise ValueError("whiten_per_segment_torch: npts_new must be divisible by npts_seg")
+    if chunk_nch < 1:
+        raise ValueError("whiten_per_segment_torch: chunk_nch must be >= 1")
 
     nseg = npts_new // npts_seg
-    B = nch * nseg
-    df = float(fs_proc) / float(npts_seg)
+    df   = float(fs_proc) / float(npts_seg)
+    x    = x.to(dtype=torch.float32)
+    out  = torch.empty_like(x)
 
-    x = x.to(dtype=torch.float32)
-    x2 = x.reshape(B, npts_seg)
-    X = torch.fft.rfft(x2, n=npts_seg, dim=-1)
-    Xw = spectral_whitening(X, df, float(window_freq_hz), float(f1), float(f2))
-    xw = torch.fft.irfft(Xw, n=npts_seg, dim=-1).to(torch.float32)
-    return xw.reshape(nch, npts_new)
+    for ch0 in range(0, nch, chunk_nch):
+        ch1   = min(ch0 + chunk_nch, nch)
+        B     = (ch1 - ch0) * nseg                        # rows for this chunk
+
+        # Reshape chunk: (chunk_nch, npts_new) → (chunk_nch × nseg, npts_seg)
+        x2    = x[ch0:ch1, :].reshape(B, npts_seg)
+        X     = torch.fft.rfft(x2, n=npts_seg, dim=-1)
+        Xw    = spectral_whitening(X, df, float(window_freq_hz), float(f1), float(f2))
+        xw    = torch.fft.irfft(Xw, n=npts_seg, dim=-1).to(torch.float32)
+
+        # Write result back: (chunk_nch × nseg, npts_seg) → (chunk_nch, npts_new)
+        out[ch0:ch1, :] = xw.reshape(ch1 - ch0, npts_new)
+
+    return out
 
 # ==============================================================
 # 3. Full preprocessing pipeline
 # ==============================================================
-def preprocess(x: np.ndarray | torch.Tensor, fs_raw: float, f1: float, f2: float, 
+def preprocess(x: np.ndarray | torch.Tensor, fs_raw: float, f1: float, f2: float,
                decimation: int, diff: bool, ram_win: float) -> np.ndarray | torch.Tensor:
+    """
+    Full DAS preprocessing pipeline: diff → detrend → bandpass → decimate → median
+    removal → temporal normalisation.
+
+    Decimation notes
+    ----------------
+    decimation=1 : no-op, data is unchanged.
+    decimation>1 : uses scipy.signal.decimate (Chebyshev lowpass + downsample,
+                   zero-phase). Naive slicing (x[:, ::q]) is intentionally NOT
+                   used because it skips the anti-aliasing filter, which can fold
+                   energy from [Nyquist_decimated, Nyquist_raw] back into the
+                   passband. A ValueError is raised if f2 >= Nyquist_decimated
+                   (i.e. the bandpass would alias), and a UserWarning is issued
+                   if f2 > 0.8 × Nyquist_decimated (close to the alias boundary).
+
+    :param x: Input data, shape (nch, nt).
+    :param fs_raw: Raw sampling rate (Hz).
+    :param f1: Bandpass low corner (Hz).
+    :param f2: Bandpass high corner (Hz).
+    :param decimation: Integer downsampling factor (>= 1).
+    :param diff: If True, differentiate along time axis first (strain → strain-rate).
+    :param ram_win: Running absolute mean window (seconds). 0 = 1-bit normalisation.
+    :return: Preprocessed array, same type as input, shape (nch, nt_proc), float32.
+    """
+    import warnings
+
+    if decimation < 1:
+        raise ValueError(f"preprocess: decimation must be >= 1, got {decimation}.")
+
     is_tensor = isinstance(x, torch.Tensor)
     orig_device = x.device if is_tensor else None
     x_np = convert_to_numpy(x) if is_tensor else np.asarray(x)
 
-    if diff: x_np = np.gradient(x_np, axis=-1) * float(fs_raw)
+    if x_np.ndim != 2:
+        raise ValueError(f"preprocess: expected 2D (nch × nt); got shape {x_np.shape}.")
+
+    # --- Differentiation (strain → strain-rate) ---
+    if diff:
+        x_np = np.gradient(x_np, axis=-1) * float(fs_raw)
+
+    # --- Detrend + bandpass ---
     x_np = detrend(x_np, axis=-1)
     x_np = bandpass_filter_tukey(x_np, fs_raw, f1, f2)
-    if decimation > 1: x_np = x_np[:, ::int(decimation)]
 
+    # --- Decimation with anti-alias guard ---
+    if decimation > 1:
+        nyq_decimated = float(fs_raw) / (2.0 * float(decimation))
+
+        # Hard error: f2 at or above the decimated Nyquist means the signal
+        # of interest cannot survive downsampling — aliasing is unavoidable.
+        if float(f2) >= nyq_decimated:
+            raise ValueError(
+                f"preprocess: f2={f2} Hz >= Nyquist after decimation "
+                f"({nyq_decimated:.2f} Hz at fs_raw={fs_raw} Hz, decimation={decimation}). "
+                f"Reduce decimation or lower f2 to avoid aliasing."
+            )
+
+        # Soft warning: f2 within 20% of the decimated Nyquist. The anti-alias
+        # filter in scipy.decimate attenuates here, but the transition band may
+        # clip some signal energy near f2.
+        if float(f2) > 0.8 * nyq_decimated:
+            warnings.warn(
+                f"preprocess: f2={f2} Hz is within 20% of the decimated Nyquist "
+                f"({nyq_decimated:.2f} Hz). Some signal energy near f2 may be "
+                f"attenuated by the anti-alias filter. Consider reducing decimation "
+                f"or lowering f2.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # scipy.signal.decimate: Chebyshev type-I lowpass at Nyquist_decimated,
+        # then downsamples by q. zero_phase=True uses sosfiltfilt (same as our
+        # bandpass — no phase distortion).
+        x_np = decimate(x_np, q=int(decimation), axis=-1, zero_phase=True)
+
+    # --- Median removal + temporal normalisation ---
     fs_proc = float(fs_raw) / float(decimation)
-    x_np -= np.median(x_np, axis=0)
-    x_np = temporal_normalization(x_np, fs_proc, float(ram_win))
-    
+    x_np   -= np.median(x_np, axis=0)
+    x_np    = temporal_normalization(x_np, fs_proc, float(ram_win))
+
     return convert_to_tensor(x_np, device=orig_device) if is_tensor else x_np.astype(np.float32)
 
 # ==============================================================
@@ -304,20 +434,29 @@ class TorchCrossCorrelation(nn.Module):
         B, nseg, N = signal_1.shape
         nblocks = (N + K - 1) // K
         
-        # 4D Block Allocation: (Batch, Segments, Blocks, Time)
-        x_blocked = torch.zeros((B, nseg, nblocks, Lfft), dtype=signal_1.dtype, device=signal_1.device)
-        y_blocked = torch.zeros((B, nseg, nblocks, Lfft), dtype=signal_1.dtype, device=signal_1.device)
+        # --- The 3D Merged Batch Optimization ---
+        Bn = B * nseg
+        x_blocked = torch.zeros((Bn, nblocks, Lfft), dtype=signal_1.dtype, device=signal_1.device)
+        y_blocked = torch.zeros((Bn, nblocks, Lfft), dtype=signal_1.dtype, device=signal_1.device)
+
+        s1 = signal_1.reshape(Bn, N)
+        s2 = signal_2.reshape(Bn, N)
 
         for blk in range(nblocks):
             start = blk * K
             end = min(start + K, N)
             klen = end - start
-            y_blocked[:, :, blk, M : M + klen] = signal_2[:, :, start : end]
-            x0 = start - M; ix0 = max(0, x0); ix1 = min(N, start + K + M)
+            y_blocked[:, blk, M : M + klen] = s2[:, start : end]
+            x0 = start - M
+            ix0 = max(0, x0)
+            ix1 = min(N, start + K + M)
             if ix1 > ix0:
-                x_blocked[:, :, blk, (ix0 - x0) : (ix0 - x0) + (ix1 - ix0)] = signal_1[:, :, ix0 : ix1]
+                dst0 = ix0 - x0
+                length = ix1 - ix0
+                x_blocked[:, blk, dst0 : dst0 + length] = s1[:, ix0 : ix1]
 
-        # 1. Forward FFT along the block-time dimension
+        del s1, s2
+
         X = torch.fft.rfft(x_blocked, n=Lfft, dim=-1)
         Y = torch.fft.rfft(y_blocked, n=Lfft, dim=-1)
         del x_blocked, y_blocked
@@ -327,10 +466,11 @@ class TorchCrossCorrelation(nn.Module):
             X = spectral_whitening(X, df, *self.whitening_params[1:])
             Y = spectral_whitening(Y, df, *self.whitening_params[1:])
 
-        # 2. Multiply and Frequency-Domain Stacking (Sum over nseg AND nblocks)
-        Rspec = (X.conj() * Y).sum(dim=(1, 2))
+        # Frequency-Domain Stacking (Sum over nseg AND nblocks)
+        Rspec = (X.conj() * Y).sum(dim=1)
+        Rspec = Rspec.reshape(B, nseg, X.shape[-1]).sum(dim=1)
         
-        # 3. SINGLE Inverse FFT
+        # SINGLE Inverse FFT
         r = torch.fft.irfft(Rspec, n=Lfft, dim=-1)
         return torch.cat([r[:, Lfft - M : Lfft], r[:, 0 : M + 1]], dim=-1).to(torch.float32)
 

@@ -82,9 +82,14 @@ def _worker_warmup(
     threads_per_proc: int,
     do_compile: bool = False,
     compile_mode: str = "reduce-overhead",
+    warmup_nseg: int = 10,
 ) -> None:
     """
     Initializes the PyTorch correlation model and performs a dummy inference pass.
+
+    :param warmup_nseg: Number of segments to use in the warmup trace. Must match
+        the production nseg so torch.compile traces the correct shape and doesn't
+        retrace on the first real file (which would re-pay the 30-40s Inductor cost).
     """
     global _WARMED_UP
     if _WARMED_UP:
@@ -119,9 +124,10 @@ def _worker_warmup(
             logger.warning("torch.compile() failed in warmup: %s", e)
 
     Bwarm = 32
-    # 3D tensor warmup to trace the new Frequency Stacking architecture (Batch, nseg, Time)
-    x = torch.zeros((Bwarm, 2, int(npts_seg)), dtype=torch.float32, device=device)
-    y = torch.zeros((Bwarm, 2, int(npts_seg)), dtype=torch.float32, device=device)
+    nseg_warm = max(1, int(warmup_nseg))
+    # Use production nseg so compile traces the correct shape — avoids retrace on first real call
+    x = torch.zeros((Bwarm, nseg_warm, int(npts_seg)), dtype=torch.float32, device=device)
+    y = torch.zeros((Bwarm, nseg_warm, int(npts_seg)), dtype=torch.float32, device=device)
 
     with torch.inference_mode():
         _ = model(x, y)
@@ -129,12 +135,8 @@ def _worker_warmup(
 
     _WARMED_UP = True
     logger.info(
-        "Worker warm-up done | mode=%s | npts_seg=%d | M=%d | threads=%d | compiled=%s",
-        mode,
-        npts_seg,
-        max_lag_samples,
-        threads_per_proc,
-        do_compile,
+        "Worker warm-up done | mode=%s | npts_seg=%d | nseg=%d | M=%d | threads=%d | compiled=%s",
+        mode, npts_seg, nseg_warm, max_lag_samples, threads_per_proc, do_compile,
     )
 
 
@@ -253,8 +255,10 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         gc.collect()
         data_tensor = data_tensor.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else data_tensor.to(device)
 
-    lag_start = (npts_seg - 1) - npts_lag if mode == "conventional" else 0
-    lag_end = (npts_seg - 1) + npts_lag + 1 if mode == "conventional" else 0
+    # For conventional mode, compute the lag window indices into the full CC output.
+    # None is used for v1 — the model already returns exactly (2M+1) lags, no slicing needed.
+    lag_start = (npts_seg - 1) - npts_lag if mode == "conventional" else None
+    lag_end   = (npts_seg - 1) + npts_lag + 1 if mode == "conventional" else None
 
     npair_chunk = auto_np_pair_chunk(
         nch=nch, npts_seg=npts_seg, device=device,
@@ -359,8 +363,9 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
                 full1 = src_trace.expand(batch_len, -1)
                 full2 = data_tensor[start_idx:end_idx, :]
 
-                # Form the 3D Tensors: (Batch, Segments, Time)
-                data1 = full1.contiguous().view(batch_len, nseg, npts_seg)
+                # reshape() handles non-contiguous expand() without a physical copy,
+                # unlike .contiguous().view() which forces a 252MB memcpy per chunk (issue 9).
+                data1 = full1.reshape(batch_len, nseg, npts_seg)
                 if not full2.is_contiguous():
                     full2 = full2.contiguous()
                 data2 = full2.view(batch_len, nseg, npts_seg)
@@ -447,13 +452,27 @@ def main(config_path: str | Path) -> None:
     do_compile   = bool(get_cfg(cfg, ["runtime", "torch_compile"], False))
     compile_mode = str(get_cfg(cfg, ["runtime", "compile_mode"], "reduce-overhead"))
 
+    # Representative nseg for warmup — use 10-min files at the configured window.
+    # This must match production nseg so torch.compile traces the correct shape
+    # and doesn't silently retrace (re-paying 30-40s Inductor cost) on the first real file.
+    warmup_file_sec = 600.0   # 10-min files assumed; adjust if your files differ
+    warmup_nseg = max(1, int(warmup_file_sec * fs_proc) // npts_seg)
+
     initializer = functools.partial(
         _worker_warmup, mode=mode, npts_seg=npts_seg, max_lag_samples=M,
         v1_fft_snap_pow2=v1_fft_snap_pow2, v1_fallback=v1_fallback,
-        threads_per_proc=threads_per_proc, do_compile=do_compile, compile_mode=compile_mode,
+        threads_per_proc=threads_per_proc, do_compile=do_compile,
+        compile_mode=compile_mode, warmup_nseg=warmup_nseg,
     )
 
-    with mp.Pool(processes=njobs, initializer=initializer, maxtasksperchild=1) as pool:
+    # maxtasksperchild=1 restarts workers after each file for memory hygiene.
+    # WARNING: if torch_compile=True, each restart re-pays the Inductor trace cost
+    # (~30-40s per worker). In that case set maxtasks=None so workers persist and
+    # the compiled cache survives across files.
+    maxtasks = None if do_compile else 1
+    logger.info("Pool | njobs=%d | maxtasksperchild=%s | compiled=%s | warmup_nseg=%d",
+                njobs, maxtasks, do_compile, warmup_nseg)
+    with mp.Pool(processes=njobs, initializer=initializer, maxtasksperchild=maxtasks) as pool:
         task_args = [(str(fpath), cfg) for fpath in filelist]
         for result_dict in tqdm(pool.imap_unordered(_process_unpack, task_args, chunksize=1), total=len(filelist), desc="Processing"):
             if result_dict and result_dict.get("out_path"):
