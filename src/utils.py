@@ -166,27 +166,32 @@ def timeit(func: F) -> F:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         log = logging.getLogger(func.__module__)
 
-        if torch.cuda.is_available():
+        # Sync only if a CUDA context already exists in THIS process.
+        # Calling torch.cuda.synchronize() unconditionally would create a
+        # context, which is fatal in SLURM Exclusive Process mode where the
+        # parent must not hold the GPU before workers spawn.
+        sync_gpu = torch.cuda.is_available() and torch.cuda.is_initialized()
+
+        if sync_gpu:
             torch.cuda.synchronize()
         t0 = time.perf_counter()
 
         result = func(*args, **kwargs)
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if sync_gpu:
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError:
+                pass
 
         dt = time.perf_counter() - t0
-
         msg = f"[{func.__name__}] elapsed = {dt:.3f} s"
         log.info(msg)
-
         try:
             write_runlog(msg)
         except Exception:
             log.debug("Runlog not available — skipping file logging.")
-
         return result
-
     return wrapper
 
 # ==============================================================

@@ -466,74 +466,93 @@ def _process_unpack(args: tuple) -> Optional[Dict[str, Any]]:
 
 @timeit
 def main(config_path: str | Path) -> None:
-    cfg = load_config(config_path)
+    # 1. Hide the GPU from the parent process so that any accidental CUDA call
+    # here does not grab the Exclusive-Process lock before workers spawn.
+    # Restored just before mp.Pool so spawned workers inherit the real value.
 
-    data_root = Path(get_cfg(cfg, ["paths", "data_root"], required=True)).expanduser().resolve()
-    output_root = Path(get_cfg(cfg, ["paths", "output_root"], required=True)).expanduser().resolve()
-    output_root.mkdir(parents=True, exist_ok=True)
+    _orig_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-    njobs = max(1, int(get_cfg(cfg, ["runtime", "njobs"], 4)))
-    mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
-
-    npz_files = [p for p in data_root.rglob("*.npz") if p.is_file()]
-    zarr_dirs = [p for p in data_root.rglob("*.zarr") if p.is_dir()]
-    filelist = sorted(npz_files + zarr_dirs)
-
-    logger.info("Found %d valid datasets in %s", len(filelist), data_root)
-    if not filelist:
-        return
-
-    slurm_cores = os.environ.get("SLURM_CPUS_PER_TASK")
-    ncores = int(slurm_cores) if slurm_cores else (os.cpu_count() or 1)
-    threads_per_proc = max(1, ncores // njobs)
-
-    fs_raw = float(get_cfg(cfg, ["data", "fs_raw"], required=True))
-    decimation = int(get_cfg(cfg, ["preprocess", "decimation"], 1))
-    fs_proc = fs_raw / decimation
-
-    max_lag_sec = float(get_cfg(cfg, ["xcorr", "max_lag_sec"], 4.0))
-    xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec"], 8.0))
-    if mode == "v1":
-        xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec_v1"], xcorr_seg_sec))
-
-    M = int(round(max_lag_sec * fs_proc))
-    npts_seg = int(round(xcorr_seg_sec * fs_proc))
-
-    v1_fft_snap_pow2 = bool(get_cfg(cfg, ["xcorr", "v1_fft_snap_pow2"], True))
-    v1_fallback      = str(get_cfg(cfg, ["xcorr", "v1_fallback"], "v1_2M"))
-
-    do_compile   = bool(get_cfg(cfg, ["runtime", "torch_compile"], False))
-    compile_mode = str(get_cfg(cfg, ["runtime", "compile_mode"], "reduce-overhead"))
-
-    warmup_nseg = 1
     try:
-        probe = np.load(str(filelist[0]), mmap_mode="r")
-        probe_key  = "data" if "data" in probe else list(probe.keys())[0]
-        npts_probe = int(probe[probe_key].shape[-1])
-        warmup_nseg = max(1, npts_probe // npts_seg)
-        logger.info("warmup_nseg=%d derived from %s (npts=%d, npts_seg=%d)",
-                    warmup_nseg, filelist[0].name, npts_probe, npts_seg)
-    except Exception as e:
-        logger.warning("Could not probe first file for warmup_nseg: %s. Using nseg=1.", e)
+        cfg = load_config(config_path)
 
-    initializer = functools.partial(
-        _worker_warmup,
-        mode=mode,
-        npts_seg=npts_seg,
-        max_lag_samples=M,
-        v1_fft_snap_pow2=v1_fft_snap_pow2,
-        v1_fallback=v1_fallback,
-        threads_per_proc=threads_per_proc,
-        do_compile=do_compile,
-        compile_mode=compile_mode,
-        warmup_nseg=warmup_nseg,
-    )
+        data_root = Path(get_cfg(cfg, ["paths", "data_root"], required=True)).expanduser().resolve()
+        output_root = Path(get_cfg(cfg, ["paths", "output_root"], required=True)).expanduser().resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
 
-    maxtasks = None if do_compile else 20
-    logger.info(
-        "Pool | njobs=%d | maxtasksperchild=%s | compiled=%s | warmup_nseg=%d",
-        njobs, maxtasks, do_compile, warmup_nseg,
-    )
+        njobs = max(1, int(get_cfg(cfg, ["runtime", "njobs"], 4)))
+        mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
+
+        npz_files = [p for p in data_root.rglob("*.npz") if p.is_file()]
+        zarr_dirs = [p for p in data_root.rglob("*.zarr") if p.is_dir()]
+        filelist = sorted(npz_files + zarr_dirs)
+
+        logger.info("Found %d valid datasets in %s", len(filelist), data_root)
+        if not filelist:
+            return
+
+        slurm_cores = os.environ.get("SLURM_CPUS_PER_TASK")
+        ncores = int(slurm_cores) if slurm_cores else (os.cpu_count() or 1)
+        threads_per_proc = max(1, ncores // njobs)
+
+        fs_raw = float(get_cfg(cfg, ["data", "fs_raw"], required=True))
+        decimation = int(get_cfg(cfg, ["preprocess", "decimation"], 1))
+        fs_proc = fs_raw / decimation
+
+        max_lag_sec = float(get_cfg(cfg, ["xcorr", "max_lag_sec"], 4.0))
+        xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec"], 8.0))
+        if mode == "v1":
+            xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec_v1"], xcorr_seg_sec))
+
+        M = int(round(max_lag_sec * fs_proc))
+        npts_seg = int(round(xcorr_seg_sec * fs_proc))
+
+        v1_fft_snap_pow2 = bool(get_cfg(cfg, ["xcorr", "v1_fft_snap_pow2"], True))
+        v1_fallback      = str(get_cfg(cfg, ["xcorr", "v1_fallback"], "v1_2M"))
+
+        do_compile   = bool(get_cfg(cfg, ["runtime", "torch_compile"], False))
+        compile_mode = str(get_cfg(cfg, ["runtime", "compile_mode"], "reduce-overhead"))
+
+        warmup_nseg = 1
+        try:
+            probe = np.load(str(filelist[0]), mmap_mode="r")
+            probe_key  = "data" if "data" in probe else list(probe.keys())[0]
+            npts_probe = int(probe[probe_key].shape[-1])
+            warmup_nseg = max(1, npts_probe // npts_seg)
+            logger.info("warmup_nseg=%d derived from %s (npts=%d, npts_seg=%d)",
+                        warmup_nseg, filelist[0].name, npts_probe, npts_seg)
+        except Exception as e:
+            logger.warning("Could not probe first file for warmup_nseg: %s. Using nseg=1.", e)
+
+        initializer = functools.partial(
+            _worker_warmup,
+            mode=mode,
+            npts_seg=npts_seg,
+            max_lag_samples=M,
+            v1_fft_snap_pow2=v1_fft_snap_pow2,
+            v1_fallback=v1_fallback,
+            threads_per_proc=threads_per_proc,
+            do_compile=do_compile,
+            compile_mode=compile_mode,
+            warmup_nseg=warmup_nseg,
+        )
+
+        maxtasks = None if do_compile else 20
+        logger.info(
+            "Pool | njobs=%d | maxtasksperchild=%s | compiled=%s | warmup_nseg=%d",
+            njobs, maxtasks, do_compile, warmup_nseg,
+        )
+
+    finally:
+        # 2. Restored just before mp.Pool so spawned workers inherit the real value.
+        # Always restore, even on exception, so re-runs in the same shell
+        # don't leak the empty value.
+        if _orig_cvd is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = _orig_cvd
+
+    # 3. Workers spawn here and safely claim the GPU context
     with mp.Pool(processes=njobs, initializer=initializer, maxtasksperchild=maxtasks) as pool:
         task_args = [(str(fpath), cfg) for fpath in filelist]
         for result_dict in tqdm(pool.imap_unordered(_process_unpack, task_args, chunksize=1),
