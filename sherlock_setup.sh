@@ -4,8 +4,6 @@
 #   source sherlock_setup.sh
 # Must be sourced (not executed).
 
-set -euo pipefail
-
 echo "========================================"
 echo " Setting up Sherlock DAS ANI environment"
 echo "========================================"
@@ -22,9 +20,10 @@ module load py-scikit-image/0.24.0_py312
 module load py-scipy/1.12.0_py312
 
 # -------------------------
-# Set Project Root
+# Set Project Root (Dynamic)
 # -------------------------
-PROJ="/home/groups/biondo/spoobua/das_ani"
+# Automatically detects the directory where this script is located
+PROJ="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 cd "$PROJ"
 
 # Avoid duplicate PYTHONPATH entries
@@ -63,15 +62,18 @@ print("Torch:", torch.__version__)
 print("CUDA available:", torch.cuda.is_available())
 print("scikit-image:", skimage.__version__)
 print("SciPy:", scipy.__version__)
+
+# Verify our new I/O architecture is present
+try:
+    import zarr
+    import numcodecs
+    print("Zarr:", zarr.__version__)
+    print("Numcodecs:", numcodecs.__version__)
+except ImportError as e:
+    print(f"⚠️ WARNING: Missing I/O dependency: {e}")
+    print("   Run: python3 -m pip install --user zarr numcodecs")
+
 print("src imported from:", src.__file__)
 EOF
 
 echo "✅ Sherlock environment ready."
-
-# How to use it 
-# cd /home/groups/biondo/spoobua/das_ani
-# source sherlock_setup.sh
-
-# Alias
-# alias dasani='cd /home/groups/biondo/spoobua/das_ani && source sherlock_setup.sh'
-# dasani
