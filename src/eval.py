@@ -131,10 +131,12 @@ class RunResult:
     io_format: str
     n_files: int
     
-    # Timers (Now using Medians instead of Means)
+    # Timers (Medians)
     wall_sec: float       
     io_sec: float
     cc_sec: float
+    file_tot_sec: float     # ADDED: True per-file total time
+    overhead_sec: float     # ADDED: True per-file preprocessing overhead
 
     # Robust Timers (Explicit tracking for redundancy)
     wall_median: Optional[float] = None
@@ -184,9 +186,9 @@ class BenchmarkRunner:
             cfg["perf"]["enabled"] = False
         return cfg
 
-    def _run_pool(self, cfg: Dict[str, Any]) -> tuple[float, float, float]:
+    def _run_pool(self, cfg: Dict[str, Any]) -> tuple[float, float, float, float, float]:
         """
-        Runs the batch and returns: (Total Wall Time, MEDIAN IO sec, MEDIAN CC sec)
+        Runs the batch and returns: (Wall Time, med_io, med_cc, med_tot, med_ovh)
         """
         njobs = max(1, int(get_cfg(cfg, ["runtime", "njobs"], 1)))
         mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
@@ -223,55 +225,66 @@ class BenchmarkRunner:
                 compile_mode=compile_mode,
             )
 
-        io_times = []
-        cc_times = []
+        io_times, cc_times, tot_times, overhead_times = [], [], [], []
 
         t0 = time.perf_counter()
         with mp.Pool(processes=njobs, initializer=initializer, maxtasksperchild=1) as pool:
             task_args = [(str(f), cfg) for f in self.files]
             
             for res in pool.imap_unordered(_process_unpack, task_args, chunksize=1):
-                if isinstance(res, dict):
-                    if "io_sec" in res: io_times.append(res["io_sec"])
-                    if "cc_sec" in res: cc_times.append(res["cc_sec"])
-                elif isinstance(res, (tuple, list)):
-                    for item in res:
+                # Handle single dict or list of dicts safely
+                items = [res] if isinstance(res, dict) else res
+                if isinstance(items, (tuple, list)):
+                    for item in items:
                         if isinstance(item, dict):
-                            if "io_sec" in item: io_times.append(item["io_sec"])
-                            if "cc_sec" in item: cc_times.append(item["cc_sec"])
+                            i_io = item.get("io_sec", 0.0)
+                            i_cc = item.get("cc_sec", 0.0)
+                            i_tot = item.get("total_time", 0.0)
+                            
+                            io_times.append(i_io)
+                            cc_times.append(i_cc)
+                            tot_times.append(i_tot)
+                            
+                            # Calculate exact overhead per file before taking the median
+                            overhead = max(0.0, i_tot - (i_cc + i_io))
+                            overhead_times.append(overhead)
 
         t1 = time.perf_counter()
         
         wall_time = float(t1 - t0)
-        
-        # CHANGED: Now grabbing the Median of the files processed in this batch
         med_io = float(np.median(io_times)) if io_times else 0.0
         med_cc = float(np.median(cc_times)) if cc_times else 0.0
+        med_tot = float(np.median(tot_times)) if tot_times else 0.0
+        med_ovh = float(np.median(overhead_times)) if overhead_times else 0.0
 
-        return wall_time, med_io, med_cc
+        return wall_time, med_io, med_cc, med_tot, med_ovh
 
     def run_batch(self, *, run_id: str, overrides: Dict[str, Any], repeats: int = 2) -> Dict[str, float]:
         repeats = max(1, int(repeats))
-        times_w, times_io, times_cc = [], [], []
+        times_w, times_io, times_cc, times_tot, times_ovh = [], [], [], [], []
         
         for r in range(repeats):
-            w, io, cc = self._run_pool(self._prepare_cfg(run_id=f"{run_id}_rep{r}", overrides=overrides))
+            w, io, cc, tot, ovh = self._run_pool(self._prepare_cfg(run_id=f"{run_id}_rep{r}", overrides=overrides))
             times_w.append(w)
             times_io.append(io)
             times_cc.append(cc)
+            times_tot.append(tot)
+            times_ovh.append(ovh)
 
         # Discard warmup run for ALL metrics
         arr_w = np.asarray(times_w, dtype=np.float64) if repeats == 1 else np.asarray(times_w[1:], dtype=np.float64)
         arr_io = np.asarray(times_io, dtype=np.float64) if repeats == 1 else np.asarray(times_io[1:], dtype=np.float64)
         arr_cc = np.asarray(times_cc, dtype=np.float64) if repeats == 1 else np.asarray(times_cc[1:], dtype=np.float64)
+        arr_tot = np.asarray(times_tot, dtype=np.float64) if repeats == 1 else np.asarray(times_tot[1:], dtype=np.float64)
+        arr_ovh = np.asarray(times_ovh, dtype=np.float64) if repeats == 1 else np.asarray(times_ovh[1:], dtype=np.float64)
 
         return {
-            # CHANGED: Standard '_sec' variables are now strictly Medians
             "wall_sec": float(np.median(arr_w)), 
             "io_sec": float(np.median(arr_io)),
             "cc_sec": float(np.median(arr_cc)),
+            "file_tot_sec": float(np.median(arr_tot)),
+            "overhead_sec": float(np.median(arr_ovh)),
             
-            # Explicit Tracking (same as above for backward compatibility)
             "wall_median": float(np.median(arr_w)), 
             "io_median": float(np.median(arr_io)),
             "cc_median": float(np.median(arr_cc)),
@@ -333,6 +346,8 @@ def run_scaling_test(runner: BenchmarkRunner, cores_list: List[int], *, window_s
                 wall_sec=stats["wall_sec"],
                 io_sec=stats["io_sec"],
                 cc_sec=stats["cc_sec"],
+                file_tot_sec=stats["file_tot_sec"],
+                overhead_sec=stats["overhead_sec"],
                 
                 wall_median=stats["wall_median"],
                 io_median=stats["io_median"],
@@ -348,8 +363,8 @@ def run_scaling_test(runner: BenchmarkRunner, cores_list: List[int], *, window_s
                 wall_p75=stats["wall_p75"],
                 n_eff=stats["n_eff"],
             ))
-            logger.info("[%s] p=%d | Wall Med: %.2fs | CC Med: %.2fs | IO Med: %.2fs", 
-                        mode, p, stats["wall_sec"], stats["cc_sec"], stats["io_sec"])
+            logger.info("[%s] p=%d | Wall Med: %.2fs | CC Med: %.2fs | Preproc Overhead: %.2fs", 
+                        mode, p, stats["wall_sec"], stats["cc_sec"], stats["overhead_sec"])
     return results
 
 def run_complexity_test(runner: BenchmarkRunner, lags_sec: List[float], *, window_sec: float, njobs: int, repeats: int = 2) -> List[RunResult]:
@@ -391,6 +406,7 @@ def run_complexity_test(runner: BenchmarkRunner, lags_sec: List[float], *, windo
         results.append(RunResult(
             experiment="complexity", mode="conventional", njobs=int(njobs), io_format=io_fmt,
             wall_sec=stats_conv["wall_sec"], io_sec=stats_conv["io_sec"], cc_sec=stats_conv["cc_sec"],
+            file_tot_sec=stats_conv["file_tot_sec"], overhead_sec=stats_conv["overhead_sec"],
             wall_median=stats_conv["wall_median"], io_median=stats_conv["io_median"], cc_median=stats_conv["cc_median"],
             wall_mean=stats_conv["wall_mean"], wall_std=stats_conv["wall_std"], 
             wall_p25=stats_conv["wall_p25"], wall_p75=stats_conv["wall_p75"],
@@ -400,6 +416,7 @@ def run_complexity_test(runner: BenchmarkRunner, lags_sec: List[float], *, windo
         results.append(RunResult(
             experiment="complexity", mode="v1", njobs=int(njobs), io_format=io_fmt,
             wall_sec=stats_v1["wall_sec"], io_sec=stats_v1["io_sec"], cc_sec=stats_v1["cc_sec"],
+            file_tot_sec=stats_v1["file_tot_sec"], overhead_sec=stats_v1["overhead_sec"],
             wall_median=stats_v1["wall_median"], io_median=stats_v1["io_median"], cc_median=stats_v1["cc_median"],
             wall_mean=stats_v1["wall_mean"], wall_std=stats_v1["wall_std"], 
             wall_p25=stats_v1["wall_p25"], wall_p75=stats_v1["wall_p75"],

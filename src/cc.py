@@ -7,7 +7,6 @@
 :purpose: DAS ambient noise interferometry (ANI).
           High-performance engine for Cross-Correlation (NCF generation) 
           and Auto-Correlation (ACF generation for Coda Wave Interferometry).
-          Includes internal profiling for I/O vs Compute benchmarking.
 """
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ import logging
 import os
 import time
 import gc
+import math
 import multiprocessing as mp
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Dict
@@ -48,23 +48,11 @@ from src.ani import preprocess, TorchCrossCorrelation, whiten_per_segment_torch
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Global flag to ensure the PyTorch model is only initialized once per worker process.
 _WARMED_UP = False
 
 
 def _set_thread_env(threads: int) -> None:
-    """
-    Sets environment variables to strictly control the number of threads used by 
-    underlying C/C++ math libraries (BLAS, OpenMP, MKL, NumExpr). 
-    
-    This prevents catastrophic thread oversubscription and CPU thrashing when 
-    running Python's multiprocessing pool on HPC nodes like Stanford Sherlock.
-
-    :param threads: The maximum number of threads allowed per library.
-    """
     threads_str = str(max(1, int(threads)))
-
-    # HARD OVERRIDE: Do not use setdefault. Force the OS to respect these limits.
     os.environ["OMP_NUM_THREADS"] = threads_str
     os.environ["MKL_NUM_THREADS"] = threads_str
     os.environ["VECLIB_MAXIMUM_THREADS"] = threads_str
@@ -82,21 +70,13 @@ def _worker_warmup(
     threads_per_proc: int,
     do_compile: bool = False,
     compile_mode: str = "reduce-overhead",
-    warmup_nseg: int = 10,
+    warmup_nseg: int = 1,
 ) -> None:
-    """
-    Initializes the PyTorch correlation model and performs a dummy inference pass.
-
-    :param warmup_nseg: Number of segments to use in the warmup trace. Must match
-        the production nseg so torch.compile traces the correct shape and doesn't
-        retrace on the first real file (which would re-pay the 30-40s Inductor cost).
-    """
     global _WARMED_UP
     if _WARMED_UP:
         return
 
     _set_thread_env(threads_per_proc)
-
     torch.set_num_threads(max(1, threads_per_proc))
     try:
         torch.set_num_interop_threads(1)
@@ -119,25 +99,19 @@ def _worker_warmup(
     if do_compile:
         try:
             model = torch.compile(model, backend="inductor", mode=compile_mode)
-            logger.info("torch.compile() applied in warmup | mode=%s", compile_mode)
         except Exception as e:
             logger.warning("torch.compile() failed in warmup: %s", e)
 
-    Bwarm = 32
-    nseg_warm = max(1, int(warmup_nseg))
-    # Use production nseg so compile traces the correct shape — avoids retrace on first real call
-    x = torch.zeros((Bwarm, nseg_warm, int(npts_seg)), dtype=torch.float32, device=device)
-    y = torch.zeros((Bwarm, nseg_warm, int(npts_seg)), dtype=torch.float32, device=device)
+    Bwarm  = 32
+    nseg_w = max(1, int(warmup_nseg))
+    x = torch.zeros((Bwarm, nseg_w, int(npts_seg)), dtype=torch.float32, device=device)
+    y = torch.zeros((Bwarm, nseg_w, int(npts_seg)), dtype=torch.float32, device=device)
 
     with torch.inference_mode():
         _ = model(x, y)
         _ = model(x, y)
 
     _WARMED_UP = True
-    logger.info(
-        "Worker warm-up done | mode=%s | npts_seg=%d | nseg=%d | M=%d | threads=%d | compiled=%s",
-        mode, npts_seg, nseg_warm, max_lag_samples, threads_per_proc, do_compile,
-    )
 
 
 @timeit
@@ -194,6 +168,8 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec"], 8.0))
     mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
     auto_cc = bool(get_cfg(cfg, ["xcorr", "auto_cc"], False))
+    
+    whiten_chunk_nch = int(get_cfg(cfg, ["preprocess", "whiten_chunk_nch"], 64))
 
     if mode == "v1":
         xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec_v1"], xcorr_seg_sec))
@@ -248,6 +224,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         data_tensor = whiten_per_segment_torch(
             data_tensor, fs_proc=fs_proc, npts_seg=npts_seg,
             window_freq_hz=window_freq_hz, f1=f1, f2=f2,
+            chunk_nch=whiten_chunk_nch,
         )
     else:
         data_tensor = convert_to_tensor(data_proc, device=torch.device("cpu"))
@@ -255,27 +232,32 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         gc.collect()
         data_tensor = data_tensor.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else data_tensor.to(device)
 
-    # For conventional mode, compute the lag window indices into the full CC output.
-    # None is used for v1 — the model already returns exactly (2M+1) lags, no slicing needed.
-    lag_start = (npts_seg - 1) - npts_lag if mode == "conventional" else None
-    lag_end   = (npts_seg - 1) + npts_lag + 1 if mode == "conventional" else None
-
-    npair_chunk = auto_np_pair_chunk(
-        nch=nch, npts_seg=npts_seg, device=device,
-        frac_mem=frac_mem, min_chunk=min_chunk, max_chunk=max_chunk, nworkers=njobs,
-    )
-
-    is_spectral_whitening_cc = False if prewhiten else bool(is_spectral_whitening)
-    whitening_params_cc = None if prewhiten else (float(fs_proc), float(window_freq_hz), float(f1), float(f2))
+    lag_start = (npts_seg - 1) - npts_lag if mode == "conventional" else 0
+    lag_end = (npts_seg - 1) + npts_lag + 1 if mode == "conventional" else 0
 
     model: nn.Module = TorchCrossCorrelation(
         mode=mode,
         max_lag_samples=int(npts_lag) if mode == "v1" else None,
-        is_spectral_whitening=is_spectral_whitening_cc,
-        whitening_params=whitening_params_cc,
+        is_spectral_whitening=False if prewhiten else bool(is_spectral_whitening),
+        whitening_params=None if prewhiten else (float(fs_proc), float(window_freq_hz), float(f1), float(f2)),
         v1_fft_snap_pow2=v1_fft_snap_pow2,
         v1_fallback=v1_fallback,
     )
+
+    # Optimization 4: Protect V1 chunk size by inflating the fake length sent to auto_np_pair_chunk
+    if mode == "v1":
+        _fake_nblocks = (npts_seg + model._v1_K - 1) // model._v1_K
+        _v1_bytes = nseg * _fake_nblocks * (model._v1_Lfft * 8 + model._v1_nfreq * 16)
+        _fake_npts_seg = int(_v1_bytes / 36)
+        npair_chunk = auto_np_pair_chunk(
+            nch=nch, npts_seg=_fake_npts_seg, device=device,
+            frac_mem=frac_mem, min_chunk=min_chunk, max_chunk=max_chunk, nworkers=njobs,
+        )
+    else:
+        npair_chunk = auto_np_pair_chunk(
+            nch=nch, npts_seg=npts_seg, device=device,
+            frac_mem=frac_mem, min_chunk=min_chunk, max_chunk=max_chunk, nworkers=njobs,
+        )
 
     multi_gpu = device.type == "cuda" and use_gpu and (torch.cuda.device_count() > 1)
     model = nn.DataParallel(model).to(device) if multi_gpu else model.to(device)
@@ -294,7 +276,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     vs_bar = tqdm(src_ch_all, desc=f"VS {basename}", leave=True)
 
     # ==========================================================
-    # 3. CORRELATION ENGINE (3D FREQUENCY STACKING)
+    # 3. CORRELATION ENGINE
     # ==========================================================
     if auto_cc:
         out_path = out_dir / f"{basename}_auto_{mode}.npy"
@@ -311,15 +293,12 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             start_idx = npair_chunk * ichunk
             end_idx = min(start_idx + npair_chunk, nch)
             batch_len = end_idx - start_idx
-
-            full_data = data_tensor[start_idx:end_idx, :].contiguous()
             
-            # Form the 3D Tensor: (Batch, Segments, Time)
-            data_in = full_data.view(batch_len, nseg, npts_seg)
+            # Sub-slice is inherently contiguous natively
+            data_in = data_tensor[start_idx:end_idx, :].view(batch_len, nseg, npts_seg)
 
             with torch.inference_mode():
-                # Model returns (Batch, Lags) directly. Python loop is gone.
-                cc_sum_t = model(data_in, data_in)
+                cc_sum_t = model(data_in, data_in, is_source_spectrum=False)
 
             if mode == "conventional":
                 ccall[start_idx:end_idx, :] += cc_sum_t[:, lag_start:lag_end].cpu().numpy()
@@ -351,28 +330,27 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             nchunk = int(np.ceil(npair / npair_chunk))
             ccall = np.zeros((npair, cc_out_len), dtype=np.float32)
 
-            src_trace = data_tensor[src_idx : src_idx + 1, :]
             t_vs0 = time.perf_counter()
-
             t_cc_start = time.perf_counter()
+            
+            # Optimization 1: Encode Source exactly once
+            src_trace = data_tensor[src_idx : src_idx + 1, :]
+            data1_src = src_trace.view(1, nseg, npts_seg)
+            with torch.inference_mode():
+                model_base = model.module if multi_gpu else model
+                X_src = model_base.encode_source(data1_src)
+
             for ichunk in range(nchunk):
                 start_idx = npair_chunk * ichunk
                 end_idx = min(start_idx + npair_chunk, npair)
                 batch_len = end_idx - start_idx
 
-                full1 = src_trace.expand(batch_len, -1)
-                full2 = data_tensor[start_idx:end_idx, :]
-
-                # reshape() handles non-contiguous expand() without a physical copy,
-                # unlike .contiguous().view() which forces a 252MB memcpy per chunk (issue 9).
-                data1 = full1.reshape(batch_len, nseg, npts_seg)
-                if not full2.is_contiguous():
-                    full2 = full2.contiguous()
-                data2 = full2.view(batch_len, nseg, npts_seg)
+                # Expand the cached source spectrum for the chunk
+                X_expanded = X_src.expand(batch_len, *X_src.shape[1:])
+                data2 = data_tensor[start_idx:end_idx, :].view(batch_len, nseg, npts_seg)
 
                 with torch.inference_mode():
-                    # Model returns (Batch, Lags) directly. Python loop is gone.
-                    cc_sum_t = model(data1, data2)
+                    cc_sum_t = model(X_expanded, data2, is_source_spectrum=True)
 
                 if mode == "conventional":
                     cc_win = cc_sum_t[:, lag_start:lag_end]
@@ -447,31 +425,39 @@ def main(config_path: str | Path) -> None:
     npts_seg = int(round(xcorr_seg_sec * fs_proc))
 
     v1_fft_snap_pow2 = bool(get_cfg(cfg, ["xcorr", "v1_fft_snap_pow2"], True))
-    v1_fallback = str(get_cfg(cfg, ["xcorr", "v1_fallback"], "v1_2M"))
+    v1_fallback      = str(get_cfg(cfg, ["xcorr", "v1_fallback"], "v1_2M"))
 
     do_compile   = bool(get_cfg(cfg, ["runtime", "torch_compile"], False))
     compile_mode = str(get_cfg(cfg, ["runtime", "compile_mode"], "reduce-overhead"))
 
-    # Representative nseg for warmup — use 10-min files at the configured window.
-    # This must match production nseg so torch.compile traces the correct shape
-    # and doesn't silently retrace (re-paying 30-40s Inductor cost) on the first real file.
-    warmup_file_sec = 600.0   # 10-min files assumed; adjust if your files differ
-    warmup_nseg = max(1, int(warmup_file_sec * fs_proc) // npts_seg)
+    warmup_nseg = 1  
+    try:
+        probe = np.load(str(filelist[0]), mmap_mode="r")
+        probe_key  = "data" if "data" in probe else list(probe.keys())[0]
+        npts_probe = int(probe[probe_key].shape[-1])
+        warmup_nseg = max(1, npts_probe // npts_seg)
+    except Exception as e:
+        logger.warning("Could not probe first file for warmup_nseg: %s. Using nseg=1.", e)
 
     initializer = functools.partial(
-        _worker_warmup, mode=mode, npts_seg=npts_seg, max_lag_samples=M,
-        v1_fft_snap_pow2=v1_fft_snap_pow2, v1_fallback=v1_fallback,
-        threads_per_proc=threads_per_proc, do_compile=do_compile,
-        compile_mode=compile_mode, warmup_nseg=warmup_nseg,
+        _worker_warmup,
+        mode=mode,
+        npts_seg=npts_seg,
+        max_lag_samples=M,
+        v1_fft_snap_pow2=v1_fft_snap_pow2,
+        v1_fallback=v1_fallback,
+        threads_per_proc=threads_per_proc,
+        do_compile=do_compile,
+        compile_mode=compile_mode,
+        warmup_nseg=warmup_nseg,
     )
 
-    # maxtasksperchild=1 restarts workers after each file for memory hygiene.
-    # WARNING: if torch_compile=True, each restart re-pays the Inductor trace cost
-    # (~30-40s per worker). In that case set maxtasks=None so workers persist and
-    # the compiled cache survives across files.
-    maxtasks = None if do_compile else 1
-    logger.info("Pool | njobs=%d | maxtasksperchild=%s | compiled=%s | warmup_nseg=%d",
-                njobs, maxtasks, do_compile, warmup_nseg)
+    # Optimization 6: Relax maxtasksperchild to prevent massive Python import overhead per-file
+    maxtasks = None if do_compile else 20
+    logger.info(
+        "Pool | njobs=%d | maxtasksperchild=%s | compiled=%s | warmup_nseg=%d",
+        njobs, maxtasks, do_compile, warmup_nseg,
+    )
     with mp.Pool(processes=njobs, initializer=initializer, maxtasksperchild=maxtasks) as pool:
         task_args = [(str(fpath), cfg) for fpath in filelist]
         for result_dict in tqdm(pool.imap_unordered(_process_unpack, task_args, chunksize=1), total=len(filelist), desc="Processing"):
