@@ -4,15 +4,29 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: Utility functions for DAS data processing, timing, GPU/CPU diagnostics, and I/O safety.
+:purpose: Core utilities for DAS data processing, hardware diagnostics, and HPC safety.
 
-Revision notes (this version):
-    - auto_np_pair_chunk is now mode-aware. For mode="v1", callers can pass
-      (nseg, nblocks, Lfft, nfreq) and the per-pair byte estimate uses the
-      actual v1 working set (x_blocked + y_blocked real + X + Y complex)
-      instead of the conventional output size. Without these kwargs the
-      function preserves its previous (conservative) behavior for backward
-      compatibility.
+Description:
+This module provides the foundational support functions for the High-Performance 
+Computing (HPC) Ambient Noise Interferometry (ANI) engine. It is specifically 
+designed to handle SLURM environment quirks, manage PyTorch memory budgets, 
+and ensure multi-GPU/multiprocessing safety.
+
+Key Features:
+    - HPC Hardware Diagnostics: Safely calculates available CPU memory by explicitly 
+      reading SLURM cgroup limits (SLURM_MEM_PER_NODE) to prevent node OOM kills.
+    - Multiprocessing-Safe GPU Timing: Custom timing decorators (``timeit``) that 
+      guard against premature CUDA context initialization. This prevents the parent 
+      process from accidentally acquiring the GPU lock under SLURM Exclusive mode 
+      before the worker pool spawns.
+    - Dynamic Resource Allocation: The ``auto_np_pair_chunk`` function mathematically 
+      models the exact tensor byte-footprint of both the conventional and Zhang (2026) 
+      v1 algorithms to maximize array chunk sizes without exceeding VRAM/RAM budgets.
+    - Data I/O & Checkpointing: Transparent loading of large-scale .npz and .zarr 
+      arrays, zero-copy PyTorch tensor conversions, and robust JSON-based auto-resume 
+      tracking for interrupted cluster jobs.
+    - DSP & Math Tools: 2D FK-filtering, temporal envelopes, and robust power-of-two 
+      FFT padding calculators.
 """
 from __future__ import annotations
 
@@ -156,24 +170,47 @@ def convert_to_numpy(x: ArrayLike) -> np.ndarray:
 # ==============================================================
 # 3. Timing + decorators
 # ==============================================================
+def _can_sync_cuda() -> bool:
+    """
+    True only if a CUDA context already exists in the current process.
+
+    Calling torch.cuda.synchronize() unconditionally would create a context
+    in the calling process. Under SLURM Exclusive Process mode, that's fatal
+    in the multiprocessing parent — workers can't then acquire the device.
+    torch.cuda.is_initialized() is the correct guard: it returns True only
+    after the current process has issued a real CUDA op, never as a side
+    effect of merely checking it.
+    """
+    return torch.cuda.is_available() and torch.cuda.is_initialized()
+
+
 def runtime(sync_cuda: bool = True) -> float:
-    if sync_cuda and torch.cuda.is_available():
-        torch.cuda.synchronize()
+    """High-resolution timestamp; CUDA-synced only if this process holds a context."""
+    if sync_cuda and _can_sync_cuda():
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            # Exclusive Process / Exclusive Thread mode: lock held elsewhere.
+            pass
     return time.perf_counter()
 
+
 def timeit(func: F) -> F:
+    """
+    Decorator that measures and logs runtime, CUDA-synced if (and only if) the
+    calling process already holds a CUDA context. Safe to apply to functions
+    that run in either the parent (no CUDA) or workers (own CUDA context).
+    """
     @functools.wraps(func)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         log = logging.getLogger(func.__module__)
 
-        # Sync only if a CUDA context already exists in THIS process.
-        # Calling torch.cuda.synchronize() unconditionally would create a
-        # context, which is fatal in SLURM Exclusive Process mode where the
-        # parent must not hold the GPU before workers spawn.
-        sync_gpu = torch.cuda.is_available() and torch.cuda.is_initialized()
-
+        sync_gpu = _can_sync_cuda()
         if sync_gpu:
-            torch.cuda.synchronize()
+            try:
+                torch.cuda.synchronize()
+            except RuntimeError:
+                sync_gpu = False
         t0 = time.perf_counter()
 
         result = func(*args, **kwargs)
@@ -185,13 +222,17 @@ def timeit(func: F) -> F:
                 pass
 
         dt = time.perf_counter() - t0
+
         msg = f"[{func.__name__}] elapsed = {dt:.3f} s"
         log.info(msg)
+
         try:
             write_runlog(msg)
         except Exception:
             log.debug("Runlog not available — skipping file logging.")
+
         return result
+
     return wrapper
 
 # ==============================================================
@@ -233,6 +274,25 @@ def fk_transform(
     dx: float,
     pad_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Computes the 2D Forward Fourier Transform from the (x, t) domain to the (k, f) domain.
+
+    **DSP Theory:**
+    The FK transform (Frequency-Wavenumber) decomposes a wavefield into its constituent 
+    plane waves. In DAS data, the horizontal axis (x) represents the fiber distance and 
+    the vertical axis (t) represents time. The 2D FFT maps these to spatial frequency 
+    (wavenumber, k) and temporal frequency (f).
+
+    :param data: 2D array of DAS data, shape (n_channels, n_samples).
+    :param dt: Temporal sampling interval in seconds.
+    :param dx: Spatial sampling interval (channel spacing) in meters.
+    :param pad_shape: Optional tuple (nx_pad, nt_pad) for zero-padding. Padding improves 
+                      spectral resolution and prevents circular convolution artifacts.
+    :return: (f_axis, k_axis, fk_spectrum) 
+             f_axis: temporal frequency vector (Hz)
+             k_axis: spatial wavenumber vector (1/m)
+             fk_spectrum: 2D complex-valued Fourier spectrum, centered (shifted).
+    """
     if data.ndim != 2:
         raise ValueError(f"'data' must be 2D (nx, nt); got {data.ndim}D")
 
@@ -251,6 +311,14 @@ def fk_inverse(
     fk_spectrum: np.ndarray,
     orig_shape: Optional[Tuple[int, int]] = None
 ) -> np.ndarray:
+    """
+    Transforms a complex FK spectrum back to the space-time (x, t) domain.
+
+    :param fk_spectrum: 2D complex spectrum in (k, f) domain, assumed to be shifted.
+    :param orig_shape: Optional tuple (nx, nt) to crop the result back to original size, 
+                       undoing any padding applied during the forward transform.
+    :return: Real-valued space-time wavefield.
+    """
     if fk_spectrum.ndim != 2:
         raise ValueError(f"'fk_spectrum' must be 2D; got {fk_spectrum.ndim}D")
 
@@ -275,6 +343,37 @@ def fk_filter(
     sigma: float = 1.0,
     uniform_size: int = 1,
 ) -> np.ndarray:
+    """
+    Applies a velocity-based fan filter in the Frequency-Wavenumber (FK) domain.
+
+    **DSP Theory:**
+    In the FK domain, coherent seismic waves appear as energy organized along linear 
+    trajectories. The slope of these lines represents the apparent phase velocity (v = f/k). 
+    FK filtering allows for the separation of signal from noise based on velocity 
+    and propagation direction.
+
+    **Applications in DAS:**
+    - **Surface Wave Removal:** Eliminating slow-moving Scholte or Rayleigh waves 
+      (low v) to reveal faster body waves.
+    - **Directional Steering:** Extracting only waves traveling in one direction along 
+      the fiber (e.g., separating upgoing vs. downgoing waves in a borehole).
+    - **Noise Suppression:** Removing "ringing" interrogator noise which often maps 
+      to specific k=0 or f=0 regions.
+
+    :param data: Space-time array (nch, nt).
+    :param dt: Temporal sampling (s).
+    :param dx: Spatial sampling (m).
+    :param vmin: Minimum velocity threshold (m/s).
+    :param vmax: Maximum velocity threshold (m/s).
+    :param mode: "eliminate" to mute energy within [vmin, vmax]; 
+                 "extract" to keep only energy within [vmin, vmax].
+    :param direction: "right" (k > 0), "left" (k < 0), or "both".
+    :param pad_factor: Multiplier for padding (nx_in*pad_factor[0], nt_in*pad_factor[1]).
+    :param smooth: Type of taper to apply to the mask edges to prevent Gibbs ringing.
+    :param sigma: Standard deviation for Gaussian smoothing.
+    :param uniform_size: Window size for uniform smoothing.
+    :return: Filtered space-time wavefield.
+    """
     nx_in, nt_in = data.shape
     nx_pad = int(nx_in * pad_factor[0])
     nt_pad = int(nt_in * pad_factor[1])
@@ -320,6 +419,23 @@ def fk_filter(
 # 5B. Hilbert transform along time axis (for analytic signal / envelope)
 # ==============================================================
 def compute_envelope(data: np.ndarray, axis: int = -1) -> np.ndarray:
+    """
+    Calculates the instantaneous amplitude (envelope) via the Hilbert Transform.
+
+    **DSP Theory:**
+    The Hilbert transform shifts the phase of a signal by -90 degrees. By combining 
+     the original real signal (x) and its Hilbert transform (y) as an analytic signal 
+     (z = x + iy), we can calculate the instantaneous amplitude (envelope) as |z|.
+
+    **Applications in DAS:**
+    - Tracking the energy of ambient noise over time.
+    - Enhancing the arrival of diffuse wave packets where phase is incoherent.
+    - Normalization and gain control.
+
+    :param data: Input waveform data.
+    :param axis: The axis along which to compute the transform (usually time).
+    :return: 2D array of instantaneous amplitudes.
+    """
     from scipy.signal import hilbert
     return np.abs(hilbert(data, axis=axis))
 
@@ -412,8 +528,7 @@ def auto_np_pair_chunk(
           + nseg * npts_seg * 4               # input segment slab
         ] × safety_factor
         — this is the actual peak working set inside _forward_v1_batched /
-        compute_X + compute_Y. The conventional model under-estimates this by
-        up to ~50× on Urban-style configs (large nseg, large M).
+        compute_X + compute_Y. 
 
     :param nch: Number of channels.
     :param npts_seg: Samples per segment.

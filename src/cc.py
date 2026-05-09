@@ -4,25 +4,41 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: DAS ambient noise interferometry (ANI).
-          High-performance engine for Cross-Correlation (NCF generation)
-          and Auto-Correlation (ACF generation for Coda Wave Interferometry).
-          Includes internal profiling for I/O vs Compute benchmarking.
+:purpose: High-performance DAS Ambient Noise Interferometry (ANI) engine for 
+          cross-correlation (NCF) and auto-correlation (ACF) generation.
 
-Revision notes (this version):
-    - VS loop now computes the source-side spectrum X_src once per virtual
-      source via TorchCrossCorrelation.compute_X(...), then in the chunk
-      loop only computes Y_recv = compute_Y(...) and combines via
-      model.combine(X_src, Y_recv). Drops the src_trace.expand + .contiguous()
-      that previously caused (batch_len × nseg) redundant rffts of identical
-      data on the source side. On Bridge/Offshore/Urban configs this halves
-      the FFT work in v1 mode (and also in conventional mode).
-    - auto_np_pair_chunk receives v1-aware sizing (nseg/nblocks/Lfft/nfreq)
-      so its budget matches the actual peak working set.
-    - Removed the redundant torch.set_num_interop_threads(1) call inside
-      process_single_file (it is set once at worker start in _worker_warmup).
-    - logging.basicConfig() moved into __main__ to avoid clobbering the
-      logging configuration of any caller that imports cc.py.
+Description:
+This module serves as the primary execution engine for generating Noise 
+Correlation Functions (NCFs) from massive DAS datasets. It is optimized for 
+High-Performance Computing (HPC) environments, featuring hardware-aware 
+resource management, asynchronous I/O, and highly parallelized spectral math.
+
+Key Architecture & Performance Features:
+    - Asymmetric GPU Pipeline: Implements a "Compute-Once, Broadcast-Many" 
+      architecture for Virtual Source (VS) mode. The source spectrum is 
+      calculated once and reused across receiver batches, eliminating 
+      redundant FFTs.
+    - Deferred Device-to-Host Transfer: Cross-correlation sums are accumulated 
+      directly in GPU VRAM. Transfers to CPU/Host memory are deferred until the 
+      entire Virtual Source is complete, minimizing PCIe bus contention and 
+      maximizing GPU kernel utilization.
+    - SLURM-Safe Multiprocessing: Implements a "Double-Guard" on GPU visibility. 
+      The parent process is shielded from the GPU during setup to prevent 
+      premature lock acquisition in SLURM Exclusive-Process mode, ensuring 
+      clean initialization of the worker pool.
+    - Memory-Budgeted Chunking: Utilizes a heuristic memory model to 
+      dynamically scale channel batches based on available VRAM and algorithm 
+      complexity (Conventional vs. Zhang 2026 v1), ensuring zero Out-of-Memory 
+      (OOM) crashes.
+    - Deterministic HPC Threading: Enforces strict control over OMP, MKL, and 
+      intra-op threading via SLURM_CPUS_PER_TASK to ensure predictable 
+      performance and fair resource sharing on multi-tenant nodes.
+
+Workflow:
+    1. Pre-computes whitening and block-sizing parameters.
+    2. Spawns a hardware-aware worker pool with pre-warmed PyTorch models.
+    3. Processes datasets in parallel, managing auto-resume states and 
+       internal profiling (I/O vs. Compute) for performance benchmarking.
 """
 from __future__ import annotations
 
@@ -62,7 +78,7 @@ from src.ani import (
     preprocess,
     TorchCrossCorrelation,
     whiten_per_segment_torch,
-    choose_block_size_v2,
+    choose_block_size_v1,
 )
 
 logger = logging.getLogger(__name__)
@@ -287,7 +303,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     # v1 (real x_blocked + y_blocked + complex X + Y) instead of the much
     # smaller conventional output size.
     if mode == "v1":
-        v1_K, v1_Lfft = choose_block_size_v2(
+        v1_K, v1_Lfft = choose_block_size_v1(
             int(npts_lag), fft_snap_pow2=v1_fft_snap_pow2, fallback=v1_fallback
         )
         v1_nblocks = (int(npts_seg) + v1_K - 1) // v1_K
@@ -319,21 +335,35 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         v1_fallback=v1_fallback,
     )
 
-    multi_gpu = device.type == "cuda" and use_gpu and (torch.cuda.device_count() > 1)
-    model = nn.DataParallel(model).to(device) if multi_gpu else model.to(device)
+    # The bare TorchCrossCorrelation is what the VS path calls into directly
+    # (compute_X / compute_Y / combine). Always keep a reference to it.
+    xcorr = model.to(device)
+    xcorr.eval()
 
-    if do_compile and (not multi_gpu):
+    multi_gpu = device.type == "cuda" and use_gpu and (torch.cuda.device_count() > 1)
+
+    # nn.DataParallel only intercepts forward(). VS mode does not call forward,
+    # so wrapping there is a silent no-op (only cuda:0 ever runs). Wrap only
+    # for auto_cc, which does call model(data, data) → forward.
+    if multi_gpu and auto_cc:
+        forward_model: nn.Module = nn.DataParallel(xcorr).to(device)
+        logger.info("Auto-CC + multi-GPU: nn.DataParallel across %d devices",
+                    torch.cuda.device_count())
+    else:
+        forward_model = xcorr
+        if multi_gpu and not auto_cc:
+            logger.warning(
+                "Multi-GPU detected but auto_cc=False. VS mode does not "
+                "parallelize across nn.DataParallel; only cuda:0 will be "
+                "used. For multi-GPU VS-mode runs, launch separate SLURM "
+                "tasks pinned to different GPUs via CUDA_VISIBLE_DEVICES."
+            )
+
+    if do_compile and (not (multi_gpu and auto_cc)):
         try:
-            model = torch.compile(model, backend="inductor", mode=compile_mode)
+            forward_model = torch.compile(forward_model, backend="inductor", mode=compile_mode)
         except Exception:
             pass
-
-    model.eval()
-
-    # The compiled / DataParallel-wrapped model only exposes .forward(). For
-    # the asymmetric VS path we need direct access to compute_X / compute_Y /
-    # combine, so reach the underlying TorchCrossCorrelation here.
-    xcorr = _unwrap_model(model)
 
     meta_path = out_dir / basename.replace(".npz", f"_cc_state_{mode}.json")
     completed_src = load_resume_state(meta_path)
@@ -344,9 +374,9 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     # 3. CORRELATION ENGINE
     # ==========================================================
     if auto_cc:
-        # Symmetric path. Use model.forward(data, data) end-to-end so that
-        # torch.compile / DataParallel wrappers stay engaged. Internally,
-        # forward(x, x) routes through compute_X(x) + compute_Y(x) + combine.
+        # Symmetric path. forward_model(data, data) routes through forward(),
+        # which is what nn.DataParallel / torch.compile wrap. forward()
+        # internally calls compute_X(x) + compute_Y(x) + combine.
         out_path = out_dir / f"{basename}_auto_{mode}.npy"
         if check_existing_output(out_path, (nch, cc_out_len)):
             return {"out_path": str(out_path), "io_sec": io_time, "cc_sec": 0.0,
@@ -355,7 +385,9 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         write_runlog(f"Start Auto-CC: {gpu_memory() or ''} | {cpu_memory()}")
 
         nchunk = int(np.ceil(nch / npair_chunk))
-        ccall = np.zeros((nch, cc_out_len), dtype=np.float32)
+        # On-device accumulator: avoids per-chunk PCIe round-trips on GPU.
+        # On CPU this is just a torch CPU tensor — no transfer involved.
+        ccall_dev = torch.zeros((nch, cc_out_len), dtype=torch.float32, device=device)
 
         t_cc_start = time.perf_counter()
         for ichunk in range(nchunk):
@@ -367,23 +399,26 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             data_in = full_data.view(batch_len, nseg, npts_seg)
 
             with torch.inference_mode():
-                cc_sum_t = model(data_in, data_in)
+                cc_sum_t = forward_model(data_in, data_in)
 
-            if mode == "conventional":
-                ccall[start_idx:end_idx, :] += cc_sum_t[:, lag_start:lag_end].cpu().numpy()
-            else:
-                ccall[start_idx:end_idx, :] += cc_sum_t.cpu().numpy()
+                if mode == "conventional":
+                    ccall_dev[start_idx:end_idx].add_(cc_sum_t[:, lag_start:lag_end])
+                else:
+                    ccall_dev[start_idx:end_idx].add_(cc_sum_t)
 
-        ccall /= float(flag_mean)
+        ccall_dev.div_(float(flag_mean))
         cc_time += (time.perf_counter() - t_cc_start)
 
+        # Single device→host transfer for the whole file.
         t_io_start = time.perf_counter()
+        ccall = ccall_dev.cpu().numpy()
         np.save(out_path, ccall)
         io_time += (time.perf_counter() - t_io_start)
+        del ccall_dev
         last_out = out_path
 
     else:
-        # Asymmetric VS path with X_src reuse.
+        # Asymmetric VS path with X_src reuse + on-device ccall accumulator.
         for src_idx in vs_bar:
             src_idx = int(src_idx)
             out_path = out_dir / f"{basename}_cc_{src_idx:03d}_{mode}.npy"
@@ -398,9 +433,15 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
 
             npair = nch
             nchunk = int(np.ceil(npair / npair_chunk))
-            ccall = np.zeros((npair, cc_out_len), dtype=np.float32)
 
-            # Compute the source-side spectrum ONCE per VS. Shape:
+            # On-device accumulator. The previous CPU branch built a numpy
+            # ccall and copied each chunk via .cpu().numpy() inside the loop,
+            # which on GPU forced a synchronous PCIe round-trip per chunk and
+            # killed device utilization. Keeping ccall on `device` defers all
+            # device→host traffic to a single transfer at the end of this VS.
+            ccall_dev = torch.zeros((npair, cc_out_len), dtype=torch.float32, device=device)
+
+            # Source-side spectrum computed ONCE per VS. Shape:
             #   conventional → (1, nseg, nfreq)
             #   v1           → (1, nseg, nblocks, nfreq)
             src_segs = data_tensor[src_idx:src_idx + 1, :].view(1, nseg, npts_seg)
@@ -416,28 +457,30 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
                     batch_len = end_idx - start_idx
 
                     # Row slices of a contiguous (nch, npts_new) tensor are
-                    # contiguous, so .view(...) below is safe without an
-                    # intermediate .contiguous() copy.
+                    # contiguous, so .view(...) is safe without .contiguous().
                     recv_segs = data_tensor[start_idx:end_idx, :].view(batch_len, nseg, npts_seg)
 
                     Y_recv = xcorr.compute_Y(recv_segs)
                     cc_sum_t = xcorr.combine(X_src, Y_recv)
 
                     if mode == "conventional":
-                        ccall[start_idx:end_idx, :] += cc_sum_t[:, lag_start:lag_end].cpu().numpy()
+                        ccall_dev[start_idx:end_idx].add_(cc_sum_t[:, lag_start:lag_end])
                     else:
-                        ccall[start_idx:end_idx, :] += cc_sum_t.cpu().numpy()
+                        ccall_dev[start_idx:end_idx].add_(cc_sum_t)
 
                     # Drop receiver-side buffers between chunks so peak memory
                     # tracks one chunk's working set, not the cumulative.
                     del recv_segs, Y_recv, cc_sum_t
 
-            ccall /= float(flag_mean)
+            ccall_dev.div_(float(flag_mean))
             cc_time += (time.perf_counter() - t_cc_start)
 
+            # Single device→host transfer per VS.
             t_io_start = time.perf_counter()
+            ccall = ccall_dev.cpu().numpy()
             np.save(out_path, ccall)
             io_time += (time.perf_counter() - t_io_start)
+            del ccall_dev, X_src
 
             if perf_enabled and log_every_vs:
                 write_perf_row(
@@ -466,10 +509,12 @@ def _process_unpack(args: tuple) -> Optional[Dict[str, Any]]:
 
 @timeit
 def main(config_path: str | Path) -> None:
-    # 1. Hide the GPU from the parent process so that any accidental CUDA call
-    # here does not grab the Exclusive-Process lock before workers spawn.
-    # Restored just before mp.Pool so spawned workers inherit the real value.
-
+    # ----- GPU safety guard -----
+    # Hide the GPU from the parent process while it does setup work, so any
+    # accidental CUDA call here cannot grab the Exclusive-Process lock before
+    # workers spawn. Restored just before mp.Pool so spawned workers inherit
+    # the real device list. The try/finally guarantees restoration even if
+    # setup raises (otherwise the empty value would leak to subsequent runs).
     _orig_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
@@ -544,15 +589,15 @@ def main(config_path: str | Path) -> None:
         )
 
     finally:
-        # 2. Restored just before mp.Pool so spawned workers inherit the real value.
-        # Always restore, even on exception, so re-runs in the same shell
-        # don't leak the empty value.
+        # Restore the GPU visibility before mp.Pool is constructed so that
+        # workers inherit the real device list at spawn time. Always run,
+        # even if an exception was raised above, so re-runs in the same
+        # shell don't leak CUDA_VISIBLE_DEVICES="".
         if _orig_cvd is None:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = _orig_cvd
 
-    # 3. Workers spawn here and safely claim the GPU context
     with mp.Pool(processes=njobs, initializer=initializer, maxtasksperchild=maxtasks) as pool:
         task_args = [(str(fpath), cfg) for fpath in filelist]
         for result_dict in tqdm(pool.imap_unordered(_process_unpack, task_args, chunksize=1),

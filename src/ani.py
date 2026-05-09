@@ -4,15 +4,31 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: DAS preprocessing (Bensen et al., 2007) + cross-correlation (conventional + Zhang 2026 v1).
-:reference: Modified from Yan Yang (2022-07-10).
+:purpose: High-performance DAS preprocessing and ambient noise cross-correlation engine.
+:reference: Preprocessing heavily adapted from Bensen et al. (2007). 
+            Original baseline modified from Yan Yang (2022-07-10).
+            Advanced cross-correlation implements Zhang (2026) v1.
 
-Revision notes (this version):
-    - TorchCrossCorrelation refactored into compute_X / compute_Y / combine
-      so VS-mode callers can compute the source spectrum once per virtual
-      source and reuse it across receiver chunks. The legacy
-      forward(data1, data2) entry point is preserved.
-    - preprocess: np.diff multiply is now in-place (one fewer full-array alloc).
+Description:
+This module contains the core mathematical and digital signal processing (DSP) 
+pipeline for Ambient Noise Interferometry (ANI). It pairs memory-efficient NumPy 
+preprocessing with a hardware-aware PyTorch backend, designed specifically to 
+maximize GPU utilization and minimize memory overhead on HPC clusters.
+
+Key Features:
+    - Asymmetric Cross-Correlation: The `TorchCrossCorrelation` engine is split into 
+      `compute_X`, `compute_Y`, and `combine`. This allows the FFT of a Virtual 
+      Source (VS) to be computed exactly once and broadcast across thousands of 
+      receiver chunks, eliminating redundant computations.
+    - Convolutional Spectral Whitening: Flattens frequency arrays and uses 
+      `torch.nn.functional.conv1d` to apply smoothing windows, allowing the GPU's 
+      highly optimized deep learning cores to accelerate DSP math.
+    - Zero-Copy & In-Place Memory: Enforces strict in-place operations (e.g., 
+      `np.divide` via `out=`) during temporal normalization and differentiation 
+      to prevent massive RAM allocation spikes.
+    - Strict Inference Mode: Utilizes `@torch.inference_mode()` across all PyTorch 
+      functions to strip gradient metadata, minimizing dispatch overhead and unlocking 
+      maximum execution speed in the C++/CUDA backends.
 """
 from __future__ import annotations
 
@@ -48,6 +64,34 @@ def bandpass_filter_tukey(
     alpha: float = 0.05,
     order: int = 4,
 ) -> np.ndarray:
+    """
+    Applies a time-domain Tukey window taper followed by a zero-phase Butterworth filter.
+
+    **DSP Theory & Application:**
+    1. **Tapering (Tukey Window):** DAS and seismic recording segments often have abrupt 
+       start and end amplitudes. Filtering or Fourier transforming un-tapered data causes 
+       "spectral leakage" (Gibbs phenomenon). The Tukey window (tapered cosine) smoothly 
+       ramps the edges of the trace to zero while preserving the original amplitude in 
+       the center.
+    2. **Filtering (Butterworth):** A Butterworth filter is chosen for its maximally flat 
+       passband. To maintain exact phase relationships—which is mathematically critical 
+       for travel-time measurements in cross-correlation—the filter is applied forward 
+       and backward using ``sosfiltfilt`` (zero-phase filtering).
+    3. **Numerical Stability:** The filter is designed using Second-Order Sections (SOS) 
+       rather than standard polynomial forms (b, a) to prevent numerical instability and 
+       precision loss at higher filter orders.
+
+    :param data: 2D NumPy array of continuous DAS data, shape (nchannels, nsamples).
+    :param fs: Sampling frequency of the input data in Hz.
+    :param f1: Lower frequency bound (Hz). If None, operates as a lowpass filter.
+    :param f2: Upper frequency bound (Hz). If None, operates as a highpass filter.
+    :param alpha: Shape parameter of the Tukey window. Represents the fraction of the 
+                  window inside the cosine tapered region. A value of 0.05 means a 
+                  2.5% taper on each end of the trace.
+    :param order: The order of the Butterworth filter. Higher orders yield sharper 
+                  rolloffs but can cause ringing in the time domain.
+    :return: Tapered and filtered 2D array, cast to float32.
+    """
     if data.ndim != 2:
         raise ValueError("bandpass_filter_tukey: data must be 2D (nch × nt).")
 
@@ -74,16 +118,31 @@ def bandpass_filter_tukey(
 
 def temporal_normalization(data: np.ndarray, fs: float, window_time: float) -> np.ndarray:
     """
-    Vectorized temporal normalization using a running absolute mean (RAM).
+    Suppresses high-amplitude transients in the time domain prior to cross-correlation.
 
-    For ``window_time == 0.0``: 1-bit normalization (``np.sign``).
-    Otherwise: divides each sample by the local RAM over a window of
-    ``round(fs × window_time)`` samples.
+    **DSP Theory & Application:**
+    Ambient Noise Interferometry (ANI) relies on extracting the Earth's Green's function 
+    from continuous, diffuse background noise. However, local transients (e.g., passing 
+    vehicles, earthquakes, or optical glitches in the DAS interrogator) can completely 
+    dominate the cross-correlation result. Temporal normalization equalizes the amplitude 
+    of the signal, ensuring that loud discrete events do not overpower the continuous 
+    ambient wavefield.
 
-    :param data: Input array, shape (nch, nt).
-    :param fs: Sampling rate (Hz).
-    :param window_time: RAM window length (seconds). 0.0 = 1-bit normalisation.
-    :return: Normalised array, shape (nch, nt), float32.
+    **Methods:**
+    - **Running Absolute Mean (RAM) (window_time > 0):** Computes a moving average of the 
+      absolute amplitude over a specified time window. The original signal is then divided 
+      by this envelope. This preserves relative local phase while suppressing regional 
+      spikes. Implemented via ``scipy.ndimage.uniform_filter1d`` for optimal C-level 
+      vectorization.
+    - **1-Bit Normalization (window_time = 0.0):** An extreme, highly robust method that 
+      retains only the sign of the waveform (-1, 0, or 1), completely destroying absolute 
+      amplitude information but perfectly equalizing the trace.
+
+    :param data: Input 2D NumPy array, shape (nchannels, nsamples).
+    :param fs: Sampling rate of the input data in Hz.
+    :param window_time: Length of the running absolute mean window in seconds. 
+                        Set to 0.0 to trigger 1-bit normalization.
+    :return: Temporally normalized 2D array, shape (nch, nt), float32.
     """
     if data.ndim != 2:
         raise ValueError("temporal_normalization: data must be 2D (nch × nt).")
@@ -101,6 +160,20 @@ def temporal_normalization(data: np.ndarray, fs: float, window_time: float) -> n
 # 2. Spectral whitening (torch)
 # ==============================================================
 class _WhiteningCache:
+    """
+    A specialized cache for PyTorch tensors used during spectral whitening.
+
+    **Purpose:**
+    To maximize GPU performance, we must avoid re-allocating and re-initializing 
+    taper and convolution kernel tensors during every iteration of the processing 
+    loop. This class stores pre-computed constant tensors (kernels and cosine tapers) 
+    indexed by device, dtype, and shape.
+
+    **Attributes:**
+    - kernel: Stores 1D boxcar kernels for amplitude spectrum smoothing.
+    - taper1: Stores cosine-squared tapers for the low-frequency roll-off.
+    - taper2: Stores cosine-squared tapers for the high-frequency roll-off.
+    """
     __slots__ = ("kernel", "taper1", "taper2")
     def __init__(self) -> None:
         self.kernel: dict[tuple[Any, ...], torch.Tensor] = {}
@@ -112,12 +185,31 @@ class _WhiteningCache:
         return (device, dtype, *rest)
 
     def get_kernel(self, device: torch.device, dtype: torch.dtype, nwin: int) -> torch.Tensor:
+        """
+        Retrieves or creates a 1D normalization kernel for frequency-domain smoothing.
+
+        :param device: The torch device (CPU/CUDA) where the kernel should reside.
+        :param dtype: The floating-point precision (usually float32).
+        :param nwin: The width of the smoothing window in frequency samples.
+        :return: A 3D tensor of shape (1, 1, nwin) suitable for ``torch.nn.functional.conv1d``.
+        """
         key = self._key(device, dtype, nwin)
         if key not in self.kernel:
             self.kernel[key] = torch.ones((1, 1, nwin), device=device, dtype=dtype) / float(nwin)
         return self.kernel[key]
 
     def get_taper1(self, device: torch.device, dtype: torch.dtype, idxf1: int) -> Optional[torch.Tensor]:
+        """
+        Retrieves or creates a cosine-squared (Hanning-style) transition taper.
+
+        **DSP Theory:**
+        Abruptly zeroing out frequencies outside the [f1, f2] passband causes 
+        ringing in the time domain. These tapers provide a smooth transition 
+        from 0 to 1 (or 1 to 0) at the band edges to ensure a clean impulse response.
+
+        :param idx: The number of frequency samples in the taper transition zone.
+        :return: A 1D tensor representing the cosine-squared ramp.
+        """
         if idxf1 <= 0: return None
         key = self._key(device, dtype, idxf1)
         if key not in self.taper1:
@@ -135,6 +227,33 @@ class _WhiteningCache:
 _WHITEN_CACHE = _WhiteningCache()
 
 def spectral_whitening(rfftdata: torch.Tensor, df: float, window_freq: float, f1: float, f2: float) -> torch.Tensor:
+    """
+    Performs frequency-domain normalization (whitening) on a complex RFFT spectrum.
+
+    **DSP Theory & Application:**
+    Spectral whitening is used to flatten the ambient noise spectrum, ensuring 
+    that all frequencies within the passband contribute equally to the 
+    cross-correlation. This effectively sharpens the correlation peak and 
+    attenuates monochromatic noise (e.g., electronic hum or machinery).
+
+    **Implementation Details:**
+    - **Smoothing:** If ``window_freq > 0``, the amplitude spectrum is smoothed 
+      using a moving average (via high-speed 1D convolution) before division. 
+      This prevents the "over-whitening" of low-energy bins that may contain 
+      only numerical noise.
+    - **Vectorization:** The function flattens all leading dimensions into a 
+      single batch, allowing it to process any input rank (e.g., multichannel 
+      segments) in a single GPU kernel launch.
+    - **Band-limiting:** Frequencies outside [f1, f2] are zeroed out with 
+      cosine-squared tapers applied at the edges.
+
+    :param rfftdata: Complex-valued Fourier spectrum (B, nfreq).
+    :param df: Frequency resolution (Hz/sample).
+    :param window_freq: Width of the smoothing window (Hz). 0.0 = full whitening.
+    :param f1: Lower limit of the whitening passband (Hz).
+    :param f2: Upper limit of the whitening passband (Hz).
+    :return: Whitened complex spectrum of the same shape.
+    """
     if rfftdata.ndim < 2:
         raise ValueError("spectral_whitening: rfftdata must be at least 2D.")
     device = rfftdata.device
@@ -185,16 +304,27 @@ def whiten_per_segment_torch(
     chunk_nch: int = 64,
 ) -> torch.Tensor:
     """
-    Apply spectral whitening independently to each segment of a multichannel signal.
+    A high-level wrapper to apply spectral whitening to time-domain segments in PyTorch.
 
-    :param x: Input tensor, shape (nch, npts_new). Must be float32.
-    :param fs_proc: Sampling rate after decimation (Hz).
-    :param npts_seg: Samples per segment (must divide npts_new evenly).
-    :param window_freq_hz: Smoothing window for amplitude spectrum (Hz). 0 = full whitening.
-    :param f1: Low frequency bound of whitening passband (Hz).
-    :param f2: High frequency bound of whitening passband (Hz).
-    :param chunk_nch: Channels processed per chunk.
-    :return: Whitened tensor, same shape as input (nch, npts_new), float32.
+    **Logic Flow:**
+    1. Reshapes continuous channel data into discrete time segments (B, npts_seg).
+    2. Computes the Forward Real FFT (RFFT) for each segment.
+    3. Calls ``spectral_whitening`` to normalize the frequency content.
+    4. Computes the Inverse Real FFT (IRFFT) to return to the time domain.
+    5. Reconstructs the original continuous channel shape.
+
+    **Performance Note:**
+    Uses a ``chunk_nch`` loop to control peak VRAM usage. This is critical when 
+    processing thousands of DAS channels simultaneously on a GPU.
+
+    :param x: 2D input tensor (nch, npts_continuous).
+    :param fs_proc: Sampling rate (Hz).
+    :param npts_seg: Length of the segments used for FFT (samples).
+    :param window_freq_hz: Smoothing window for whitening (Hz).
+    :param f1: Low-cut frequency (Hz).
+    :param f2: High-cut frequency (Hz).
+    :param chunk_nch: Number of channels to process per batch to manage memory.
+    :return: Time-domain whitened tensor.
     """
     if not isinstance(x, torch.Tensor):
         raise TypeError("whiten_per_segment_torch: x must be a torch.Tensor")
@@ -246,7 +376,7 @@ def preprocess(
     Full DAS preprocessing pipeline.
 
     Order of operations:
-        1. Differentiation (optional) — strain → strain-rate via ``np.diff``.
+        1. Differentiation (optional) — strain → strain-rate via ``np.gradient``.
         2. Detrend — remove linear trend along time axis.
         3. Bandpass + Tukey taper — ``bandpass_filter_tukey``.
         4. Decimation (optional) — anti-aliased downsampling via
@@ -306,17 +436,50 @@ def preprocess(
 # ==============================================================
 # 4. Zhang (2026) helper: choose block size
 # ==============================================================
-def choose_block_size_v2(
+def choose_block_size_v1(
     M: int,
     *,
     fft_snap_pow2: bool = True,
     fallback: Literal["v1_2M", "v1_Mp1"] = "v1_2M",
 ) -> tuple[int, int]:
     """
-    Choose optimal block size K and FFT length L for the Zhang v1 algorithm.
+    Calculates the theoretically optimal block size (K) and FFT length (L) for 
+    the Zhang v1 Cross-Correlation algorithm.
+
+    **DSP Theory & Optimization:**
+    The Zhang v1 algorithm utilizes an Overlap-Save approach to compute long 
+    cross-correlations. The computational cost is a function of the FFT length $L$ 
+    relative to the "useful" samples $K$ produced per block. 
+    
+    If $K$ is too small, the algorithm performs redundant FFTs. If $K$ is too large, 
+    the $\mathcal{O}(L \log L)$ cost of the FFT itself becomes inefficient. 
+    
+    The theoretical optimum for $K$ satisfies the transcendental equation involving 
+    the Lambert W function (specifically the $W_{-1}$ branch). This function 
+    minimizes the number of operations per output sample for a given maximum 
+    lag $M$.
+
+    **Algorithm Logic:**
+    1. **Optimal Search:** Uses the Lambert W function to find $K^*$ that minimizes 
+       the cost function based on the requested lag $M$.
+    2. **Power-of-Two Snapping:** If ``fft_snap_pow2`` is True, it rounds $L$ up 
+       to the nearest $2^n$ and adjusts $K$ accordingly. This is critical for 
+       maximum performance in libraries like FFTW, cuFFT, or PyTorch's MKL backend.
+    3. **Constraints:** Enforces $K \ge M + 1$ to ensure that every block contains 
+       at least enough context to compute a full lag window.
+
+    :param M: Maximum lag in samples. The total correlation length is $2M + 1$.
+    :param fft_snap_pow2: If True, forces the total FFT length $L$ to be a power 
+                           of two for optimal hardware performance.
+    :param fallback: The heuristic to use if ``scipy.special.lambertw`` is 
+                     unavailable. "v1_2M" ($K=2M$) is generally more efficient 
+                     for modern CPUs.
+    :return: A tuple of (K, L) 
+             K: Samples consumed per input block.
+             L: Total length of the FFT ($K + 2M$).
     """
     if M <= 0:
-        raise ValueError(f"choose_block_size_v2: M must be > 0, got {M}.")
+        raise ValueError(f"choose_block_size_v1: M must be > 0, got {M}.")
 
     K_star = None
     if lambertw is not None:
@@ -353,33 +516,36 @@ def choose_block_size_v2(
 # ==============================================================
 class TorchCrossCorrelation(nn.Module):
     """
-    Frequency-domain cross-correlation engine.
+    High-performance frequency-domain engine for seismic cross-correlation.
 
-    Public API
-    ----------
-    forward(data1, data2)
-        Symmetric path; equivalent to ``combine(compute_X(data1), compute_Y(data2))``.
-        Used by auto-CC and any caller that has both signals on hand.
+    **Architecture & Design:**
+    This module implements both the standard "conventional" cross-correlation and 
+    the optimized Zhang (2026) v1 algorithm. It is refactored into a three-stage 
+    asymmetric pipeline (Compute X -> Compute Y -> Combine) to maximize throughput 
+    on HPC clusters.
 
-    compute_X(x), compute_Y(y), combine(X, Y)
-        Asymmetric path used by VS-mode pipelines: compute the source-side
-        spectrum once per virtual source and broadcast over receiver chunks.
+    **The Asymmetric Advantage (VS Mode):**
+    In Virtual Source (VS) interferometry, a single source channel is typically 
+    correlated against thousands of receiver channels. By splitting the engine, 
+    the source-side spectrum ($X$) is computed and cached exactly once. The 
+    receiver-side spectra ($Y$) are processed in batches, and PyTorch's 
+    broadcasting mechanism efficiently replicates the source spectrum across 
+    the batch during the multiplication stage. This eliminates $N-1$ redundant 
+    FFT operations per virtual source.
 
-        For mode='conventional', ``compute_X`` and ``compute_Y`` are identical
-        (they're both an rfft + optional whitening). The split exists so the
-        v1 path — where x and y require different padding patterns — can
-        share the same call surface.
+    **Algorithmic Modes:**
+    1. **Conventional:** Performs full-length correlation ($2N-1$ samples). 
+       Ideal for short segments or when the full lag range is required.
+    2. **Zhang v1:** Optimized for calculating a specific maximum lag $M$ 
+       where $M \ll N$. Uses an Overlap-Save block approach to minimize 
+       computational complexity and memory footprint. Output length is $2M+1$.
 
-    Shapes
-    ------
-    Inputs to compute_X / compute_Y / forward:    (B, nseg, N) real.
-    compute_X / compute_Y output:
-        conventional → (B, nseg, nfreq) complex
-        v1           → (B, nseg, nblocks, nfreq) complex
-    combine output:                                (B_recv, 2M+1 or 2N-1) real (float32).
-        Broadcasts a B_X=1 source spectrum over a B_Y=batch_len receiver
-        spectrum, so the source's rfft is computed once per VS instead of
-        ``batch_len × nchunk`` times.
+    **Public API:**
+    - ``forward(data1, data2)``: Symmetric path; calculates $C_{12}$.
+    - ``compute_X(x)``: Computes the source-side complex spectrum. 
+    - ``compute_Y(y)``: Computes the receiver-side complex spectrum.
+    - ``combine(X, Y)``: Multiplies spectra, sums across segments/blocks, 
+      and performs the inverse FFT to produce the time-domain NCF.
     """
 
     def __init__(self, *, mode: str = "conventional", max_lag_samples: Optional[int] = None,
@@ -405,7 +571,7 @@ class TorchCrossCorrelation(nn.Module):
 
         if self.mode == "v1":
             self._v1_M = int(max_lag_samples)
-            self._v1_K, self._v1_Lfft = choose_block_size_v2(
+            self._v1_K, self._v1_Lfft = choose_block_size_v1(
                 self._v1_M, fft_snap_pow2=v1_fft_snap_pow2, fallback=v1_fallback
             )
             self._v1_nfreq = self._v1_Lfft // 2 + 1
@@ -427,10 +593,22 @@ class TorchCrossCorrelation(nn.Module):
 
     def _v1_build_x(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Source-side block layout (full overlap context).
+        Constructs the block-wise layout for the Zhang v1 Overlap-Save algorithm.
 
-        Each block holds [pre-context M][center K][post-context M], zero-padded
-        for first/last blocks where context falls outside the signal.
+        **DSP Theory:**
+        To compute a correlation up to lag $M$ using FFTs of length $L$, the 
+        input must be partitioned such that the circular convolution artifacts 
+        are discarded. 
+
+        - **Source-side (build_x):** Each block of size $K$ is padded with $M$ 
+        samples of context from both the preceding and following data 
+        (total length $L = K + 2M$). This ensures the source "sees" enough 
+        of the receiver's signal to compute all lags.
+        - **Receiver-side (build_y):** The $K$ samples are centered within 
+        the $L$-length buffer, padded with $M$ zeros on both sides.
+
+        :param x/y: Input tensor of shape (Batch, nseg, N).
+        :return: Blocked tensor of shape (Batch*nseg, nblocks, Lfft).
         """
         M, K, Lfft = self._v1_M, self._v1_K, self._v1_Lfft
         B, nseg, N = x.shape
@@ -451,13 +629,6 @@ class TorchCrossCorrelation(nn.Module):
         return x_blocked
 
     def _v1_build_y(self, y: torch.Tensor) -> torch.Tensor:
-        """
-        Receiver-side block layout (centered, M-zero borders).
-
-        Each block holds [M zeros][center K samples of y][M zeros + tail zeros],
-        where the trailing zeros come from the implicit zero-padding to length
-        Lfft = K + 2M (and the K-window is truncated for the final block).
-        """
         M, K, Lfft = self._v1_M, self._v1_K, self._v1_Lfft
         B, nseg, N = y.shape
         Bn = B * nseg
@@ -540,14 +711,29 @@ class TorchCrossCorrelation(nn.Module):
     # ----- Public spectrum API -----
     @torch.inference_mode()
     def compute_X(self, x: torch.Tensor) -> torch.Tensor:
-        """Source-side spectrum. See class docstring for shape contract."""
+        """
+        Transforms time-domain segments into the frequency domain for correlation.
+
+        **Implementation Details:**
+        - Automatically handles FFT length $L$ selection (Power-of-two snapping).
+        - Applies optional spectral whitening to the complex RFFT coefficients.
+        - Operates under ``torch.inference_mode()`` for maximum C++/CUDA speed.
+
+        **Shapes:**
+        - Input: $(B, nseg, N)$ real.
+        - Output (Conventional): $(B, nseg, nfreq)$ complex.
+        - Output (v1): $(B, nseg, nblocks, nfreq)$ complex.
+
+        :param x: Real-valued input waveform tensor.
+        :return: Complex-valued frequency-domain spectrum.
+        """
         if self.mode == "conventional":
             return self._compute_conv_spec(x)
         return self._compute_v1_X_spec(x)
 
     @torch.inference_mode()
     def compute_Y(self, y: torch.Tensor) -> torch.Tensor:
-        """Receiver-side spectrum. See class docstring for shape contract."""
+        """Receiver-side spectrum."""
         if self.mode == "conventional":
             return self._compute_conv_spec(y)
         return self._compute_v1_Y_spec(y)
@@ -556,10 +742,23 @@ class TorchCrossCorrelation(nn.Module):
     @torch.inference_mode()
     def combine(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
         """
-        Combine source and receiver spectra into the cross-correlation output.
+        Aggregates source and receiver spectra into the final time-domain NCF.
 
-        For VS mode, X has B_X=1 and Y has B_Y=batch_len; broadcasting handles
-        the rest. For symmetric forward(), B_X==B_Y.
+        **Performance Features:**
+        1. **Spectral Multiplication:** Performs $X^* \cdot Y$ (conjugate multiplication).
+        2. **Segment Averaging:** Sums the product across all time segments ($nseg$) 
+        to produce the stable ambient noise correlation.
+        3. **Block Aggregation (v1 only):** Sums across $nblocks$ to finalize the 
+        Overlap-Save reconstruction.
+        4. **Broadcasting:** If $X$ has a batch size of 1 and $Y$ has a batch size 
+        of $B$, PyTorch automatically broadcasts the source across all receivers 
+        without memory replication.
+        5. **IFFT & Phase Shift:** Performs the IRFFT and reorders the results 
+        to place zero-lag in the center of the output.
+
+        :param X: Source-side complex spectrum.
+        :param Y: Receiver-side complex spectrum.
+        :return: Real-valued time-domain NCF, shape $(B, 2M+1)$ or $(B, 2N-1)$.
         """
         if self.mode == "conventional":
             # X: (B_X, nseg, nfreq), Y: (B_Y, nseg, nfreq)
@@ -624,11 +823,12 @@ class TorchCrossCorrelation(nn.Module):
     @torch.inference_mode()
     def _forward_v1_python_fft(self, signal_1, signal_2):
         """
-        LEGACY METHOD (Internal / Benchmarking use only).
-
-        WARNING: Returns the raw accumulation of cross-correlation windows
-        without dividing by ``flag_mean`` (nseg). For comparison against the
-        production batched pipeline, divide the result by nseg manually.
+        LEGACY REFERENCE METHOD.
+        
+        Computes the Zhang v1 algorithm using a sequential loop over blocks. 
+        This is significantly slower than the batched/vectorized production 
+        methods but serves as the "Gold Standard" for mathematical verification 
+        of the Overlap-Save logic. Use only for benchmarking and unit testing.
         """
         is_3d = signal_1.ndim == 3
         if is_3d:
