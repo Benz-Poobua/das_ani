@@ -508,6 +508,6 @@ if __name__ == "__main__":
 #   --repeats 4 \
 #   --cores 1 2 4 8 16 \
 #   --window_sec 204.8 \
-#   --njobs_complexity 16 \
+#   --njobs_complexity 1 \
 #   --lags 5 10 20 30
 #   --cleanup

@@ -46,6 +46,7 @@ import numpy as np
 
 from tqdm import tqdm
 from pathlib import Path
+import scipy.signal as signal
 from scipy.ndimage import uniform_filter, gaussian_filter
 from scipy.fft import fft2, fftshift, ifft2, ifftshift
 
@@ -119,6 +120,61 @@ def load_data(filepath: PathLike, mmap: bool = False) -> tuple[Any, ArrayLike, f
 
     logger.info("DAS loaded: shape=%s, dt=%s", das_array.shape, dt)
     return data_source, das_array, dt, n_samples, duration
+
+def load_and_merge_das_sequence(
+    file_list: Sequence[Union[str, Path]],
+    start_chan: Optional[int] = None,
+    end_chan: Optional[int] = None,
+) -> Tuple[np.ndarray, float, float]:
+    """
+    Ingests a sequence of discrete NumPy archive files, extracts a targeted spatial subset,
+    concatenates the records along the temporal axis, and removes linear drift globally.
+
+    **DSP Theory:**
+    In ambient noise monitoring and low-frequency interferometry, the frequency resolution 
+    of the discrete Fourier transform is strictly governed by the total continuous record 
+    duration ($\Delta f = 1 / T_{\text{total}}$). Concatenating sequential short-duration 
+    files expands the temporal aperture to resolve highly dispersed, narrow-band phase velocities. 
+    Crucially, applying linear detrending across the entire concatenated block—rather than 
+    individual files independently—prevents localized baseline discontinuities (step artifacts) 
+    at file boundaries, eliminating a primary source of high-frequency spectral leakage.
+
+    **Applications in DAS:**
+    - **Continuous Wavefield Assembly:** Merging standard 10-minute field files into continuous 
+      1-hour or multi-hour matrices for stable empirical Green's function retrieval.
+    - **Memory-Safe Subspace Extraction:** Decoupling file reading from full-array RAM limits 
+      by slicing only the required spatial channel aperture during initial disk ingestion.
+
+    :param file_list: Sequence of file paths (strings or Path objects) pointing to sorted 
+                      NumPy archives (`.npz`) containing native `'data'`, `'dt'`, and `'dx'` keys.
+    :param start_chan: Optional starting channel index to slice the spatial array.
+    :param end_chan: Optional ending channel index to slice the spatial array.
+    :return: (merged_detrended, dt, dx)
+             merged_detrended: 2D continuous space-time wavefield array, shape (n_channels, n_total_samples).
+             dt: Temporal sampling interval extracted natively from the initial archive (seconds).
+             dx: Spatial sampling interval extracted natively from the initial archive (meters).
+    """
+    arrays = []
+    dt, dx = None, None
+
+    for idx, path in enumerate(file_list):
+        data = np.load(path)
+
+        # Extract native metadata from the initial archive
+        if idx == 0:
+            dt = float(data['dt'])
+            dx = float(data['dx'])
+
+        raw_slice = data['data'][start_chan:end_chan, :]
+        arrays.append(raw_slice)
+
+    # Concatenate horizontally (Channels x Merged Time)
+    merged_raw = np.concatenate(arrays, axis=1)
+
+    # Detrend across the entire continuous block to prevent boundary steps
+    merged_detrended = signal.detrend(merged_raw, type='linear', axis=1)
+
+    return merged_detrended, dt, dx
 
 # ==============================================================
 # 2. Tensor / Numpy conversions
