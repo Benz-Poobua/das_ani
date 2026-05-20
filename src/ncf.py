@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import re
 import os
 import sys
 import glob
@@ -240,12 +241,15 @@ def process_and_save_subset(
 def get_vs_number(filepath: str) -> int:
     """
     Extracts the Virtual Source integer from a standard NCF filename for proper sorting.
-    
-    :param filepath: Path to the NCF file.
-    :returns: The integer value of the virtual source.
+    Handles variable prefix lengths by looking for the '_cc_[number]' pattern.
     """
     filename = os.path.basename(filepath)
-    return int(filename.split('_')[2])
+    match = re.search(r'_cc_(\d+)', filename)
+    
+    if match:
+        return int(match.group(1))
+    else:
+        raise ValueError(f"Could not parse VS number from filename: {filename}")
 
 def apply_inner_spatial_mute(data: np.ndarray, offset: np.ndarray, cut_m: float = 100.0, taper_m: float = 50.0) -> np.ndarray:
     """

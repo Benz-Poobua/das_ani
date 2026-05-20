@@ -255,12 +255,30 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     t_io_start = time.perf_counter()
     _, das_array, dt, npts, _ = load_data(in_path, mmap=mmap)
     data_raw = das_array[:] if isinstance(das_array, zarr.Array) else das_array
+
+    # Channel slicing — handle both pre-sliced and full-cable inputs
+    nch_file = data_raw.shape[0]
+    if nch_file == nch_expected:
+        # File is already sliced to the target range
+        pass
+    elif nch_file > last_chan:
+        # File contains the full cable (or more); slice to the requested channels
+        data_raw = data_raw[first_chan : last_chan + 1, :]
+    else:
+        # File doesn't contain enough channels — skip
+        logger.warning(
+            "[%s] nch_file=%d < last_chan+1=%d, skipping",
+            in_path.name, nch_file, last_chan + 1,
+        )
+        return None
+
     nch = data_raw.shape[0]
+
     io_time += (time.perf_counter() - t_io_start)
 
     basename = in_path.name.replace('.zarr', '').replace('.npz', '')
 
-    if nch != nch_expected or npts < min_npts:
+    if npts < min_npts:
         return None
 
     # ==========================================================
@@ -368,6 +386,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     meta_path = out_dir / basename.replace(".npz", f"_cc_state_{mode}.json")
     completed_src = load_resume_state(meta_path)
     last_out: Optional[Path] = None
+
     vs_bar = tqdm(src_ch_all, desc=f"VS {basename}", leave=True)
 
     # ==========================================================
