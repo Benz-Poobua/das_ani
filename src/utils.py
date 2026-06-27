@@ -109,6 +109,20 @@ def load_data(filepath: PathLike, mmap: bool = False) -> tuple[Any, ArrayLike, f
         if "data" not in data_source or "dt" not in data_source:
             raise KeyError("NPZ file must contain 'data' and 'dt'.")
 
+        # File specification (see README "Input data format"): every archive
+        # named YYYYMMDD_HHMMSS_<tag>.npz should carry
+        #   data (nch, nt) | dt (s) | dx (m) | start_sample | end_sample.
+        # Only data/dt are hard requirements of the CC engine; warn on the
+        # rest so legacy archives keep working but new ones get flagged.
+        missing = [k for k in ("dx", "start_sample", "end_sample")
+                   if k not in data_source]
+        if missing:
+            logger.warning(
+                "NPZ %s is missing recommended keys %s "
+                "(file spec: data, dt, dx, start_sample, end_sample).",
+                path.name, missing,
+            )
+
         das_array = data_source["data"]
         dt = float(data_source["dt"])
 
@@ -133,7 +147,7 @@ def load_and_merge_das_sequence(
     **DSP Theory:**
     In ambient noise monitoring and low-frequency interferometry, the frequency resolution 
     of the discrete Fourier transform is strictly governed by the total continuous record 
-    duration ($\Delta f = 1 / T_{\text{total}}$). Concatenating sequential short-duration 
+    duration ($\\Delta f = 1 / T_{\text{total}}$). Concatenating sequential short-duration 
     files expands the temporal aperture to resolve highly dispersed, narrow-band phase velocities. 
     Crucially, applying linear detrending across the entire concatenated block—rather than 
     individual files independently—prevents localized baseline discontinuities (step artifacts) 
@@ -302,6 +316,26 @@ def norm_fro(A: torch.Tensor, Arec: torch.Tensor) -> float:
 
 def compute_clip(arr: np.ndarray, pclip: float = 99.0) -> float:
     return float(np.percentile(arr, pclip))
+
+def normalize_traces(data: np.ndarray, axis: int = -1) -> np.ndarray:
+    """
+    Normalize each trace by its maximum absolute amplitude along ``axis``.
+
+    Dead traces (all-zero along ``axis``) are returned as zeros instead of
+    NaN. Operates on arrays of any rank; ``axis`` is typically the time axis.
+    Used by, e.g., ``src.dvv.compute_dvv_xcorr`` to remove per-trace amplitude
+    differences before peak-shift estimation.
+
+    :param data: Input array, shape ``(..., nt)`` when ``axis=-1``.
+    :param axis: Axis along which each trace is defined (default: last).
+    :return: Normalized array, same shape, float result; max |amplitude| of
+             every live trace is 1.
+    """
+    arr = np.asarray(data)
+    peak = np.max(np.abs(arr), axis=axis, keepdims=True)
+    out = np.zeros_like(arr, dtype=np.result_type(arr.dtype, np.float32))
+    np.divide(arr, peak, out=out, where=peak > 0)
+    return out
 
 @overload
 def nextpow2(x: int) -> int: ...
@@ -641,10 +675,22 @@ def auto_np_pair_chunk(
         return 1
 
     max_pairs_by_mem = max(1, int(budget // bytes_per_pair))
+    # Largest pair-batch that fits: bounded by the channel count, the hard
+    # `max_chunk` ceiling, and the memory budget.
     upper = min(int(nch), int(max_chunk), int(max_pairs_by_mem))
     if upper <= 0:
         return 1
-    return int(min_chunk) if min_chunk <= upper else int(upper)
+    # Use the LARGEST batch that fits the budget. Bigger batches maximize the
+    # FFT/BLAS batch dimension and (on GPU) device occupancy; the per-channel
+    # NCFs are independent of how channels are grouped, so the numerical result
+    # is unchanged. `min_chunk` acts as a preferred floor: it is satisfied
+    # automatically whenever it fits (upper >= min_chunk) and is deliberately
+    # never allowed to exceed what memory permits.
+    #
+    # NOTE: the previous form `return min_chunk if min_chunk <= upper else upper`
+    # returned `min_chunk` whenever it fit, which capped every batch at
+    # `min_chunk` (default 64) and discarded the memory model computed above.
+    return int(upper)
 
 # ==============================================================
 # 9. Auto-resume helpers

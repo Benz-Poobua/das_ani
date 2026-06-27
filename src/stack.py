@@ -19,7 +19,7 @@ Computational Optimizations:
     2. **Sliding-Window $O(N)$ Logic:** Implements a boundary-update algorithm for 
        rolling windows. Instead of re-stacking $W$ days for every step, the 
        engine simply adds the entering day and subtracts the leaving day. This 
-       reduces computational complexity from $O(N \cdot W)$ to $O(N)$.
+       reduces computational complexity from $O(N \\cdot W)$ to $O(N)$.
     3. **I/O Caching:** Each base-stack file is loaded exactly once per Virtual 
        Source group, regardless of how many overlapping windows it belongs to, 
        yielding up to a 30x reduction in disk overhead.

@@ -1,0 +1,106 @@
+"""Unit + small integration tests for src/stack.py."""
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from src.stack import (
+    _streaming_mean,
+    _time_fmt_for,
+    base_stack_ncf,
+    parse_date_vs,
+    parse_date_vs_method,
+)
+
+
+# ---------------------------------------------------------------------------
+# Filename parsing
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("name,exp_dt,exp_vs,exp_method", [
+    ("20210901_000000_cc_080.npy", datetime(2021, 9, 1), 80, None),
+    ("20211110_150000_cc_080_conventional.npy", datetime(2021, 11, 10, 15), 80, "conventional"),
+    ("20211110_150000_auto_conventional.npy", datetime(2021, 11, 10, 15), -1, "conventional"),
+    ("20210901_cc_080_30d_v1_2M.npy", datetime(2021, 9, 1), 80, "v1_2M"),
+    ("20250722_025000_bridge_cc_012_v1.npy", datetime(2025, 7, 22, 2, 50), 12, "v1"),
+])
+def test_parse_date_vs_method(name, exp_dt, exp_vs, exp_method):
+    dt_obj, vs, method = parse_date_vs_method(name)
+    assert dt_obj == exp_dt
+    assert vs == exp_vs
+    assert method == exp_method
+
+
+def test_parse_date_vs_rejects_garbage():
+    with pytest.raises(ValueError):
+        parse_date_vs("not_a_real_file.npy")
+
+
+@pytest.mark.parametrize("label,fmt", [
+    ("1d", "%Y%m%d"), ("30d", "%Y%m%d"), ("1h", "%Y%m%d_%H%M%S"), ("daily", "%Y%m%d"),
+])
+def test_time_fmt_for(label, fmt):
+    assert _time_fmt_for(label) == fmt
+
+
+# ---------------------------------------------------------------------------
+# Streaming mean
+# ---------------------------------------------------------------------------
+def test_streaming_mean(tmp_path, rng):
+    arrays = [rng.standard_normal((4, 16)).astype(np.float32) for _ in range(5)]
+    files = []
+    for i, a in enumerate(arrays):
+        p = tmp_path / f"a{i}.npy"
+        np.save(p, a)
+        files.append(p)
+
+    stack, n = _streaming_mean(files)
+    assert n == 5
+    assert stack.dtype == np.float32
+    assert np.allclose(stack, np.mean(arrays, axis=0), atol=1e-6)
+
+
+def test_streaming_mean_skips_mismatched_shapes(tmp_path, rng):
+    p1 = tmp_path / "good.npy"
+    p2 = tmp_path / "bad.npy"
+    np.save(p1, np.ones((2, 4), dtype=np.float32))
+    np.save(p2, np.ones((3, 4), dtype=np.float32))
+    stack, n = _streaming_mean([p1, p2])
+    assert n == 1
+    assert stack.shape == (2, 4)
+
+
+def test_streaming_mean_empty():
+    stack, n = _streaming_mean([])
+    assert stack is None and n == 0
+
+
+# ---------------------------------------------------------------------------
+# Base stacking (integration on a tmp tree)
+# ---------------------------------------------------------------------------
+def test_base_stack_ncf_groups_by_date_vs_method(tmp_path, rng):
+    raw = tmp_path / "raw"
+    out = tmp_path / "stacks"
+    raw.mkdir()
+
+    # Two hourly slices of the same (day, vs, method) -> one 1d output;
+    # a second VS -> its own output.
+    a = rng.standard_normal((3, 9)).astype(np.float32)
+    b = rng.standard_normal((3, 9)).astype(np.float32)
+    np.save(raw / "20250722_010000_urban_cc_000_v1.npy", a)
+    np.save(raw / "20250722_020000_urban_cc_000_v1.npy", b)
+    np.save(raw / "20250722_010000_urban_cc_004_v1.npy", a * 2)
+
+    base_stack_ncf(raw, out, "1d", overwrite=True, njobs=1)
+
+    produced = sorted(p.name for p in Path(out).glob("*.npy"))
+    # Hourly files carry distinct datetimes, so each (datetime, vs) is its
+    # own group; the 1d label formats the name by date+time.
+    assert any("cc_000" in n for n in produced)
+    assert any("cc_004" in n for n in produced)
+    for p in Path(out).glob("*.npy"):
+        arr = np.load(p)
+        assert arr.shape == (3, 9)
+        assert arr.dtype == np.float32

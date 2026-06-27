@@ -4,40 +4,46 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: High-performance DAS Ambient Noise Interferometry (ANI) engine for 
+:purpose: High-performance DAS Ambient Noise Interferometry (ANI) engine for
           cross-correlation (NCF) and auto-correlation (ACF) generation.
 
 Description:
-This module serves as the primary execution engine for generating Noise 
-Correlation Functions (NCFs) from massive DAS datasets. It is optimized for 
-High-Performance Computing (HPC) environments, featuring hardware-aware 
+This module serves as the primary execution engine for generating Noise
+Correlation Functions (NCFs) from massive DAS datasets. It is optimized for
+High-Performance Computing (HPC) environments, featuring hardware-aware
 resource management, asynchronous I/O, and highly parallelized spectral math.
 
 Key Architecture & Performance Features:
-    - Asymmetric GPU Pipeline: Implements a "Compute-Once, Broadcast-Many" 
-      architecture for Virtual Source (VS) mode. The source spectrum is 
-      calculated once and reused across receiver batches, eliminating 
+    - Asymmetric GPU Pipeline: Implements a "Compute-Once, Broadcast-Many"
+      architecture for Virtual Source (VS) mode. The source spectrum is
+      calculated once and reused across receiver batches, eliminating
       redundant FFTs.
-    - Deferred Device-to-Host Transfer: Cross-correlation sums are accumulated 
-      directly in GPU VRAM. Transfers to CPU/Host memory are deferred until the 
-      entire Virtual Source is complete, minimizing PCIe bus contention and 
+    - Deferred Device-to-Host Transfer: Cross-correlation sums are accumulated
+      directly in GPU VRAM. Transfers to CPU/Host memory are deferred until the
+      entire Virtual Source is complete, minimizing PCIe bus contention and
       maximizing GPU kernel utilization.
-    - SLURM-Safe Multiprocessing: Implements a "Double-Guard" on GPU visibility. 
-      The parent process is shielded from the GPU during setup to prevent 
-      premature lock acquisition in SLURM Exclusive-Process mode, ensuring 
+    - SLURM-Safe Multiprocessing: Implements a "Double-Guard" on GPU visibility.
+      The parent process is shielded from the GPU during setup to prevent
+      premature lock acquisition in SLURM Exclusive-Process mode, ensuring
       clean initialization of the worker pool.
-    - Memory-Budgeted Chunking: Utilizes a heuristic memory model to 
-      dynamically scale channel batches based on available VRAM and algorithm 
-      complexity (Conventional vs. Zhang 2026 v1), ensuring zero Out-of-Memory 
+    - Memory-Budgeted Chunking: Utilizes a heuristic memory model to
+      dynamically scale channel batches based on available VRAM and algorithm
+      complexity (Conventional vs. Zhang 2026 v1), ensuring zero Out-of-Memory
       (OOM) crashes.
-    - Deterministic HPC Threading: Enforces strict control over OMP, MKL, and 
-      intra-op threading via SLURM_CPUS_PER_TASK to ensure predictable 
+    - Deterministic HPC Threading: Enforces strict control over OMP, MKL, and
+      intra-op threading via SLURM_CPUS_PER_TASK to ensure predictable
       performance and fair resource sharing on multi-tenant nodes.
 
 Workflow:
-    1. Pre-computes whitening and block-sizing parameters.
-    2. Spawns a hardware-aware worker pool with pre-warmed PyTorch models.
-    3. Processes datasets in parallel, managing auto-resume states and 
+    1. Ingest raw DAS data (decimation + optional differentiation, once per file).
+    2. Per-window preprocessing via ``src.ani.preprocess`` with a selectable
+       backend (config key ``preprocess.mode``): ``pure_numpy`` (legacy CPU
+       benchmark), ``hybrid`` (scipy detrend/bandpass + torch
+       median/temporal-norm; Option A), or ``pure_torch`` (all-torch,
+       GPU-tailored).
+    3. Pre-computes whitening and block-sizing parameters.
+    4. Spawns a hardware-aware worker pool with pre-warmed PyTorch models.
+    5. Processes datasets in parallel, managing auto-resume states and
        internal profiling (I/O vs. Compute) for performance benchmarking.
 """
 from __future__ import annotations
@@ -48,6 +54,11 @@ import logging
 import os
 import time
 import gc
+import sys
+try:
+    import resource  # Unix only; used for peak-RSS (high-water) reporting
+except ImportError:  # pragma: no cover
+    resource = None
 import multiprocessing as mp
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Dict
@@ -76,12 +87,34 @@ from src.utils import (
 
 from src.ani import (
     preprocess,
+    resolve_preprocess_mode,
+    decimate_raw,
+    differentiate_cpu,
     TorchCrossCorrelation,
     whiten_per_segment_torch,
     choose_block_size_v1,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _peak_rss_mb() -> float:
+    """Peak resident-set size of this process in MB (high-water mark).
+
+    Uses ``resource.getrusage`` (true peak) when available, falling back to the
+    current RSS via ``psutil``. Added for the benchmark suite (src/eval.py) so a
+    file's host-memory peak can be reported alongside the GPU peak.
+    """
+    if resource is not None:
+        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports KiB; macOS reports bytes.
+        return r / 1024.0 if sys.platform != "darwin" else r / (1024.0 * 1024.0)
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1e6
+    except Exception:
+        return 0.0
+
 
 # Global flag to ensure the PyTorch model is only initialized once per worker process.
 _WARMED_UP = False
@@ -179,6 +212,43 @@ def _unwrap_model(m: nn.Module) -> nn.Module:
     return m
 
 
+def _get_ingest_cfg(cfg: Mapping[str, Any]) -> tuple[int, bool]:
+    """
+    Read ingest-time decimation and differentiation flags.
+
+    The canonical location is ``ingest.{decimation, diff}``. For backward
+    compatibility with older configs that placed these under
+    ``preprocess.{decimation, diff}``, the legacy locations are accepted as a
+    fallback and a DeprecationWarning is logged.
+    """
+    decimation = get_cfg(cfg, ["ingest", "decimation"], None)
+    diff = get_cfg(cfg, ["ingest", "diff"], None)
+
+    if decimation is None:
+        legacy = get_cfg(cfg, ["preprocess", "decimation"], None)
+        if legacy is not None:
+            logger.warning(
+                "Config key 'preprocess.decimation' is deprecated; "
+                "move it to 'ingest.decimation' to match the Option A pipeline."
+            )
+            decimation = legacy
+        else:
+            decimation = 1
+
+    if diff is None:
+        legacy = get_cfg(cfg, ["preprocess", "diff"], None)
+        if legacy is not None:
+            logger.warning(
+                "Config key 'preprocess.diff' is deprecated; "
+                "move it to 'ingest.diff' to match the Option A pipeline."
+            )
+            diff = legacy
+        else:
+            diff = False
+
+    return int(decimation), bool(diff)
+
+
 @timeit
 def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     t_total_start = time.perf_counter()
@@ -218,11 +288,21 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     min_length_sec = float(get_cfg(cfg, ["data", "min_length_sec"], 60.0))
     min_npts = int(min_length_sec * fs_raw)
 
-    decimation = int(get_cfg(cfg, ["preprocess", "decimation"], 1))
+    # Ingest-time operations: decimation + optional differentiation.
+    # These run once per file (NOT per processing window).
+    decimation, diff = _get_ingest_cfg(cfg)
+
+    # Per-window preprocessing parameters.
     f1 = float(get_cfg(cfg, ["preprocess", "f1"], 1.0))
     f2 = float(get_cfg(cfg, ["preprocess", "f2"], 5.0))
-    diff = bool(get_cfg(cfg, ["preprocess", "diff"], False))
     ram_win_sec = float(get_cfg(cfg, ["preprocess", "ram_win_sec"], 0.0))
+    whiten_chunk_nch = int(get_cfg(cfg, ["preprocess", "whiten_chunk_nch"], 64))
+    # Preprocessing backend: "pure_numpy" | "hybrid" | "pure_torch".
+    # Default (key absent) preserves legacy behaviour: CPU -> pure_numpy,
+    # GPU -> hybrid (Option A). Validated here so a typo fails fast.
+    preprocess_mode = resolve_preprocess_mode(
+        get_cfg(cfg, ["preprocess", "mode"], None), use_gpu
+    )
     fs_proc = fs_raw / decimation
 
     is_spectral_whitening = bool(get_cfg(cfg, ["xcorr", "is_spectral_whitening"], True))
@@ -231,8 +311,6 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec"], 8.0))
     mode = str(get_cfg(cfg, ["xcorr", "mode"], "conventional")).lower()
     auto_cc = bool(get_cfg(cfg, ["xcorr", "auto_cc"], False))
-
-    whiten_chunk_nch = int(get_cfg(cfg, ["preprocess", "whiten_chunk_nch"], 64))
 
     if mode == "v1":
         xcorr_seg_sec = float(get_cfg(cfg, ["xcorr", "xcorr_seg_sec_v1"], xcorr_seg_sec))
@@ -248,6 +326,9 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     src_ch_all = src_ch_all_num - first_chan
 
     device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        # Reset so the peak-VRAM figure returned below reflects this file only.
+        torch.cuda.reset_peak_memory_stats(device)
 
     # ==========================================================
     # 1. DATA INGESTION
@@ -256,7 +337,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     _, das_array, dt, npts, _ = load_data(in_path, mmap=mmap)
     data_raw = das_array[:] if isinstance(das_array, zarr.Array) else das_array
 
-    # Channel slicing — handle both pre-sliced and full-cable inputs
+    # Channel slicing -- handle both pre-sliced and full-cable inputs
     nch_file = data_raw.shape[0]
     if nch_file == nch_expected:
         # File is already sliced to the target range
@@ -265,7 +346,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         # File contains the full cable (or more); slice to the requested channels
         data_raw = data_raw[first_chan : last_chan + 1, :]
     else:
-        # File doesn't contain enough channels — skip
+        # File doesn't contain enough channels -- skip
         logger.warning(
             "[%s] nch_file=%d < last_chan+1=%d, skipping",
             in_path.name, nch_file, last_chan + 1,
@@ -281,10 +362,27 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     if npts < min_npts:
         return None
 
+    # ----------------------------------------------------------
+    # Ingest-time anti-aliased decimation + optional differentiation.
+    # Both operate on the raw numpy buffer before per-window preprocessing.
+    # ----------------------------------------------------------
+    if decimation > 1:
+        data_raw = decimate_raw(data_raw, fs_raw, decimation, f2_target=f2)
+    if diff:
+        data_raw = differentiate_cpu(data_raw, fs_proc)
+
     # ==========================================================
-    # 2. PREPROCESSING
+    # 2. PREPROCESSING  (backend selected by preprocess.mode)
     # ==========================================================
-    data_proc = preprocess(data_raw, fs_raw, f1, f2, decimation, diff, ram_win_sec).astype(np.float32, copy=False)
+    # preprocess() returns either:
+    #   - np.ndarray (mode="pure_numpy"), or
+    #   - torch.Tensor already resident on `device`
+    #     (mode="hybrid" or "pure_torch").
+    logger.debug("[%s] preprocess mode=%s device=%s", basename, preprocess_mode, device)
+    data_proc = preprocess(
+        data_raw, fs_proc, f1, f2, ram_win_sec,
+        use_gpu=use_gpu, device=device, mode=preprocess_mode,
+    )
     npts_proc = int(data_proc.shape[1])
 
     npts_new = (npts_proc // npts_seg) * npts_seg
@@ -292,26 +390,33 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     if npts_new <= 0 or nseg == 0:
         return None
 
+    # Truncate to an integer number of segments. Both ndarray and tensor
+    # support the same trailing-slice syntax.
     data_proc = data_proc[:, :npts_new]
     flag_mean = int(nseg)
     prewhiten = bool(is_spectral_whitening)
 
-    if prewhiten:
+    # Ensure we have a torch tensor on the target device for the whitening /
+    # CC kernels. On the GPU path this is a no-op (already on device); on the
+    # CPU path we promote the numpy array to a tensor on `device`.
+    if isinstance(data_proc, torch.Tensor):
+        data_tensor = data_proc
+    else:
         data_tensor = convert_to_tensor(data_proc, device=torch.device("cpu"))
-        del data_raw, data_proc
-        gc.collect()
+        if device.type == "cuda":
+            data_tensor = data_tensor.pin_memory().to(device, non_blocking=True)
+        else:
+            data_tensor = data_tensor.to(device)
 
-        data_tensor = data_tensor.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else data_tensor.to(device)
+    del data_raw, data_proc
+    gc.collect()
+
+    if prewhiten:
         data_tensor = whiten_per_segment_torch(
             data_tensor, fs_proc=fs_proc, npts_seg=npts_seg,
             window_freq_hz=window_freq_hz, f1=f1, f2=f2,
             chunk_nch=whiten_chunk_nch,
         )
-    else:
-        data_tensor = convert_to_tensor(data_proc, device=torch.device("cpu"))
-        del data_raw, data_proc
-        gc.collect()
-        data_tensor = data_tensor.pin_memory().to(device, non_blocking=True) if device.type == "cuda" else data_tensor.to(device)
 
     # ==========================================================
     # 2b. SIZING (v1-aware)
@@ -340,7 +445,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     is_spectral_whitening_cc = False if prewhiten else bool(is_spectral_whitening)
     whitening_params_cc = None if prewhiten else (float(fs_proc), float(window_freq_hz), float(f1), float(f2))
 
-    # Lag window (conventional only — v1 returns 2M+1 directly).
+    # Lag window (conventional only -- v1 returns 2M+1 directly).
     lag_start = (npts_seg - 1) - npts_lag if mode == "conventional" else 0
     lag_end = (npts_seg - 1) + npts_lag + 1 if mode == "conventional" else 0
 
@@ -362,7 +467,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
 
     # nn.DataParallel only intercepts forward(). VS mode does not call forward,
     # so wrapping there is a silent no-op (only cuda:0 ever runs). Wrap only
-    # for auto_cc, which does call model(data, data) → forward.
+    # for auto_cc, which does call model(data, data) -> forward.
     if multi_gpu and auto_cc:
         forward_model: nn.Module = nn.DataParallel(xcorr).to(device)
         logger.info("Auto-CC + multi-GPU: nn.DataParallel across %d devices",
@@ -383,7 +488,8 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
         except Exception:
             pass
 
-    meta_path = out_dir / basename.replace(".npz", f"_cc_state_{mode}.json")
+    # meta_path = out_dir / basename.replace(".npz", f"_cc_state_{mode}.json")
+    meta_path = out_dir / f"{Path(basename).stem}_cc_state_{mode}.json"
     completed_src = load_resume_state(meta_path)
     last_out: Optional[Path] = None
 
@@ -405,7 +511,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
 
         nchunk = int(np.ceil(nch / npair_chunk))
         # On-device accumulator: avoids per-chunk PCIe round-trips on GPU.
-        # On CPU this is just a torch CPU tensor — no transfer involved.
+        # On CPU this is just a torch CPU tensor -- no transfer involved.
         ccall_dev = torch.zeros((nch, cc_out_len), dtype=torch.float32, device=device)
 
         t_cc_start = time.perf_counter()
@@ -426,9 +532,13 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
                     ccall_dev[start_idx:end_idx].add_(cc_sum_t)
 
         ccall_dev.div_(float(flag_mean))
+        if device.type == "cuda":
+            # CUDA kernels are async; sync so cc_time measures real GPU compute
+            # rather than just launch overhead (otherwise the wait lands in I/O).
+            torch.cuda.synchronize(device)
         cc_time += (time.perf_counter() - t_cc_start)
 
-        # Single device→host transfer for the whole file.
+        # Single device->host transfer for the whole file.
         t_io_start = time.perf_counter()
         ccall = ccall_dev.cpu().numpy()
         np.save(out_path, ccall)
@@ -457,12 +567,12 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             # ccall and copied each chunk via .cpu().numpy() inside the loop,
             # which on GPU forced a synchronous PCIe round-trip per chunk and
             # killed device utilization. Keeping ccall on `device` defers all
-            # device→host traffic to a single transfer at the end of this VS.
+            # device->host traffic to a single transfer at the end of this VS.
             ccall_dev = torch.zeros((npair, cc_out_len), dtype=torch.float32, device=device)
 
             # Source-side spectrum computed ONCE per VS. Shape:
-            #   conventional → (1, nseg, nfreq)
-            #   v1           → (1, nseg, nblocks, nfreq)
+            #   conventional -> (1, nseg, nfreq)
+            #   v1           -> (1, nseg, nblocks, nfreq)
             src_segs = data_tensor[src_idx:src_idx + 1, :].view(1, nseg, npts_seg)
             t_vs0 = time.perf_counter()
 
@@ -492,9 +602,13 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
                     del recv_segs, Y_recv, cc_sum_t
 
             ccall_dev.div_(float(flag_mean))
+            if device.type == "cuda":
+                # CUDA kernels are async; sync so cc_time measures real GPU
+                # compute, not launch overhead (else the wait lands in I/O).
+                torch.cuda.synchronize(device)
             cc_time += (time.perf_counter() - t_cc_start)
 
-            # Single device→host transfer per VS.
+            # Single device->host transfer per VS.
             t_io_start = time.perf_counter()
             ccall = ccall_dev.cpu().numpy()
             np.save(out_path, ccall)
@@ -516,11 +630,16 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
             save_resume_state(meta_path, completed_src)
             last_out = out_path
 
+    peak_vram_mb = (
+        torch.cuda.max_memory_allocated(device) / 1e6 if device.type == "cuda" else 0.0
+    )
     return {
         "out_path": str(last_out) if last_out else None,
         "io_sec": io_time,
         "cc_sec": cc_time,
         "total_time": time.perf_counter() - t_total_start,
+        "peak_vram_mb": float(peak_vram_mb),
+        "peak_rss_mb": float(_peak_rss_mb()),
     }
 
 def _process_unpack(args: tuple) -> Optional[Dict[str, Any]]:
@@ -560,7 +679,7 @@ def main(config_path: str | Path) -> None:
         threads_per_proc = max(1, ncores // njobs)
 
         fs_raw = float(get_cfg(cfg, ["data", "fs_raw"], required=True))
-        decimation = int(get_cfg(cfg, ["preprocess", "decimation"], 1))
+        decimation, _ = _get_ingest_cfg(cfg)
         fs_proc = fs_raw / decimation
 
         max_lag_sec = float(get_cfg(cfg, ["xcorr", "max_lag_sec"], 4.0))

@@ -16,11 +16,14 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib import rcParams
 from matplotlib.animation import FuncAnimation
+from matplotlib.ticker import MaxNLocator
+
+from scipy import signal
+from scipy.interpolate import griddata
 
 from pathlib import Path
 from tqdm.auto import tqdm
 from typing import Tuple, List, Literal, Callable, Any, Union, Optional
-from scipy import signal
 
 from src.utils import parse_ncf_stack_filename, fk_filter, fk_transform
 from src.ncf import get_vs_number, process_single_file, prep_ncf
@@ -121,14 +124,18 @@ def plot_das_traces(
     # 5. Plotting
     fig, ax = plt.subplots(figsize=figsize, layout="constrained")
 
+    # Get the total number of channels to calculate the top-down offset
+    num_channels = len(valid_channels)
+
     # Plot each trace iteratively, adding a vertical offset based on its order
     for idx, (chan_idx, trace) in enumerate(zip(valid_channels, trace_subset)):
         
         # Calculate physical distance for the label
         dist_km = (chan_idx * dx) / 1000.0
         
-        # Normalize the trace and apply the static vertical offset
-        offset_y = idx * spacing_factor
+        # REVERSED OFFSET: First channel gets the highest offset, plotting it at the top
+        offset_y = (num_channels - 1 - idx) * spacing_factor
+        
         normalized_trace = (trace / scale_norm) + offset_y
         
         ax.plot(
@@ -1862,8 +1869,221 @@ def animate_fv(
     plt.close(fig)
     return ani
 
+def animate_fv_pick(
+    fv_files: list[str],
+    picks_dir: str,
+    cmap: str = "viridis",
+    interval_ms: int = 400,
+) -> FuncAnimation:
+    """
+    Instantly animates pre-computed f-v panels and overlays saved picks if they exist.
+
+    :param fv_files: List of file paths to pre-computed frequency-velocity panels.
+    :type fv_files: list[str]
+    :param picks_dir: Directory path containing the pre-picked `.npy` files.
+    :type picks_dir: str
+    :param cmap: Matplotlib colormap to use. Default is "viridis".
+    :type cmap: str, optional
+    :param interval_ms: Delay between frames in milliseconds. Default is 400.
+    :type interval_ms: int, optional
+    :returns: The constructed animation object ready for rendering or display.
+    :rtype: FuncAnimation
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # 1. Initialize first frame 
+    # REMOVED .item() because fv_files are .npz
+    item0 = np.load(fv_files[0], allow_pickle=True)
+    f_axis0, v_axis0, fv0 = item0["f_axis"], item0["v_axis"], item0["fv"]
+    
+    # Move to CPU/NumPy if they are tensors
+    f_np = f_axis0.cpu().numpy() if hasattr(f_axis0, 'cpu') else np.asarray(f_axis0)
+    v_np = v_axis0.cpu().numpy() if hasattr(v_axis0, 'cpu') else np.asarray(v_axis0)
+    fv_np = fv0.cpu().numpy() if hasattr(fv0, 'cpu') else np.asarray(fv0)
+
+    # 2. Setup Plot Elements
+    mesh = ax.pcolormesh(f_np, v_np, fv_np, shading='gouraud', cmap=cmap, snap=True)
+    scat = ax.scatter([], [], color='red', s=30, edgecolors='white', linewidth=0.5, label="Saved Picks", zorder=10)
+    
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Phase velocity (m/s)")
+    ax.legend(loc='upper right')
+    plt.colorbar(mesh, ax=ax, label="Normalized Amplitude")
+
+    def update(frame_idx):
+        # Load FV Panel (REMOVED .item() here too)
+        fpath = fv_files[frame_idx]
+        fname_full = os.path.basename(fpath)
+        data = np.load(fpath, allow_pickle=True)
+        
+        fv_np_cur = data["fv"].cpu().numpy() if hasattr(data["fv"], 'cpu') else np.asarray(data["fv"])
+        mesh.set_array(fv_np_cur.ravel())
+        
+        # Check for matching Pick file (FIXED to replace _fv.npz)
+        pick_fname = fname_full.replace("_fv.npz", "_pick.npy")
+        pick_path = os.path.join(picks_dir, pick_fname)
+        
+        if os.path.exists(pick_path):
+            # KEPT .item() here because pick files are .npy dictionaries!
+            pick_data = np.load(pick_path, allow_pickle=True).item()
+            points = np.column_stack((pick_data['f'], pick_data['v']))
+            scat.set_offsets(points)
+            scat.set_visible(True)
+        else:
+            scat.set_visible(False)
+
+        # Title (FIXED to replace _fv.npz)
+        display_name = fname_full.replace("_fv.npz", "")
+        ax.set_title(f"Dispersion Viewer: {display_name}")
+        
+        return mesh, scat
+
+    ani = FuncAnimation(
+        fig, update, frames=len(fv_files), interval=interval_ms, blit=False
+    )
+    
+    plt.close(fig)
+    return ani
+
 # ===========================================================================
-# 4. Plot Comparison
+# 4. Plot Picks
+# ===========================================================================
+def plot_scatter_section(
+    x: np.ndarray | list, 
+    y: np.ndarray | list, 
+    z: np.ndarray | list, 
+    title: str = '2D Dispersion Pseudo-Section', 
+    cmap: str = 'turbo', 
+    y_max: float | None = None
+) -> None:
+    """
+    Plots a scatter pseudo-section of dispersion data.
+
+    :param x: Array of x-coordinates (e.g., Virtual Shot Distance).
+    :type x: array_like
+    :param y: Array of y-coordinates (e.g., Frequency).
+    :type y: array_like
+    :param z: Array of z-values used for colormapping (e.g., Phase Velocity).
+    :type z: array_like
+    :param title: Title of the plot. Default is '2D Dispersion Pseudo-Section'.
+    :type title: str, optional
+    :param cmap: Matplotlib colormap to use. Default is 'turbo'.
+    :type cmap: str, optional
+    :param y_max: Maximum value for the y-axis, used to lock limits. Default is None.
+    :type y_max: float | None, optional
+    :returns: None
+    """
+    plt.figure(figsize=(12, 6))
+    
+    sc = plt.scatter(
+        x, y, c=z, 
+        cmap=cmap, 
+        s=30, 
+        edgecolors='black', 
+        linewidth=0.2, 
+        alpha=0.9
+    )
+
+    # Formatting
+    plt.colorbar(sc, label='Phase Velocity (m/s)')
+    plt.xlabel('Virtual Shot Distance (m)')
+    plt.ylabel('Frequency (Hz)')
+    plt.title(title)
+
+    # Axis handling: set bounds and invert to mimic a depth section
+    if y_max is not None:
+        plt.ylim(np.min(y), y_max)
+    
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+
+def plot_interpolated_section(
+    x: np.ndarray | list, 
+    y: np.ndarray | list, 
+    z: np.ndarray | list, 
+    title: str = 'Interpolated 2D Dispersion Pseudo-Section', 
+    cmap: str = 'turbo', 
+    y_max: float | None = None, 
+    grid_res: int = 200,
+    cbar_ticks: int | None = 10
+) -> None:
+    """
+    Interpolates scattered dispersion data onto a regular grid and plots a filled contour map.
+
+    :param x: Array of x-coordinates (e.g., Virtual Shot Distance).
+    :type x: array_like
+    :param y: Array of y-coordinates (e.g., Frequency).
+    :type y: array_like
+    :param z: Array of z-values to interpolate (e.g., Phase Velocity).
+    :type z: array_like
+    :param title: Title of the plot. Default is 'Interpolated 2D Dispersion Pseudo-Section'.
+    :type title: str, optional
+    :param cmap: Matplotlib colormap to use. Default is 'turbo'.
+    :type cmap: str, optional
+    :param y_max: Maximum value for the y-axis. Default is None.
+    :type y_max: float | None, optional
+    :param grid_res: Resolution of the interpolation grid (NxN points). Default is 200.
+    :type grid_res: int, optional
+    :param cbar_ticks: Number of ticks for the colorbar. Set to None for auto-selection. Default is 10.
+    :type cbar_ticks: int | None, optional
+    :returns: None
+    """
+    x_np, y_np, z_np = np.array(x), np.array(y), np.array(z)
+
+    # 1. Define the regular grid
+    xi = np.linspace(x_np.min(), x_np.max(), grid_res)
+    yi = np.linspace(y_np.min(), y_np.max(), grid_res)
+    xi_mesh, yi_mesh = np.meshgrid(xi, yi)
+
+    # 2. Interpolate the data
+    zi_mesh = griddata(
+        points=(x_np, y_np), 
+        values=z_np, 
+        xi=(xi_mesh, yi_mesh), 
+        method='linear'
+    )
+
+    # 3. Plotting
+    plt.figure(figsize=(12, 6))
+    
+    contour = plt.contourf(
+        xi_mesh, yi_mesh, zi_mesh, 
+        levels=50, 
+        cmap=cmap, 
+        extend='both'
+    )
+
+    # Overlay constraints
+    plt.scatter(
+        x_np, y_np, 
+        c='black', 
+        s=5, 
+        alpha=0.4, 
+        label='Data Constraints'
+    )
+
+    # Formatting - Revise colorbar to have configurable ticks
+    cbar = plt.colorbar(contour, label='Phase Velocity (m/s)')
+    if cbar_ticks is not None:
+        cbar.locator = MaxNLocator(nbins=cbar_ticks)
+        cbar.update_ticks()
+
+    plt.xlabel('Virtual Shot Distance (m)')
+    plt.ylabel('Frequency (Hz)')
+    plt.title(title)
+
+    # Axis handling
+    if y_max is not None:
+        plt.ylim(y_np.min(), y_max)
+
+    plt.legend(loc='upper right')
+    plt.grid(True, linestyle=':', alpha=0.3, color='white')
+    plt.tight_layout()
+    plt.show()
+
+# ===========================================================================
+# 5. Plot Comparison
 # ===========================================================================
 def animate_ncf_comparison(
     files_A: List[str],

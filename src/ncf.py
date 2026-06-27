@@ -11,17 +11,26 @@ from __future__ import annotations
 
 import re
 import os
-import sys
 import glob
 from typing import List, Literal
 
 import numpy as np
-import dask
 from tqdm.auto import tqdm
 from scipy.signal.windows import tukey
 
-sys.path.append('..')
 from src.utils import parse_ncf_stack_filename, fk_filter, fk_transform
+
+# Dask is optional: it only parallelizes the batch pipelines. Without it the
+# @dask.delayed functions run eagerly (the decorator becomes a no-op), so the
+# module stays importable in minimal environments (e.g. the test suite).
+try:
+    import dask
+except ImportError:  # pragma: no cover - depends on optional extra
+    class _DaskFallback:
+        @staticmethod
+        def delayed(func):
+            return func
+    dask = _DaskFallback()
 
 # =============================================================================
 # 1. Spatial-Temporal Swap

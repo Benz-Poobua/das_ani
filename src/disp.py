@@ -4,19 +4,33 @@
 :email: spoobua (at) stanford.edu
 :org: Stanford University
 :license: MIT
-:purpose: Dispersion imaging (f–v transform) and dispersion curve picking
-          for DAS ambient noise interferometry.
+:purpose: Dispersion imaging (f–v transform), dispersion curve picking,
+          dispersion-based dv/v + depth mapping, and a config-driven
+          time-lapse dispersion wrapper for DAS ambient noise interferometry.
 """
 from __future__ import annotations
 
-import logging 
+import logging
 import os
+import re
+from datetime import datetime
+from pathlib import Path
+
 import torch
 import numpy as np
 from scipy.interpolate import interp1d
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from tqdm import tqdm
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from src.utils import convert_to_tensor, convert_to_numpy, nextpow2, timeit, parse_ncf_stack_filename, fk_filter
+from src.utils import (
+    convert_to_tensor,
+    convert_to_numpy,
+    get_cfg,
+    nextpow2,
+    timeit,
+    parse_ncf_stack_filename,
+    fk_filter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -612,10 +626,277 @@ def export_inversion_inputs(
         # Save to a space- or tab-delimited text file
         # fmt='%.3f' keeps the numbers clean (3 decimal places)
         np.savetxt(
-            filepath, 
-            out_data, 
-            fmt='%.3f', 
-            delimiter='\t', 
-            header='Frequency(Hz)\tPhaseVelocity(m/s)', 
+            filepath,
+            out_data,
+            fmt='%.3f',
+            delimiter='\t',
+            header='Frequency(Hz)\tPhaseVelocity(m/s)',
             comments='# '
         )
+
+# =====================================================
+# 7. Dispersion-based dv/v + depth mapping
+# =====================================================
+def compute_dvv_from_dispersion(
+    ref_freq: np.ndarray,
+    ref_vel: np.ndarray,
+    cur_freq: np.ndarray,
+    cur_vel: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Calculates the fractional velocity change (dv/v) between two dispersion curves.
+    Interpolates the current curve onto the reference frequency axis for safe subtraction.
+
+    :param ref_freq: Frequencies of the reference dispersion curve (Hz).
+    :param ref_vel: Phase velocities of the reference curve (m/s).
+    :param cur_freq: Frequencies of the current dispersion curve (Hz).
+    :param cur_vel: Phase velocities of the current curve (m/s).
+    :return: (common_freqs, dvv_array) where dvv_array is (v_cur - v_ref) / v_ref.
+    """
+    ref_freq = np.asarray(ref_freq, dtype=np.float64)
+    ref_vel = np.asarray(ref_vel, dtype=np.float64)
+
+    # Create an interpolator for the current curve.
+    # bounds_error=False and fill_value=np.nan ensure we don't extrapolate garbage
+    # if the current curve picked fewer frequencies than the reference curve.
+    cur_interp_func = interp1d(
+        np.asarray(cur_freq, dtype=np.float64),
+        np.asarray(cur_vel, dtype=np.float64),
+        kind='linear',
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+
+    # Interpolate current velocities exactly at the reference frequencies
+    cur_vel_interp = cur_interp_func(ref_freq)
+
+    # Calculate dv/v (guard dead reference picks against division by zero)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dvv = (cur_vel_interp - ref_vel) / ref_vel
+    dvv[~np.isfinite(dvv)] = np.nan
+
+    # Mask out NaN values where interpolation fell out of bounds
+    valid_mask = ~np.isnan(dvv)
+
+    return ref_freq[valid_mask], dvv[valid_mask]
+
+
+def approximate_depth_profile(
+    freqs: np.ndarray,
+    velocities: np.ndarray,
+    factor: float = 0.333,
+) -> np.ndarray:
+    """
+    Approximates the penetration depth of surface waves based on frequency and velocity.
+    Standard Seismological Rule of Thumb: Depth ~ Wavelength / 3.
+
+    :param freqs: Array of frequencies (Hz).
+    :param velocities: Array of phase velocities (m/s).
+    :param factor: The depth-to-wavelength scaling factor (0.333 for Scholte/Rayleigh).
+    :return: Array of approximate depths (meters).
+    """
+    freqs = np.asarray(freqs, dtype=np.float64)
+    velocities = np.asarray(velocities, dtype=np.float64)
+
+    # Prevent division by zero if freq=0 is accidentally passed
+    safe_freqs = np.where(freqs == 0, 1e-9, freqs)
+
+    # Wavelength = Velocity / Frequency
+    wavelengths = velocities / safe_freqs
+
+    # Z = Wavelength * Factor
+    return wavelengths * float(factor)
+
+
+# =====================================================
+# 8. Time-lapse dispersion wrapper
+# =====================================================
+_DISP_FILE_RE = re.compile(r"(\d{8})(?:_(\d{6}))?")
+
+
+def _extract_datetime(filename: str) -> datetime:
+    """Parse the leading YYYYMMDD[_HHMMSS] timestamp of a stack filename."""
+    m = _DISP_FILE_RE.search(filename)
+    if not m:
+        raise ValueError(f"Could not parse datetime from filename: {filename}")
+    date_str = m.group(1)
+    time_str = m.group(2) if m.group(2) else "000000"
+    return datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+
+
+def _pick_dispersion_curve(
+    ncf: np.ndarray, cfg: Mapping[str, Any]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Fold a two-sided VSG and run the phase-shift imaging + AutoSearch picker
+    (:func:`compute_dispersion_from_ncf`) with parameters from the
+    ``dispersion:`` config block.
+
+    Offset model: rows of the (sliced) VSG are assumed to start at the
+    virtual source and increase monotonically away from it with spacing
+    ``data.dx`` -- i.e. either export one-sided gathers beforehand (see
+    ``src.ncf.export_targeted_ncfs``) or set ``dispersion.vs_row`` to the
+    VSG row index of the virtual source so rows above it are dropped.
+
+    :return: (f_axis, phase_velocity) as 1-D numpy arrays.
+    """
+    fs_raw = float(get_cfg(cfg, ["data", "fs_raw"], required=True))
+    decimation = float(get_cfg(cfg, ["ingest", "decimation"], 1))
+    fs = fs_raw / max(decimation, 1.0)
+    dx = float(get_cfg(cfg, ["data", "dx"], 8.16))
+
+    vs_row = int(get_cfg(cfg, ["dispersion", "vs_row"], 0))
+    ncf = np.asarray(ncf)
+    if not (0 <= vs_row < ncf.shape[0] - 2):
+        raise ValueError(f"dispersion.vs_row={vs_row} out of range for VSG with {ncf.shape[0]} rows.")
+    ncf = ncf[vs_row:, :]
+
+    # Fold the symmetric two-sided lag axis (average causal + acausal).
+    npts = ncf.shape[1]
+    mid = npts // 2
+    folded = (np.fliplr(ncf[:, :mid + 1]) + ncf[:, mid:]) / 2.0
+
+    fv_kwargs = dict(
+        vmin=float(get_cfg(cfg, ["dispersion", "vmin"], 100.0)),
+        vmax=float(get_cfg(cfg, ["dispersion", "vmax"], 1500.0)),
+        dv=float(get_cfg(cfg, ["dispersion", "dv"], 5.0)),
+        fmin=float(get_cfg(cfg, ["dispersion", "fmin"], 1.0)),
+        fmax=float(get_cfg(cfg, ["dispersion", "fmax"], 10.0)),
+    )
+    pick_kwargs = dict(step=int(get_cfg(cfg, ["dispersion", "pick_step"], 5)))
+
+    _, f_axis, _, picks = compute_dispersion_from_ncf(
+        folded, fs=fs, dx=dx, fv_kwargs=fv_kwargs, pick_kwargs=pick_kwargs,
+    )
+    return convert_to_numpy(f_axis).astype(np.float64), np.asarray(picks, dtype=np.float64)
+
+
+@timeit
+def run_timelapse_dispersion(cfg: Mapping[str, Any]) -> Optional[Path]:
+    """
+    Chronologically tracks dispersion-curve changes and maps them to depth.
+    Produces a 2D matrix of dv/v over (time, depth) -- e.g. for monitoring a
+    freezing front or seasonal velocity changes.
+
+    Workflow per time step (stacked VSG file):
+        1. Pick the dispersion curve via :func:`_pick_dispersion_curve`
+           (phase-shift f-v panel + AutoSearch ridge tracking).
+        2. dv/v against the reference (first) curve via
+           :func:`compute_dvv_from_dispersion`.
+        3. Map frequencies to depth with :func:`approximate_depth_profile`,
+           using the REFERENCE velocities so the depth frame stays stable.
+        4. Interpolate the scattered (depth, dv/v) points onto a fixed
+           ``z_grid`` for the heatmap.
+
+    Config keys (``dispersion:`` block unless noted):
+        stacking.stacks_root (req) : root of the stacked NCFs
+        stack_target               : which stack window to track (default "1d")
+        vmin/vmax/dv/fmin/fmax     : f-v panel parameters
+        pick_step                  : AutoSearch vertical step (default 5)
+        vs_row                     : VSG row of the virtual source (default 0)
+        max_depth_m / depth_step_m : depth grid (default 50.0 / 0.5)
+        depth_factor               : depth ~ factor * wavelength (default 0.333)
+        paths.disp_timelapse_root  : output dir (default ./data/disp_timelapse)
+
+    Output ``.npz`` keys: ``dvv_heatmap`` (n_times, nz), ``z_grid`` (nz,),
+    ``timestamps`` (n_times, POSIX seconds), ``files`` (n_times, str).
+
+    :return: Path of the written .npz, or None if no inputs were found.
+    """
+    # 1. Configuration & paths. stacks_root canonically lives under
+    # `stacking:`; accept legacy `paths.stacks_root` as fallback.
+    stacks_root = get_cfg(cfg, ["stacking", "stacks_root"],
+                          get_cfg(cfg, ["paths", "stacks_root"], None))
+    if stacks_root is None:
+        raise KeyError("Missing config key: stacking.stacks_root")
+    data_root = Path(str(stacks_root)).expanduser()
+    out_root = Path(str(get_cfg(cfg, ["paths", "disp_timelapse_root"],
+                                "./data/disp_timelapse"))).expanduser()
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    stack_target = str(get_cfg(cfg, ["dispersion", "stack_target"],
+                               get_cfg(cfg, ["dvv", "stack_target"], "1d")))
+    search_dir = data_root / stack_target
+
+    if not search_dir.exists():
+        logger.error("Directory not found: %s", search_dir)
+        return None
+
+    # 2. Gather chronological files (cross-correlation stacks only).
+    all_files = sorted(search_dir.rglob("*_cc_*.npy"),
+                       key=lambda x: _extract_datetime(x.name))
+    if not all_files:
+        logger.error("No _cc_ files found in %s", search_dir)
+        return None
+
+    n_steps = len(all_files)
+    logger.info("Found %d CC stacks for time-lapse dispersion.", n_steps)
+
+    # 3. Fixed depth grid for the heatmap.
+    max_depth = float(get_cfg(cfg, ["dispersion", "max_depth_m"], 50.0))
+    dz = float(get_cfg(cfg, ["dispersion", "depth_step_m"], 0.5))
+    depth_factor = float(get_cfg(cfg, ["dispersion", "depth_factor"], 0.333))
+    z_grid = np.arange(0.0, max_depth + dz, dz)
+
+    dvv_depth_heatmap = np.full((n_steps, len(z_grid)), np.nan, dtype=np.float32)
+    timestamps = [_extract_datetime(p.name).timestamp() for p in all_files]
+
+    # 4. Reference curve (first time step).
+    logger.info("Extracting reference dispersion curve from %s", all_files[0].name)
+    ref_freq, ref_vel = _pick_dispersion_curve(np.load(all_files[0]), cfg)
+    ref_interp = interp1d(ref_freq, ref_vel, kind="linear",
+                          bounds_error=False, fill_value=np.nan)
+
+    # Row 0 is the reference vs itself: dv/v = 0 across its depth coverage.
+    ref_depths = approximate_depth_profile(ref_freq, ref_vel, factor=depth_factor)
+    order0 = np.argsort(ref_depths)
+    dvv_depth_heatmap[0, :] = interp1d(
+        ref_depths[order0], np.zeros_like(ref_depths[order0]),
+        kind="linear", bounds_error=False, fill_value=np.nan,
+    )(z_grid)
+
+    # 5. Time-lapse loop.
+    for t in tqdm(range(1, n_steps), desc="Time-lapse dispersion"):
+        f_path = all_files[t]
+        try:
+            # A. Pick the current curve.
+            cur_freq, cur_vel = _pick_dispersion_curve(np.load(f_path), cfg)
+
+            # B. Strictly matched dv/v on the reference frequency axis.
+            valid_freqs, valid_dvv = compute_dvv_from_dispersion(
+                ref_freq, ref_vel, cur_freq, cur_vel,
+            )
+            if valid_freqs.size < 2:
+                logger.warning("Too few overlapping picks for %s; skipping.", f_path.name)
+                continue
+
+            # C. Map frequencies to depth using the REFERENCE velocities so
+            # the physical depth frame stays stable over time.
+            stable_vels = ref_interp(valid_freqs)
+            dynamic_depths = approximate_depth_profile(
+                valid_freqs, stable_vels, factor=depth_factor,
+            )
+
+            # D. Interpolate scattered (depth, dv/v) onto the rigid z_grid.
+            order = np.argsort(dynamic_depths)
+            depth_interp = interp1d(
+                dynamic_depths[order], valid_dvv[order],
+                kind="linear", bounds_error=False, fill_value=np.nan,
+            )
+            dvv_depth_heatmap[t, :] = depth_interp(z_grid)
+
+        except Exception as e:
+            logger.warning("Failed to pick/track curve for %s: %s", f_path.name, e)
+
+    # 6. Save the 2D matrix.
+    time_str = datetime.now().strftime("%Y%m%d_%H%M")
+    out_file = out_root / f"disp_timelapse_{stack_target}_{time_str}.npz"
+    np.savez(
+        out_file,
+        dvv_heatmap=dvv_depth_heatmap,            # (time, depth)
+        z_grid=z_grid,
+        timestamps=np.asarray(timestamps),
+        files=np.array([p.name for p in all_files]),
+    )
+    logger.info("Time-lapse depth matrix saved to %s", out_file)
+    return out_file

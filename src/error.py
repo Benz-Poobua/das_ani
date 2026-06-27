@@ -13,8 +13,15 @@ import numpy as np
 
 from dataclasses import dataclass
 from pathlib import Path
-from skimage.metrics import structural_similarity as ssim
 from typing import Any, Optional, Tuple, Union, Dict
+
+# scikit-image is only needed by ssim_index(); import lazily so the cheap
+# fidelity metrics (rel_frobenius, max_abs_error, ...) used by src.eval and
+# the test suite do not require the `viz` extra to be installed.
+try:
+    from skimage.metrics import structural_similarity as ssim
+except ImportError:  # pragma: no cover - depends on optional extra
+    ssim = None
 
 ArrayLike = np.ndarray
 PathLike = Union[str, Path]
@@ -283,6 +290,11 @@ def ssim_index(
     :return: SSIM value (clipped to [-1, 1]).
     :rtype: float
     """
+    if ssim is None:
+        raise ImportError(
+            "ssim_index requires scikit-image. Install the viz extra: "
+            "pip install 'das-ani[viz]' (or pip install scikit-image)."
+        )
     if D_ref.shape != D_test.shape:
         raise ValueError(f"ssim_index: shape mismatch ref{D_ref.shape} vs test{D_test.shape}")
 
