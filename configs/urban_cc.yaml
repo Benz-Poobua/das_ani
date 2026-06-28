@@ -1,14 +1,19 @@
 # =============================================================================
-# Configuration: Urban DAS Ambient Noise Interferometry
+# Configuration: Urban DAS Ambient Noise Interferometry  (CPU)
 # Target: Rayleigh waves (1.0 - 10.0 Hz) in urban sediments
 # =============================================================================
+#
+# Pipeline (CPU, preprocess.mode = pure_numpy):
+#   ingest  -> decimate_raw / differentiate_cpu        (once per file)
+#   preprocess -> detrend + bandpass + median + RAM    (per window, NumPy/SciPy)
+#   whiten + cross-correlation                         (torch, CPU)
 
 paths:
   data_root: ./data/raw_urban #_zarr
   output_root: ./data/ncf_raw_urban #_zarr
 
 runtime:
-  njobs: 4
+  njobs: 8
   use_gpu: false
   mmap: true
   frac_mem: 0.25
@@ -25,21 +30,41 @@ data:
   src_stride: 10         # every 10th channel
   min_length_sec: 60.0
 
-preprocess:
+# -----------------------------------------------------------------------------
+# Ingest stage: applied ONCE to the raw buffer, before per-window preprocessing.
+# Both keys live here (not under preprocess) to match src/ani.py Option A:
+#   - decimation: anti-aliased downsampling via decimate_raw()
+#   - diff:       strain -> strain-rate via differentiate_cpu() (np.gradient)
+# -----------------------------------------------------------------------------
+ingest:
   decimation: 1
+  diff: false
+
+preprocess:
+  # Per-window stage: detrend + bandpass + median + temporal normalization.
+  #
+  # mode selects the backend (same stage order in all three):
+  #   pure_numpy : all-CPU scipy/numpy. Legacy, bit-exact benchmark.
+  #   hybrid     : scipy detrend+bandpass (canonical sosfiltfilt) -> torch
+  #                median + temporal norm. Numerical-fidelity choice when a
+  #                torch device is in play; identical to pure_numpy within
+  #                float32 round-off.
+  #   pure_torch : all stages in torch, incl. the rFFT-domain |H(f)|^2
+  #                bandpass. GPU-tailored; approximates sosfiltfilt.
+  # If omitted: use_gpu=false -> pure_numpy, use_gpu=true -> hybrid.
+  mode: pure_numpy
   f1: 1.0
   f2: 10.0
-  diff: false
   ram_win_sec: 0.0
 
 xcorr:
   # method switch
   mode: v1 # conventional or v1
-  auto_cc: true      # set to true for Coda Wave Interferometry (ACF)
+  auto_cc: false      # set to true for Coda Wave Interferometry (ACF)
 
 
   # whitening
-  is_spectral_whitening: true 
+  is_spectral_whitening: false
   window_freq_hz: 0.0
 
   # lags of interest
@@ -61,8 +86,8 @@ perf:
 
 stacking:
   enabled: true
-  raw_root: ./data/ncf_raw
-  stacks_root: ./data/ncf_stacks
+  raw_root: ./data/ncf_raw_urban 
+  stacks_root: ./data/ncf_stacks_urban
   overwrite: false
 
   base_stack: 1d # fundamental unit; or 1h

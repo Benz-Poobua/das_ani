@@ -1,0 +1,106 @@
+# =============================================================================
+# Configuration: Urban DAS Ambient Noise Interferometry  (GPU)
+# Target: Rayleigh waves (1.0 - 10.0 Hz) in urban sediments
+# =============================================================================
+#
+# Pipeline (GPU, preprocess.mode = hybrid -- Option A):
+#   ingest      -> decimate_raw / differentiate_cpu              (CPU, once per file)
+#   preprocess  -> CPU detrend + bandpass  ->  H2D transfer
+#                  GPU median + temporal normalization           (per window)
+#   whiten + cross-correlation                                   (torch, CUDA)
+#
+# Set preprocess.mode: pure_torch to also run detrend + bandpass on the GPU
+# (rFFT-domain |H(f)|^2 bandpass). Fastest end-to-end, at the cost of an
+# approximation to scipy's sosfiltfilt -- quantify it for your band with:
+#   python3 -m src.eval --cc_config configs/urban_cc_gpu.yaml \
+#       --skip_scaling --skip_complexity
+#
+# Differences vs. urban_cc.yaml (CPU): same as bridge_cc_gpu.yaml -- see
+# that file's header for the GPU-tuning rationale.
+#
+# Note for Urban specifically:
+#   nseg can reach 60 for hour-long files, which makes v1's working-set
+#   (B x nseg x nblocks x Lfft) the largest of the three configs. On a
+#   single 16 GB GPU, expect npair_chunk to be limited by memory rather
+#   than by max_chunk; auto_np_pair_chunk's v1-aware budget will produce
+#   roughly 50-100 channels per chunk per VS at nseg=60. If you have a
+#   24 GB+ GPU, frac_mem can safely be raised to 0.6 for fewer chunks.
+
+paths:
+  data_root: ./data/raw_urban
+  output_root: ./data/ncf_raw_urban
+
+runtime:
+  njobs: 1
+  use_gpu: true
+  mmap: true
+  frac_mem: 0.5
+  min_chunk: 64
+  max_chunk: 8192
+  torch_compile: false
+  compile_mode: reduce-overhead
+
+data:
+  fs_raw: 250.0
+  first_chan: 399
+  last_chan: 748
+  dx: 8.16
+  src_stride: 10
+  min_length_sec: 60.0
+
+# -----------------------------------------------------------------------------
+# Ingest stage: applied ONCE to the raw buffer on CPU, before per-window
+# preprocessing. These were moved out of `preprocess:` to match src/ani.py
+# Option A; see urban_cc.yaml for the same notes.
+# -----------------------------------------------------------------------------
+ingest:
+  decimation: 1
+  diff: false
+
+preprocess:
+  # Per-window stage. Backend options (see urban_cc.yaml for the full table):
+  #   hybrid     : detrend + bandpass on CPU (scipy.sosfiltfilt; mathematically
+  #                canonical), single H2D transfer, then GPU median removal +
+  #                temporal normalization. Recommended default for fidelity.
+  #   pure_torch : everything on the GPU, incl. the rFFT-domain bandpass.
+  #                Fastest; small controlled deviation from sosfiltfilt.
+  #   pure_numpy : all-CPU benchmark (the GPU then only sees whiten + CC).
+  mode: hybrid
+  f1: 1.0
+  f2: 10.0
+  ram_win_sec: 0.0
+  whiten_chunk_nch: 4096
+
+xcorr:
+  mode: v1
+  auto_cc: false
+
+  is_spectral_whitening: false
+  window_freq_hz: 0.0
+
+  max_lag_sec: 2.0
+
+  xcorr_seg_sec: 60.0
+  xcorr_seg_sec_v1: 60.0
+
+  v1_fft_snap_pow2: true
+  v1_fallback: v1_2M
+
+perf:
+  enabled: true
+  out_path: ./data/runlogs/perf_cc_gpu.csv
+  log_every_vs: true
+  log_every_chunk: false
+
+stacking:
+  enabled: true
+  raw_root: ./data/ncf_raw_gpu_urban
+  stacks_root: ./data/ncf_stacks_gpu_urban
+  overwrite: false
+
+  base_stack: 1d
+
+  windows:
+    7d: true
+    15d: true
+    30d: true

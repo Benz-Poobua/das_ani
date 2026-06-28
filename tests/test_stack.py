@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from src.stack import (
+    _floor_to_base,
     _streaming_mean,
     _time_fmt_for,
     base_stack_ncf,
@@ -80,13 +81,30 @@ def test_streaming_mean_empty():
 # ---------------------------------------------------------------------------
 # Base stacking (integration on a tmp tree)
 # ---------------------------------------------------------------------------
-def test_base_stack_ncf_groups_by_date_vs_method(tmp_path, rng):
+@pytest.mark.parametrize("ts,label,expected", [
+    # All intraday timestamps of a day floor to local midnight for "1d".
+    (datetime(2021, 9, 1, 0, 0, 0), "1d", datetime(2021, 9, 1)),
+    (datetime(2021, 9, 1, 5, 50, 0), "1d", datetime(2021, 9, 1)),
+    (datetime(2021, 9, 1, 23, 59, 59), "1d", datetime(2021, 9, 1)),
+    # "1h" floors to the top of the hour.
+    (datetime(2021, 9, 1, 3, 40, 0), "1h", datetime(2021, 9, 1, 3)),
+    # Multi-step bins are measured from the epoch.
+    (datetime(2021, 9, 2, 12, 0, 0), "2d", datetime(2021, 9, 2)),
+])
+def test_floor_to_base(ts, label, expected):
+    assert _floor_to_base(ts, label) == expected
+
+
+def test_base_stack_ncf_averages_all_intraday_windows(tmp_path, rng):
+    """A '1d' base stack must average ALL intraday windows of a day into one
+    daily NCF (regression test for the timestamp-grouping bug that kept only a
+    single window per day)."""
     raw = tmp_path / "raw"
     out = tmp_path / "stacks"
     raw.mkdir()
 
-    # Two hourly slices of the same (day, vs, method) -> one 1d output;
-    # a second VS -> its own output.
+    # Two intraday slices of the same (day, vs, method) must average into ONE
+    # 1d base; a second VS gets its own 1d base.
     a = rng.standard_normal((3, 9)).astype(np.float32)
     b = rng.standard_normal((3, 9)).astype(np.float32)
     np.save(raw / "20250722_010000_urban_cc_000_v1.npy", a)
@@ -96,10 +114,21 @@ def test_base_stack_ncf_groups_by_date_vs_method(tmp_path, rng):
     base_stack_ncf(raw, out, "1d", overwrite=True, njobs=1)
 
     produced = sorted(p.name for p in Path(out).glob("*.npy"))
-    # Hourly files carry distinct datetimes, so each (datetime, vs) is its
-    # own group; the 1d label formats the name by date+time.
-    assert any("cc_000" in n for n in produced)
-    assert any("cc_004" in n for n in produced)
+    # Exactly one daily base per (day, vs), named by date only.
+    assert produced == [
+        "20250722_cc_000_1d_v1.npy",
+        "20250722_cc_004_1d_v1.npy",
+    ]
+
+    # The cc_000 daily base is the mean of its two intraday windows -- the
+    # behaviour that was broken before the fix.
+    cc000 = np.load(Path(out) / "20250722_cc_000_1d_v1.npy")
+    np.testing.assert_allclose(cc000, (a + b) / 2.0, atol=1e-6)
+
+    # cc_004 has a single window, so its base equals that window.
+    cc004 = np.load(Path(out) / "20250722_cc_004_1d_v1.npy")
+    np.testing.assert_allclose(cc004, a * 2.0, atol=1e-6)
+
     for p in Path(out).glob("*.npy"):
         arr = np.load(p)
         assert arr.shape == (3, 9)

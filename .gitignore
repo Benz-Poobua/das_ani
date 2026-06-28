@@ -1,40 +1,59 @@
-# Python cache / build files
+# ==========================================
+# Python cache / build / packaging
+# ==========================================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.egg-info/
 .build/
+build/
+dist/
+*.egg
 
+# ==========================================
 # Jupyter Notebook
+# ==========================================
 .ipynb_checkpoints/
+notebooks/data/
 
+# ==========================================
 # macOS system files
+# ==========================================
 .DS_Store
 
-# Images
-*.png
-!fig/*.png
+# ==========================================
+# Data / Outputs (Folder-level scoping)
+# ==========================================
+data/
+results/
+logs/
+runlogs/
 
-# Data files
-*.csv
+# ==========================================
+# Global Data Filetypes (Binaries / Media)
+# ==========================================
 *.npy
 *.npz
 *.h5
-*.json
+*.hdf5
+*.zarr/
+*.tar
+*.mp4
 
-# Ignore everything inside these folders
-geometry/*
-data/*
-results/*
+# ==========================================
+# IDE / Testing / Secrets
+# ==========================================
+.vscode/
+.idea/
+.pytest_cache/
+.coverage
+htmlcov/
+.env
 
-# But keep the placeholder file so the folder exists in Git
-!geometry/.gitkeep
-!data/preprocessed/.gitkeep
-!data/ncf/.gitkeep
-!data/synthetic/.gitkeep
-
-# Virtual environments / local installs (CRITICAL)
+# ==========================================
+# Virtual environments / local installs  
+# ==========================================
 .venv/
 venv/
 env/
@@ -42,8 +61,11 @@ ENV/
 
 # If we accidentally created a venv inside the repo root (common on mac)
 bin/
+etc/
+include/
 lib/
 Lib/
+share/
 Scripts/
 pyvenv.cfg
 
@@ -57,14 +79,3 @@ das_ani/pyvenv.cfg
 # More accidental venv folders inside package
 das_ani/share/
 das_ani/include/
-# big artifacts
-notebooks/data/
-.ipynb_checkpoints/
-*.npy
-*.npz
-*.pt
-*.tar
-pages/ncf.html
-notebooks/ncf_urban_tutorial.ipynb
-notebooks/ncf_urban_tutorial.ipynb
-notebooks/look_offshore.ipynb

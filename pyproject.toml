@@ -26,9 +26,12 @@ dependencies = [
   "zarr>=2.14",
   "numcodecs>=0.11",
 
+  # used by src.eval and src.dvv
+  "pandas>=2.0",
+
   # torch is platform-specific (CPU/CUDA/MPS)
   "torch>=2.1",
-  
+
   # ---- Surface-wave modelling & inversion ----
   "disba>=0.6",
   "evodcinv"
@@ -48,13 +51,17 @@ dev = [
   "types-PyYAML>=6.0.12.20240917",
 ]
 
-# Visualization & reporting (used by eval_modes + SSIM)
+# Visualization & reporting (SSIM in src.error, plots)
 viz = [
   "matplotlib>=3.7",
-  "pandas>=2.0",
   "seaborn>=0.13",
   "scikit-image>=0.22",
   "plotly>=5.18",
+]
+
+# Post-processing pipelines (dask-parallel NCF batch jobs in src.ncf)
+postprocess = [
+  "dask>=2024.1",
 ]
 
 # Jupyter / interactive work
@@ -71,14 +78,13 @@ experimental = [
 # -----------------------
 # setuptools configuration
 # -----------------------
+# The code is imported as `src.cc`, `src.ani`, ... (a flat `src` package).
+# Declaring packages = ["src"] makes `pip install -e .` provide exactly that
+# import path. (The previous package-dir = {""="src"} mapping exposed the
+# modules as top-level `cc`, `ani`, ... which broke `python -m src.cc` in
+# installed environments.)
 [tool.setuptools]
-# If your code is directly inside 'src', this map is correct.
-# Often structure is src/das_ani/... but if you import src.cc, 
-# then mapping ""="src" makes "src" the root package.
-package-dir = { "" = "src" }
-
-[tool.setuptools.packages.find]
-where = ["src"]
+packages = ["src"]
 
 # -----------------------
 # Ruff (linting)

@@ -125,6 +125,45 @@ def _time_fmt_for(label: str) -> str:
     return "%Y%m%d_%H%M%S" if m.group(2) == "h" else "%Y%m%d"
 
 
+def _floor_to_base(dt_obj: datetime, base_label: str) -> datetime:
+    """
+    Bin a raw-file timestamp into the interval that its base stack represents.
+
+    A base stack labelled ``"1d"`` must average *all* intraday windows of a
+    calendar day (e.g. 36 ten-minute files spanning 00:00-05:50) into one daily
+    NCF, so every raw timestamp on that day has to collapse to the same grouping
+    key (local midnight). Likewise ``"1h"`` collapses every timestamp inside an
+    hour to the top of that hour, and ``"Nd"`` / ``"Nh"`` bin into N-day / N-hour
+    intervals measured from the Unix epoch.
+
+    Grouping on the *raw* timestamp instead (the previous behaviour) made every
+    window its own one-file "daily" stack, so intraday averaging never happened
+    and each rolling window stacked one window per day instead of the whole day.
+
+    :param dt_obj: Raw-file timestamp returned by :func:`parse_date_vs`.
+    :param base_label: Base-stack label, e.g. ``"1d"``, ``"1h"``, ``"2d"``.
+    :return: The floored datetime to use as the grouping key. If ``base_label``
+             is not a ``(\\d+)([hd])`` token, ``dt_obj`` is returned unchanged.
+    """
+    m = _WINDOW_RE.fullmatch(base_label.strip().lower())
+    if m is None:
+        return dt_obj
+    val, unit = int(m.group(1)), m.group(2)
+    epoch = datetime(1970, 1, 1)
+    if unit == "d":
+        day0 = dt_obj.replace(hour=0, minute=0, second=0, microsecond=0)
+        if val == 1:
+            return day0
+        nbin = (day0 - epoch).days // val
+        return epoch + timedelta(days=nbin * val)
+    # unit == "h"
+    hour0 = dt_obj.replace(minute=0, second=0, microsecond=0)
+    if val == 1:
+        return hour0
+    nbin = int((hour0 - epoch).total_seconds() // 3600) // val
+    return epoch + timedelta(hours=nbin * val)
+
+
 def _output_valid(path: Path, overwrite: bool) -> bool:
     """
     Return True if the output already exists, is loadable, and we shouldn't
@@ -334,11 +373,15 @@ def base_stack_ncf(
     all_files = sorted(raw_root.rglob("*.npy"))
     logger.info("Found %d raw NCF slices under %s", len(all_files), raw_root)
 
+    # Group by (base-stack bin, vs, method). The timestamp is floored to the
+    # base interval (e.g. calendar day for "1d") so ALL intraday windows of a
+    # day land in the same group and get averaged into one daily base stack.
     groups: Dict[Tuple[datetime, int, Optional[str]], List[Path]] = {}
     for p in all_files:
         try:
             dt_obj, vs, method = parse_date_vs_method(p)
-            groups.setdefault((dt_obj, vs, method), []).append(p)
+            bin_dt = _floor_to_base(dt_obj, base_label)
+            groups.setdefault((bin_dt, vs, method), []).append(p)
         except Exception as e:
             logger.warning("Skipping %s: %s", p, e)
 
