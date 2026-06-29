@@ -431,7 +431,7 @@ If you use this codebase in your research, please cite the algorithm reference
 the application/benchmark report
 
 > Poobua, S., Li, H., & Biondi, B. L. *Minimum-Effort DAS
-> Cross-Correlation.* Stanford Exploration Project report **SEP-199**.
+> Cross-Correlation:* SEP Report 199, Stanford University.
 
 and acknowledge this repository.
 

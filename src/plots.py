@@ -1067,6 +1067,126 @@ def animate_das_dashboard(
 # ===========================================================================
 # 2. Plot NCF
 # ===========================================================================
+def plot_ncf(
+    pattern: str,
+    VS: Union[str, int],
+    *,
+    lag_axis: np.ndarray,
+    distance_axis: np.ndarray,
+    mode: str = "causal",
+    unit: str = "m",
+    clip: float | None = 0.05,
+    pclip: float | None = None,
+    cmap: str = "seismic",
+    dx: float = 8.16,
+    range_m: float = 500.0,
+    clip_lim: bool = True,
+    max_lag: float | None = None,
+    figsize: Tuple[float, float] | None = None,
+    title: str | None = None,
+    show_cbar: bool = True,
+    dpi: int = 120,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """
+    Plots a static Noise Cross-Correlation Function (NCF) section for a single 
+    Virtual Source (VS).
+
+    :param pattern: Glob pattern matching the precomputed NCF files (e.g., "*.npy" or "*.npz").
+    :param VS: Virtual Source number to plot (e.g., 5 or "005"). The function scans the pattern for it.
+    :param title: Custom title for the plot. If None, auto-generates one mimicking the animation.
+    :param show_cbar: Toggle visibility of the correlation amplitude colorbar.
+    :param dpi: Resolution of the output plot.
+    :returns: A tuple containing the (Figure, Axes) objects.
+    """
+    mode, unit = mode.lower().strip(), unit.lower().strip()
+    dist_scale = 1000.0 if unit == "km" else 1.0
+    lag_axis = np.asarray(lag_axis)
+    plot_distance, plot_range = np.asarray(distance_axis) / dist_scale, range_m / dist_scale
+
+    # Find the specific VS file
+    paths = glob.glob(pattern)
+    target_path = None
+    target_date, target_window, target_vs_str = "", "", ""
+
+    for p in paths:
+        date, vs_str, window, _ = parse_ncf_stack_filename(p)
+        if int(vs_str) == int(VS):
+            target_path = p
+            target_date = date
+            target_window = window
+            target_vs_str = vs_str
+            break
+
+    if target_path is None:
+        raise FileNotFoundError(f"Could not find a file matching VS={VS} in pattern: {pattern}")
+
+    # Set up lag axis subset
+    if mode == "all":
+        y, sel = lag_axis, slice(None)
+    elif mode == "causal":
+        sel = lag_axis >= 0
+        y = lag_axis[sel]
+    else:  # acausal
+        sel = lag_axis <= 0
+        y_raw = np.abs(lag_axis[sel])
+        order = np.argsort(y_raw)
+        y = y_raw[order]
+
+    # Load data
+    ncf = np.load(target_path)
+    if ncf.shape == (lag_axis.size, distance_axis.size):
+        ncf = ncf.T
+
+    data = ncf if mode == "all" else ncf[:, sel]
+    if mode == "acausal":
+        data = data[:, order]
+
+    # Compute clipping limits
+    if pclip is not None:
+        c0 = float(np.percentile(np.abs(data), pclip))
+    else:
+        c0 = float(clip if clip is not None else 1.0)
+
+    # Setup Plot
+    if figsize is None:
+        figsize = (6, 6) if clip_lim else (10, 6)
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    ax.invert_yaxis()
+    
+    ax.set_xlabel(f"Distance along array ({unit})")
+    ax.set_ylabel("|Lag time| (s)" if mode == "acausal" else "Lag time (s)")
+
+    if max_lag is not None:
+        ax.set_ylim(max_lag, -max_lag) if mode == "all" else ax.set_ylim(max_lag, 0)
+
+    mesh = ax.pcolormesh(
+        plot_distance, y, data.T, 
+        shading="gouraud", cmap=cmap, vmin=-c0, vmax=c0
+    )
+
+    pos_plot = (int(target_vs_str) * dx) / dist_scale
+    ax.axvline(x=pos_plot, color="black", linestyle="--", linewidth=1.2, alpha=0.6)
+
+    if clip_lim:
+        ax.set_xlim(
+            max(plot_distance.min(), pos_plot - plot_range), 
+            min(plot_distance.max(), pos_plot + plot_range)
+        )
+
+    if show_cbar:
+        fig.colorbar(mesh, ax=ax, label="Correlation amplitude")
+
+    # Title generation
+    dec = 2 if unit == "km" else 1
+    if title is None:
+        title = f"{os.path.basename(target_path)}\nWindow: {target_window} | VS={target_vs_str} ({pos_plot:.{dec}f} {unit})"
+    
+    ax.set_title(title, pad=15)
+    fig.tight_layout()
+
+    return fig, ax
+
 def animate_ncf_section_mesh(
     pattern: str,
     *,
@@ -1217,6 +1337,131 @@ def animate_ncf_section_mesh(
     plt.close(fig) 
     return ani
 
+def plot_directional_ncf(
+    pattern: str,
+    VS: Union[str, int],
+    *,
+    lag_axis: np.ndarray,
+    distance_axis: np.ndarray,
+    target: Literal["causal", "acausal", "s1", "s2"] = "s1",
+    unit: str = "m",
+    clip: float | None = 0.05,
+    pclip: float | None = None,
+    cmap: str = "seismic",
+    dx: float = 8.16,
+    range_m: float = 500.0,
+    clip_lim: bool = True,
+    view_side: Literal["both", "left", "right"] = "both",  
+    pos_offset: float = 0.0,
+    max_lag: float | None = None,
+    figsize: Tuple[float, float] | None = None,
+    title: str | None = None,
+    show_cbar: bool = True,
+    dpi: int = 120,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """
+    Plots a static directionally folded Noise Cross-Correlation Function (NCF) section 
+    for a single Virtual Source (VS).
+
+    Leverages `src.disp.prep_ncf` to extract specific wavefield components (causal, acausal, 
+    or directionally folded S1/S2 modes). Allows custom positional offsets and spatial 
+    windowing to isolate the forward- or backward-propagating wavefield.
+
+    :param pattern: Glob pattern matching the precomputed NCF files (e.g., "*.npy" or "*.npz").
+    :param VS: Virtual Source number to plot (e.g., 5 or "005"). The function scans the pattern for it.
+    :param target: The specific wavefield component to animate. Options: "causal", "acausal", 
+                   "s1" (e.g., forward-propagating), or "s2" (e.g., backward-propagating). Default is "s1".
+    :param title: Custom title for the plot. If None, auto-generates one mimicking the animation.
+    :param show_cbar: Toggle visibility of the correlation amplitude colorbar.
+    :param dpi: Resolution of the output plot.
+    :returns: A tuple containing the (Figure, Axes) objects.
+    """
+    target, unit = target.lower().strip(), unit.lower().strip()
+    dist_scale = 1000.0 if unit == "km" else 1.0
+    lag_axis = np.asarray(lag_axis)
+    plot_distance, plot_range, plot_offset = np.asarray(distance_axis) / dist_scale, range_m / dist_scale, pos_offset / dist_scale
+
+    # Find the specific VS file
+    paths = glob.glob(pattern)
+    target_path = None
+    target_date, target_window, target_vs_str, target_xmode = "", "", "", ""
+
+    for p in paths:
+        date, vs_str, window, xmode = parse_ncf_stack_filename(p)
+        if int(vs_str) == int(VS):
+            target_path = p
+            target_date = date
+            target_window = window
+            target_vs_str = vs_str
+            target_xmode = xmode
+            break
+
+    if target_path is None:
+        raise FileNotFoundError(f"Could not find a file matching VS={VS} in pattern: {pattern}")
+
+    # Process Data
+    ncf_raw = np.load(target_path)
+    if ncf_raw.shape == (lag_axis.size, distance_axis.size): 
+        ncf_raw = ncf_raw.T 
+    
+    ncf_c, ncf_a, new_lag_axis, s1, s2 = prep_ncf(ncf_raw, lag_axis, distance_axis, vs=target_vs_str, dx=dx)
+    data = {"causal": ncf_c, "acausal": ncf_a, "s1": s1, "s2": s2}[target]
+
+    # Compute clipping limits
+    if pclip is not None:
+        c0 = float(np.percentile(np.abs(data), pclip))
+    else:
+        c0 = float(clip if clip is not None else 1.0)
+
+    # Setup Plot
+    if figsize is None:
+        figsize = (6, 6) if clip_lim else (10, 6)
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    ax.invert_yaxis()
+    
+    ax.set_xlabel(f"Distance along array ({unit})")
+    ax.set_ylabel("Lag time (s)")
+
+    if max_lag is not None: 
+        ax.set_ylim(max_lag, 0)
+
+    mesh = ax.pcolormesh(
+        plot_distance, new_lag_axis, data.T, 
+        shading="gouraud", cmap=cmap, vmin=-c0, vmax=c0
+    )
+
+    pos_plot = (int(target_vs_str) * dx) / dist_scale
+    ax.axvline(x=pos_plot, color="black", linestyle="--", linewidth=1.2, alpha=0.6)
+
+    if clip_lim:
+        if view_side == "both": 
+            left, right = pos_plot - plot_range, pos_plot + plot_range
+        elif view_side == "right": 
+            left, right = pos_plot + plot_offset, pos_plot + plot_range
+        else: 
+            left, right = pos_plot - plot_range, pos_plot - plot_offset
+        
+        ax.set_xlim(
+            max(plot_distance.min(), left), 
+            min(plot_distance.max(), right)
+        )
+
+    if show_cbar:
+        fig.colorbar(mesh, ax=ax, label="Correlation amplitude")
+
+    # Title generation
+    dec = 2 if unit == "km" else 1
+    if title is None:
+        title_prefix = f"{target_date} | {target_window} | {target_xmode}"
+        target_title_suffix = f"Target: {target.upper()}"
+        title = f"{os.path.basename(target_path)}\n{title_prefix} | {target_title_suffix}\nVS={target_vs_str} ({pos_plot:.{dec}f} {unit})"
+    
+    ax.set_title(title, pad=15)
+    fig.tight_layout()
+
+    return fig, ax
+
 def animate_directional_ncf_section_mesh(
     pattern: str,
     *,
@@ -1339,6 +1584,123 @@ def animate_directional_ncf_section_mesh(
     ani = FuncAnimation(fig, update, init_func=init, frames=frame_generator, save_count=len(parsed), interval=interval_ms, blit=False, repeat=True)
     plt.close(fig)
     return ani
+
+def plot_preprocessed_ncf(
+    files: List[str],
+    VS: Union[str, int],
+    *,
+    unit: str = "m",
+    clip: float | None = 0.05,
+    pclip: float | None = None,
+    cmap: str = "seismic",
+    range_m: float = 4000.0,
+    clip_lim: bool = True,
+    view_side: Literal["both", "left", "right"] = "both",
+    pos_offset: float = 0.0,
+    figsize: Tuple[float, float] | None = None,
+    title: str | None = None,
+    show_cbar: bool = True,
+    dpi: int = 120,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """
+    Plots a static, spatially and temporally pre-processed Noise Cross-Correlation 
+    Function (NCF) gather for a single Virtual Source (VS).
+
+    This function automatically aligns with the zero-offset trace, handling cases where 
+    node geometries vary across files.
+
+    :param files: List of file paths to the pre-processed NCF numpy archives (.npz).
+    :param VS: Virtual Source number to plot (e.g., 5 or "005"). The function scans the list for it.
+    :param unit: Spatial distance unit for the x-axis ("m" or "km"). Default is "m".
+    :param clip: Absolute amplitude limit for colorbar scaling. Used only if `pclip` is None.
+    :param pclip: Percentile for dynamic amplitude clipping (e.g., 99.0).
+    :param cmap: Matplotlib colormap to use. Default is "seismic".
+    :param range_m: Maximum spatial distance (in meters or km based on `unit`) to display.
+    :param clip_lim: If True, strictly limits the x-axis bounds based on `range_m`, `view_side`, 
+                     and `pos_offset`.
+    :param view_side: Determines which side of the virtual source gather to display 
+                      ("both", "left", or "right"). Default is "both".
+    :param pos_offset: Spatial exclusion offset from the virtual source to clip out near-source noise.
+    :param figsize: Optional tuple defining figure dimensions (width, height) in inches.
+    :param title: Custom title for the plot. If None, auto-generates one.
+    :param show_cbar: Toggle visibility of the correlation amplitude colorbar.
+    :param dpi: Resolution of the output plot.
+    :returns: A tuple containing the (Figure, Axes) objects.
+    """
+    if not files:
+        raise ValueError("Provided file list is empty!")
+
+    view_side, unit = view_side.lower().strip(), unit.lower().strip()
+    dist_scale = 1000.0 if unit == "km" else 1.0
+    plot_range, plot_offset = range_m / dist_scale, pos_offset / dist_scale
+
+    # Find the specific VS file from the list
+    target_path = None
+    target_date, target_window, target_vs_str, target_xmode = "", "", "", ""
+
+    for p in files:
+        date, vs_str, window, xmode = parse_ncf_stack_filename(p)
+        if int(vs_str) == int(VS):
+            target_path = p
+            target_date = date
+            target_window = window
+            target_vs_str = vs_str
+            target_xmode = xmode
+            break
+
+    if target_path is None:
+        raise FileNotFoundError(f"Could not find a file matching VS={VS} in the provided file list.")
+
+    # Load Data from .npz
+    archive = np.load(target_path)
+    current_offset = archive['offset'] / dist_scale
+    lag_axis = archive['lag']
+    data = archive['data'].T
+
+    # Compute clipping limits
+    if pclip is not None:
+        c0 = float(np.percentile(np.abs(data), pclip))
+    else:
+        c0 = float(clip if clip is not None else 1.0)
+
+    # Establish plotting limits based on view_side and pos_offset
+    if view_side == "both": 
+        left_bound, right_bound = -plot_range, plot_range
+    elif view_side == "right": 
+        left_bound, right_bound = plot_offset, plot_range
+    else: 
+        left_bound, right_bound = -plot_range, -plot_offset
+
+    # Setup Plot
+    if figsize is None:
+        figsize = (8, 6) if clip_lim else (10, 6)
+
+    fig, ax = plt.subplots(figsize=figsize, layout="constrained", dpi=dpi)
+    ax.invert_yaxis()
+    
+    ax.set_xlabel(f"Offset from Virtual Source ({unit})")
+    ax.set_ylabel("Lag time (s)")
+
+    if clip_lim: 
+        ax.set_xlim(left_bound, right_bound)
+
+    mesh = ax.pcolormesh(
+        current_offset, lag_axis, data, 
+        shading="gouraud", cmap=cmap, vmin=-c0, vmax=c0
+    )
+    
+    ax.axvline(x=0.0, color="black", linestyle="--", linewidth=1.2, alpha=0.6)
+
+    if show_cbar:
+        fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04).set_label("Correlation amplitude")
+
+    # Title generation
+    if title is None:
+        title = f"NCF Gather (VS={target_vs_str} | {target_date} | {target_xmode})"
+    
+    ax.set_title(title)
+    
+    return fig, ax
 
 def animate_preprocessed_ncf(
     files: List[str],
@@ -1475,6 +1837,147 @@ def animate_preprocessed_ncf(
     ani = FuncAnimation(fig, update, frames=total_frames, interval=interval_ms, blit=False)
     plt.close(fig)
     return ani
+
+def plot_preprocessed_fk(
+    files: List[str],
+    VS: Union[str, int],
+    *,
+    unit: str = "m",
+    clip: float | None = None,
+    pclip: float | None = 99.0,
+    cmap: str = "inferno",
+    view_side: Literal["both", "left", "right"] = "right",
+    pos_offset: float = 0.0,
+    klim: Tuple[float, float] | None = None,
+    figsize: Tuple[float, float] = (8, 6),
+    vmin: float | None = None,                 
+    vmax: float | None = None,
+    title: str | None = None,
+    show_cbar: bool = True,
+    dpi: int = 120,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """
+    Plots a static, normalized 2D frequency-wavenumber (f-k) power spectrum 
+    for a single pre-processed Virtual Source (VS).
+
+    This function isolates directional wavefields, dynamically calculates the f-k 
+    transform to handle missing channels safely, and provides reference phase-velocity 
+    overlays for dispersion analysis.
+
+    :param files: List of file paths to the pre-processed NCF numpy archives (.npz).
+    :param VS: Virtual Source number to plot (e.g., 5 or "005").
+    :param unit: Spatial distance unit used for the x-axis ("m" or "km"). Default is "m".
+    :param clip: Absolute amplitude limit for power normalization. Used only if `pclip` is None.
+    :param pclip: Percentile for dynamic amplitude clipping (e.g., 99.0).
+    :param cmap: Matplotlib colormap to use. Default is "inferno".
+    :param view_side: Determines which side of the spatial array to process and display ("both", "left", or "right"). 
+    :param pos_offset: Spatial exclusion offset to clip out near-source auto-correlation artifacts.
+    :param klim: Optional tuple (kmin, kmax) specifying the wavenumber (x-axis) limits. 
+    :param figsize: Tuple specifying the figure dimensions.
+    :param vmin: Optional minimum phase velocity (m/s). Plots a cyan dashed reference line.
+    :param vmax: Optional maximum phase velocity (m/s). Plots a lime dashed reference line.
+    :param title: Custom title for the plot. If None, auto-generates one.
+    :param show_cbar: Toggle visibility of the power amplitude colorbar.
+    :param dpi: Resolution of the output plot.
+    :returns: A tuple containing the (Figure, Axes) objects.
+    """
+    if not files:
+        raise ValueError("Provided file list is empty!")
+
+    view_side, unit = view_side.lower().strip(), unit.lower().strip()
+    dist_scale = 1000.0 if unit == "km" else 1.0
+
+    # Locate the target file
+    target_path = None
+    target_date, target_vs_str, target_xmode = "", "", ""
+
+    for p in files:
+        date, vs_str, window, xmode = parse_ncf_stack_filename(p)
+        if int(vs_str) == int(VS):
+            target_path = p
+            target_date = date
+            target_vs_str = vs_str
+            target_xmode = xmode
+            break
+
+    if target_path is None:
+        raise FileNotFoundError(f"Could not find a file matching VS={VS} in the provided file list.")
+
+    # Helper to process the specific frame
+    def process_fk_frame(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        archive = np.load(path)
+        data, lag_axis, offset_axis = archive['data'], archive['lag'], archive['offset']
+        
+        # Spatial Masking
+        mask = np.abs(offset_axis) >= pos_offset
+        if view_side == "right": mask &= (offset_axis >= 0)
+        elif view_side == "left": mask &= (offset_axis <= 0)
+            
+        f_axis, k_axis_raw, fk_complex_raw = fk_transform(data[mask, :], lag_axis[1]-lag_axis[0], offset_axis[1]-offset_axis[0])
+        sort_idx = np.argsort(-k_axis_raw)
+        k_axis, fk_power = -k_axis_raw[sort_idx], np.abs(fk_complex_raw[sort_idx, :])
+        
+        pos_f_mask = f_axis >= 0
+        f_axis, fk_power = f_axis[pos_f_mask], fk_power[:, pos_f_mask]
+        
+        if view_side == "right": k_mask = k_axis >= 0
+        elif view_side == "left": k_mask = k_axis <= 0
+        else: k_mask = np.ones_like(k_axis, dtype=bool)
+            
+        return k_axis[k_mask], f_axis, fk_power[k_mask, :].T
+
+    k_axis, f_axis, fk_power = process_fk_frame(target_path)
+    plot_k = k_axis * dist_scale
+
+    # Compute global clip
+    if pclip is not None:
+        c0 = float(np.percentile(fk_power, pclip))
+    else:
+        c0 = float(clip if clip is not None else 1.0)
+    c0 = c0 if c0 > 0 else 1.0
+
+    # Layout Setup
+    fig, ax = plt.subplots(figsize=figsize, layout="constrained", dpi=dpi)
+    ax.set_xlabel(f"Wavenumber k (cycles/{unit})")
+    ax.set_ylabel("Frequency f (Hz)")
+
+    if klim is not None:
+        if view_side == "left" and klim[0] >= 0:
+            ax.set_xlim(-klim[1], -klim[0])
+        else:
+            ax.set_xlim(*klim)
+
+    # Plot the 2D power spectrum
+    mesh = ax.pcolormesh(
+        plot_k, f_axis, fk_power/c0, 
+        shading="gouraud", cmap=cmap, vmin=0, vmax=1.0
+    )
+    
+    ax.set_ylim(0, np.max(f_axis))
+    
+    # Velocity Overlay Lines (v = f/k => f = v*k)
+    if vmin is not None: 
+        ax.plot(plot_k, vmin * np.abs(plot_k / dist_scale), color="cyan", linestyle="--", linewidth=1.8, label=f"vmin = {vmin} m/s")
+    if vmax is not None: 
+        ax.plot(plot_k, vmax * np.abs(plot_k / dist_scale), color="lime", linestyle="--", linewidth=1.8, label=f"vmax = {vmax} m/s")
+    
+    if vmin is not None or vmax is not None:
+        ax.legend(loc="upper left", fontsize=10, framealpha=0.7, facecolor="black", edgecolor="white", labelcolor="white")
+
+    # Center axis guide for double-sided viewing
+    if view_side == "both" or (klim and klim[0] <= 0 <= klim[1]):
+        ax.axvline(x=0.0, color="white", linestyle=":", linewidth=1.0, alpha=0.4)
+        
+    if show_cbar:
+        fig.colorbar(mesh, ax=ax, fraction=0.046, pad=0.04).set_label("Normalized Power")
+    
+    # Title Generation
+    if title is None:
+        title = f"F-K Spectrum (VS={target_vs_str} | {target_date} | View: {view_side.upper()})"
+    
+    ax.set_title(title)
+
+    return fig, ax
 
 def animate_preprocessed_fk(
     files: List[str],
@@ -1770,6 +2273,96 @@ def animate_pipeline(
 # ===========================================================================
 # 3. Plot Dispersion Images
 # ===========================================================================
+def plot_fv(
+    fv_files: List[str],
+    VS: Union[str, int],
+    *,
+    xmin: float | None = None,
+    xmax: float | None = None,
+    ymin: float | None = None,
+    ymax: float | None = None,
+    cmap: str = "viridis",
+    figsize: Tuple[float, float] = (8, 6),
+    title: str | None = None,
+    show_cbar: bool = True,
+    dpi: int = 120,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """
+    Plots a static precomputed frequency-velocity (f-v) panel for a single 
+    Virtual Source (VS).
+
+    :param fv_files: List of file paths to precomputed numpy archives (.npz).
+    :param VS: Virtual Source number to plot (e.g., 50). The function scans the list for it.
+    :param xmin: Minimum frequency (x-axis) bound to display.
+    :param xmax: Maximum frequency (x-axis) bound to display.
+    :param ymin: Minimum phase velocity (y-axis) bound to display.
+    :param ymax: Maximum phase velocity (y-axis) bound to display.
+    :param cmap: Matplotlib colormap to use. Default is "viridis".
+    :param figsize: Tuple defining figure dimensions.
+    :param title: Custom title for the plot. If None, auto-generates one.
+    :param show_cbar: Toggle visibility of the amplitude colorbar.
+    :param dpi: Resolution of the output plot.
+    :returns: A tuple containing the (Figure, Axes) objects.
+    """
+    if not fv_files:
+        raise ValueError("Provided file list is empty!")
+
+    # Locate the target file by parsing the Virtual Source string from the filename
+    target_path = None
+    for p in fv_files:
+        if int(get_vs_number(p)) == int(VS):
+            target_path = p
+            break
+
+    if target_path is None:
+        raise FileNotFoundError(f"Could not find a file matching VS={VS} in the provided file list.")
+
+    # Load Data from .npz
+    archive = np.load(target_path)
+    fv_data = archive["fv"]
+    f_axis = archive["f_axis"]
+    v_axis = archive["v_axis"]
+
+    extent = [f_axis.min(), f_axis.max(), v_axis.min(), v_axis.max()]
+
+    # Setup Plot
+    fig, ax = plt.subplots(figsize=figsize, layout="constrained", dpi=dpi)
+
+    mesh = ax.imshow(
+        fv_data, 
+        extent=extent, 
+        aspect='auto', 
+        origin='lower', 
+        cmap=cmap,
+        interpolation='bicubic',  
+        vmin=np.nanmin(fv_data),
+        vmax=np.nanmax(fv_data)
+    )
+
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Phase velocity (m/s)")
+
+    if show_cbar:
+        fig.colorbar(mesh, ax=ax, label="Normalized Amplitude")
+
+    # Apply limits
+    if xmin is not None and xmax is not None: ax.set_xlim(xmin, xmax)
+    elif xmin is not None: ax.set_xlim(left=xmin)
+    elif xmax is not None: ax.set_xlim(right=xmax)
+
+    if ymin is not None and ymax is not None: ax.set_ylim(ymin, ymax)
+    elif ymin is not None: ax.set_ylim(bottom=ymin)
+    elif ymax is not None: ax.set_ylim(top=ymax)
+
+    # Title generation
+    if title is None:
+        fname = os.path.basename(target_path).replace(".npz", "").replace("_fv", "")
+        title = f"Dispersion Images: {fname}"
+    
+    ax.set_title(title, pad=15)
+
+    return fig, ax
+
 def animate_fv(
     fv_files: List[str],
     xmin: float | None = None,
@@ -1869,30 +2462,120 @@ def animate_fv(
     plt.close(fig)
     return ani
 
-def animate_fv_pick(
-    fv_files: list[str],
+def plot_fv_pick(
+    fv_files: List[str],
+    VS: Union[str, int],
     picks_dir: str,
+    *,
+    xmin: float | None = None,
+    xmax: float | None = None,
+    ymin: float | None = None,
+    ymax: float | None = None,
+    cmap: str = "viridis",
+    figsize: Tuple[float, float] = (10, 6),
+    title: str | None = None,
+    show_cbar: bool = True,
+    dpi: int = 120,
+) -> Tuple[plt.Figure, plt.Axes]:
+    """
+    Plots a static precomputed frequency-velocity (f-v) panel for a single 
+    Virtual Source (VS) and overlays saved dispersion picks if they exist.
+    """
+    if not fv_files:
+        raise ValueError("Provided file list is empty!")
+
+    # Locate the target file by parsing the Virtual Source string from the filename
+    target_path = None
+    for p in fv_files:
+        if int(get_vs_number(p)) == int(VS):
+            target_path = p
+            break
+
+    if target_path is None:
+        raise FileNotFoundError(f"Could not find a file matching VS={VS} in the provided file list.")
+
+    fname_full = os.path.basename(target_path)
+    item0 = np.load(target_path, allow_pickle=True)
+    f_axis0, v_axis0, fv0 = item0["f_axis"], item0["v_axis"], item0["fv"]
+    
+    # Move to CPU/NumPy if they are tensors
+    f_np = f_axis0.cpu().numpy() if hasattr(f_axis0, 'cpu') else np.asarray(f_axis0)
+    v_np = v_axis0.cpu().numpy() if hasattr(v_axis0, 'cpu') else np.asarray(v_axis0)
+    fv_np = fv0.cpu().numpy() if hasattr(fv0, 'cpu') else np.asarray(fv0)
+
+    # Setup Plot
+    fig, ax = plt.subplots(figsize=figsize, layout="constrained", dpi=dpi)
+
+    extent = [f_np.min(), f_np.max(), v_np.min(), v_np.max()]
+    mesh = ax.imshow(
+        fv_np, 
+        extent=extent, 
+        aspect='auto', 
+        origin='lower', 
+        cmap=cmap,
+        interpolation='bicubic',  
+        vmin=np.nanmin(fv_np),
+        vmax=np.nanmax(fv_np)
+    )
+    
+    # Check for matching Pick file
+    pick_fname = fname_full.replace("_fv.npz", "_pick.npy")
+    pick_path = os.path.join(picks_dir, pick_fname)
+    
+    if os.path.exists(pick_path):
+        pick_data = np.load(pick_path, allow_pickle=True).item()
+        ax.scatter(
+            pick_data['f'], pick_data['v'], 
+            color='red', s=40, edgecolors='white', linewidth=0.8, 
+            label="Saved Picks", zorder=10
+        )
+        ax.legend(loc='upper right')
+
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Phase velocity (m/s)")
+
+    if show_cbar:
+        fig.colorbar(mesh, ax=ax, label="Normalized Amplitude")
+
+    # Apply limits
+    if xmin is not None and xmax is not None: ax.set_xlim(xmin, xmax)
+    elif xmin is not None: ax.set_xlim(left=xmin)
+    elif xmax is not None: ax.set_xlim(right=xmax)
+
+    if ymin is not None and ymax is not None: ax.set_ylim(ymin, ymax)
+    elif ymin is not None: ax.set_ylim(bottom=ymin)
+    elif ymax is not None: ax.set_ylim(top=ymax)
+
+    # Title generation
+    if title is None:
+        display_name = fname_full.replace("_fv.npz", "")
+        title = f"Dispersion Viewer: {display_name}"
+    
+    ax.set_title(title, pad=15)
+
+    return fig, ax
+
+def animate_fv_pick(
+    fv_files: List[str],
+    picks_dir: str,
+    *,
+    xmin: float | None = None,
+    xmax: float | None = None,
+    ymin: float | None = None,
+    ymax: float | None = None,
     cmap: str = "viridis",
     interval_ms: int = 400,
+    figsize: Tuple[float, float] = (10, 6)
 ) -> FuncAnimation:
     """
     Instantly animates pre-computed f-v panels and overlays saved picks if they exist.
-
-    :param fv_files: List of file paths to pre-computed frequency-velocity panels.
-    :type fv_files: list[str]
-    :param picks_dir: Directory path containing the pre-picked `.npy` files.
-    :type picks_dir: str
-    :param cmap: Matplotlib colormap to use. Default is "viridis".
-    :type cmap: str, optional
-    :param interval_ms: Delay between frames in milliseconds. Default is 400.
-    :type interval_ms: int, optional
-    :returns: The constructed animation object ready for rendering or display.
-    :rtype: FuncAnimation
     """
-    fig, ax = plt.subplots(figsize=(10, 6))
+    if not fv_files:
+        raise ValueError("No files found! Check your file path or glob pattern.")
+
+    fig, ax = plt.subplots(figsize=figsize, layout="constrained")
     
     # 1. Initialize first frame 
-    # REMOVED .item() because fv_files are .npz
     item0 = np.load(fv_files[0], allow_pickle=True)
     f_axis0, v_axis0, fv0 = item0["f_axis"], item0["v_axis"], item0["fv"]
     
@@ -1902,7 +2585,18 @@ def animate_fv_pick(
     fv_np = fv0.cpu().numpy() if hasattr(fv0, 'cpu') else np.asarray(fv0)
 
     # 2. Setup Plot Elements
-    mesh = ax.pcolormesh(f_np, v_np, fv_np, shading='gouraud', cmap=cmap, snap=True)
+    extent = [f_np.min(), f_np.max(), v_np.min(), v_np.max()]
+    mesh = ax.imshow(
+        fv_np, 
+        extent=extent, 
+        aspect='auto', 
+        origin='lower', 
+        cmap=cmap,
+        interpolation='bicubic',  
+        vmin=np.nanmin(fv_np),
+        vmax=np.nanmax(fv_np)
+    )
+    
     scat = ax.scatter([], [], color='red', s=30, edgecolors='white', linewidth=0.5, label="Saved Picks", zorder=10)
     
     ax.set_xlabel("Frequency (Hz)")
@@ -1910,21 +2604,37 @@ def animate_fv_pick(
     ax.legend(loc='upper right')
     plt.colorbar(mesh, ax=ax, label="Normalized Amplitude")
 
+    # Apply limits
+    if xmin is not None and xmax is not None: ax.set_xlim(xmin, xmax)
+    elif xmin is not None: ax.set_xlim(left=xmin)
+    elif xmax is not None: ax.set_xlim(right=xmax)
+
+    if ymin is not None and ymax is not None: ax.set_ylim(ymin, ymax)
+    elif ymin is not None: ax.set_ylim(bottom=ymin)
+    elif ymax is not None: ax.set_ylim(top=ymax)
+
+    pbar_container = []
+    processed_frames = set()
+    total_frames = len(fv_files)
+
     def update(frame_idx):
-        # Load FV Panel (REMOVED .item() here too)
+        if not pbar_container:
+            pbar_container.append(
+                tqdm(total=total_frames, desc="Rendering Pick Video")
+            )
+
         fpath = fv_files[frame_idx]
         fname_full = os.path.basename(fpath)
         data = np.load(fpath, allow_pickle=True)
         
         fv_np_cur = data["fv"].cpu().numpy() if hasattr(data["fv"], 'cpu') else np.asarray(data["fv"])
-        mesh.set_array(fv_np_cur.ravel())
+        mesh.set_data(fv_np_cur)
         
-        # Check for matching Pick file (FIXED to replace _fv.npz)
+        # Check for matching Pick file 
         pick_fname = fname_full.replace("_fv.npz", "_pick.npy")
         pick_path = os.path.join(picks_dir, pick_fname)
         
         if os.path.exists(pick_path):
-            # KEPT .item() here because pick files are .npy dictionaries!
             pick_data = np.load(pick_path, allow_pickle=True).item()
             points = np.column_stack((pick_data['f'], pick_data['v']))
             scat.set_offsets(points)
@@ -1932,14 +2642,20 @@ def animate_fv_pick(
         else:
             scat.set_visible(False)
 
-        # Title (FIXED to replace _fv.npz)
         display_name = fname_full.replace("_fv.npz", "")
-        ax.set_title(f"Dispersion Viewer: {display_name}")
+        ax.set_title(f"Dispersion Viewer: {display_name}", pad=15)
         
+        if frame_idx not in processed_frames:
+            pbar_container[0].update(1)
+            processed_frames.add(frame_idx)
+            
+        if len(processed_frames) == total_frames:
+            pbar_container[0].close()
+            
         return mesh, scat
 
     ani = FuncAnimation(
-        fig, update, frames=len(fv_files), interval=interval_ms, blit=False
+        fig, update, frames=total_frames, interval=interval_ms, blit=False
     )
     
     plt.close(fig)

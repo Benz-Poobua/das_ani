@@ -42,8 +42,8 @@ mpl.rcParams.update({
     'ytick.labelsize': 12,
     'legend.fontsize': 12,
     'figure.dpi': 150,
-    'axes.linewidth': 1.2,      # Thicker axis lines for better visibility
-    'pdf.fonttype': 42,         # Ensures fonts are editable/embedded in PDFs
+    'axes.linewidth': 1.2,       
+    'pdf.fonttype': 42,          
     'ps.fonttype': 42
 })
 
@@ -683,8 +683,11 @@ def plot_2d_contour_section(
     figsize: tuple[float | int, float | int] = (12, 5), 
     smooth_sigma: tuple[float, float] = (1, 2), 
     tick_step: int = 100, 
-    contour: bool = False, 
+    contour: bool = False,
     x_flip: bool = False,
+    x_interp_step: float | None = None,
+    smooth_units: str = 'index',
+    max_resolved_depth: float | int | None = None,
     save_path: str | None = None
 ) -> None:
     """
@@ -716,23 +719,78 @@ def plot_2d_contour_section(
     :type contour: bool, optional
     :param x_flip: Whether to invert the X-axis (e.g., to match map orientation). Default is False.
     :type x_flip: bool, optional
+    :param x_interp_step: If set, linearly interpolate the columns onto a uniform
+        horizontal grid with this spacing (same units as ``positions``, e.g. metres)
+        BEFORE contouring. With sparse virtual shots this removes the vertical
+        banding caused by contouring straight between far-apart columns. Default None
+        (plot on the raw shot positions, legacy behaviour).
+    :type x_interp_step: float, optional
+    :param smooth_units: ``'index'`` (legacy) treats ``smooth_sigma`` as samples;
+        ``'physical'`` treats it as ``(sigma_z, sigma_x)`` in physical units (metres)
+        and converts to samples via the grid spacing, so the blur is independent of
+        grid resolution. Default ``'index'``.
+    :type smooth_units: str, optional
+    :param max_resolved_depth: If set, draw a dashed line + label at this depth to
+        mark the maximum reliably resolved depth (below it the model is poorly
+        constrained, e.g. the half-space). Default None.
+    :type max_resolved_depth: float | int, optional
     :param save_path: If provided, saves the figure to this path instead of showing inline. Default is None.
     :type save_path: str, optional
     """
     fig, ax = plt.subplots(figsize=figsize)
 
-    # Apply smoothing
-    if smooth_sigma != (0, 0):
-        plot_matrix = gaussian_filter(vs_2d_matrix, sigma=smooth_sigma)
-    else:
-        plot_matrix = vs_2d_matrix
+    positions = np.asarray(positions, dtype=float)
+    z_grid = np.asarray(z_grid, dtype=float)
+    M = np.asarray(vs_2d_matrix, dtype=float)
 
-    X, Z = np.meshgrid(positions, z_grid)
+    # Accept either orientation: the matrix must be (len(z_grid), len(positions)).
+    # If it arrives transposed as (len(positions), len(z_grid)) -- e.g. the raw
+    # list-of-profiles before the .T in the inversion loop -- orient it here so
+    # the call works regardless of run order.
+    n_z, n_x = z_grid.size, positions.size
+    if M.shape == (n_x, n_z) and n_x != n_z:
+        M = M.T
+    if M.shape != (n_z, n_x):
+        raise ValueError(
+            f"vs_2d_matrix has shape {M.shape}; expected (len(z_grid), len(positions)) "
+            f"= ({n_z}, {n_x}) or its transpose ({n_x}, {n_z})."
+        )
+
+    # contourf and lateral interpolation need columns sorted by position.
+    order = np.argsort(positions)
+    shot_positions = positions[order]
+    M = M[:, order]
+
+    # Optional lateral densification onto a uniform grid BEFORE contouring.
+    # With sparse virtual shots, contouring straight between far-apart columns
+    # produces vertical banding; interpolating to a fine grid removes it.
+    if x_interp_step:
+        x_plot = np.arange(shot_positions.min(),
+                           shot_positions.max() + x_interp_step, x_interp_step)
+        M = np.vstack([np.interp(x_plot, shot_positions, M[r]) for r in range(M.shape[0])])
+    else:
+        x_plot = shot_positions
+
+    # Smoothing. 'physical' treats smooth_sigma as (sigma_z, sigma_x) in METRES
+    # and converts to samples via the grid spacing, so the blur is independent of
+    # grid resolution. 'index' (legacy) treats smooth_sigma as samples.
+    if smooth_sigma is not None and tuple(smooth_sigma) != (0, 0):
+        if str(smooth_units).lower() == 'physical':
+            dz = float(np.median(np.diff(z_grid))) if z_grid.size > 1 else 1.0
+            dx = float(np.median(np.diff(x_plot))) if x_plot.size > 1 else 1.0
+            sigma_eff = (smooth_sigma[0] / dz, smooth_sigma[1] / dx)
+        else:
+            sigma_eff = smooth_sigma
+        plot_matrix = gaussian_filter(M, sigma=sigma_eff)
+    else:
+        plot_matrix = M
+
+    X, Z = np.meshgrid(x_plot, z_grid)
 
     # Define levels for both the colorbar and the lines
     contour_levels = np.linspace(vmin, vmax, levels)
     tick_levels = np.arange(vmin, vmax + tick_step, tick_step)
-    
+
     # 1. Filled Contours
     cf = ax.contourf(X, Z, plot_matrix, levels=contour_levels, cmap=cmap, extend='both')
 
@@ -750,18 +808,27 @@ def plot_2d_contour_section(
     ax.set_ylim(max_depth, 0)
     
     # Set explicit X-limits and handle the flip
-    x_min, x_max = np.min(positions), np.max(positions)
+    x_min, x_max = np.min(shot_positions), np.max(shot_positions)
     if x_flip:
         ax.set_xlim(x_max, x_min)
     else:
         ax.set_xlim(x_min, x_max)
+
+    # Mark the maximum reliably resolved depth (below it the model is poorly
+    # constrained, e.g. the half-space).
+    if max_resolved_depth is not None:
+        ax.axhline(max_resolved_depth, color='white', ls='--', lw=1.2, alpha=0.85)
+        ax.text(0.015, max_resolved_depth,
+                f' max resolved ≈ {max_resolved_depth:.0f} m',
+                transform=ax.get_yaxis_transform(), va='bottom', ha='left',
+                color='white', fontsize=8)
 
     ax.set_title(f"Contoured 2D Shear-Wave Velocity ($V_s$) Profile", fontsize=16, pad=15)
     ax.set_xlabel("Distance Along Cable (m)", fontsize=14)
     ax.set_ylabel("Depth (m)", fontsize=14)
     
     # Show virtual shot locations
-    ax.scatter(positions, np.zeros_like(positions), marker='v', color='black', 
+    ax.scatter(shot_positions, np.zeros_like(shot_positions), marker='v', color='black',
                s=50, clip_on=False, label='Virtual Shots', zorder=5)
     ax.legend(loc='upper left', fontsize=12)
 
@@ -780,8 +847,10 @@ def animate_sensitivity_kernels(
     test_frequencies: list[float] | None = None, 
     vp_vs_ratio: float = 2.0, 
     density: float = 1.0, 
-    x_max: float = 0.08, 
-    step: int | None = None, 
+    x_max: float = 0.08,
+    max_model_depth: float | None = None,
+    normalize: bool = False,
+    step: int | None = None,
     interval: int = 150
 ) -> HTML:
     """
@@ -805,15 +874,34 @@ def animate_sensitivity_kernels(
     :type step: int or None, optional
     :param interval: Milliseconds between frames. Lower is faster. Default is 150.
     :type interval: int, optional
+    :param max_model_depth: If set, extend the 1D model below the inverted grid
+        (holding the deepest/half-space Vs constant) down to this depth before
+        computing kernels, so low frequencies form a real sensitivity lobe
+        instead of piling onto a spike at the grid floor. Default None (legacy).
+    :type max_model_depth: float, optional
+    :param normalize: If True, divide each kernel by its layer thickness
+        (sensitivity per metre) so the thick terminal half-space is comparable to
+        the thin layers above it. Default False.
+    :type normalize: bool, optional
     :return: Interactive HTML widget displaying the animation in a Jupyter Notebook.
     :rtype: IPython.display.HTML
     """
     if test_frequencies is None:
         test_frequencies = [2.0, 3.0, 4.0, 5.0, 6.0]
     
-    # 1. Pre-calculate static variables
-    z_depths = np.abs(z_grid)
-    thickness_m = np.append(np.diff(z_depths), 10.0) # Required half-space
+    # 1. Pre-calculate static variables.
+    # Optionally extend the model below the inverted grid (constant half-space Vs)
+    # so the deepest test frequency forms a real sensitivity lobe instead of
+    # piling onto a terminal-half-space spike at the grid floor.
+    z_depths = np.abs(np.asarray(z_grid, dtype=float))
+    if max_model_depth is not None and max_model_depth > z_depths.max():
+        dz = float(np.median(np.diff(z_depths)))
+        z_ext = np.arange(z_depths.max() + dz, float(max_model_depth) + dz, dz)
+        z_model = np.concatenate([z_depths, z_ext])
+    else:
+        z_model = z_depths
+    n_ext = z_model.size - z_depths.size
+    thickness_m = np.append(np.diff(z_model), 10.0)  # last entry = half-space
     thickness_km = thickness_m / 1000.0
 
     # 2. Setup the static figure
@@ -827,7 +915,7 @@ def animate_sensitivity_kernels(
         line, = ax.plot([], [], label=f"{f} Hz", linewidth=2.5, color=colors[idx])
         lines.append(line)
 
-    ax.set_ylim(np.max(z_depths), 0) 
+    ax.set_ylim(np.max(z_model), 0)
     ax.set_xlim(0, x_max)
     
     ax.set_xlabel("Sensitivity Kernel ($\partial c / \partial V_s$)", fontsize=14)
@@ -849,24 +937,32 @@ def animate_sensitivity_kernels(
 
     def update(idx):
         pos_m = positions[idx]
-        vs_1d_ms = vs_matrix[:, idx]
-        
+        vs_1d_ms = np.asarray(vs_matrix[:, idx], dtype=float)
+
+        # Extend the profile downward with the deepest (half-space) Vs so the
+        # model reaches max_model_depth (no-op when n_ext == 0).
+        if n_ext > 0:
+            vs_1d_ms = np.concatenate([vs_1d_ms, np.full(n_ext, vs_1d_ms[-1])])
+
         # Build local 1D velocity model for this specific position
         vs_kms = vs_1d_ms / 1000.0
         vp_kms = vs_kms * vp_vs_ratio
         rho_gcm3 = np.full_like(vs_kms, density)
         velocity_model = np.column_stack((thickness_km, vp_kms, vs_kms, rho_gcm3))
-        
+
         # Initialize Disba
         ps = PhaseSensitivity(*velocity_model.T)
-        
+
         for f_idx, f in enumerate(test_frequencies):
             period = 1.0 / f
             k = ps(period, mode=0, wave="rayleigh", parameter="velocity_s")
-            
-            # Update line data
-            lines[f_idx].set_data(k.kernel, k.depth * 1000.0)
-            
+            kernel = np.asarray(k.kernel, dtype=float)
+            if normalize:
+                # sensitivity per metre, so the thick terminal half-space layer
+                # is comparable to the thin layers above it.
+                kernel = kernel / np.asarray(thickness_m, dtype=float)
+            lines[f_idx].set_data(kernel, k.depth * 1000.0)
+
         title.set_text(f"Rayleigh Wave Sensitivity\nat Position = {pos_m:.1f} m")
         return lines + [title]
 
@@ -883,3 +979,89 @@ def animate_sensitivity_kernels(
 
     plt.close(fig) # Prevent ghost plots
     return HTML(ani.to_jshtml())
+
+def save_sensitivity_kernel_plots(
+    positions: np.ndarray, 
+    vs_matrix: np.ndarray, 
+    z_grid: np.ndarray, 
+    test_frequencies: list[float] | None = None, 
+    vp_vs_ratio: float = 2.0, 
+    density: float = 1.0, 
+    x_max: float = 0.08,
+    max_model_depth: float | None = None,
+    normalize: bool = False,
+    step: int | None = None,
+    save_dir: str = "../results/inv_sensitivity_urban",
+    save_fmt: str = "png",
+    save_dpi: int = 300,
+    figsize: Tuple[float, float] = (5, 7)
+) -> None:
+    """
+    Batch processes and saves static Rayleigh wave sensitivity kernels.
+    
+    This function avoids the overhead of animation rendering by directly saving 
+    a PNG plot for each specified horizontal position along the grid.
+    
+    :param step: Step size across the positions array. If step=10, every 10th position is saved.
+                 If None, defaults to step=1 (saves every single position).
+    :param save_dir: Directory where the static frames will be saved. Default is "../results/inv_sensitivity_urban".
+    :param save_fmt: Image format for the saved frames (e.g., "png"). Default is "png".
+    :param save_dpi: Resolution for the saved frames. Default is 300.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    if test_frequencies is None:
+        test_frequencies = [2.0, 3.0, 4.0, 5.0, 6.0]
+        
+    z_depths = np.abs(np.asarray(z_grid, dtype=float))
+    if max_model_depth is not None and max_model_depth > z_depths.max():
+        dz = float(np.median(np.diff(z_depths)))
+        z_ext = np.arange(z_depths.max() + dz, float(max_model_depth) + dz, dz)
+        z_model = np.concatenate([z_depths, z_ext])
+    else:
+        z_model = z_depths
+    n_ext = z_model.size - z_depths.size
+    thickness_m = np.append(np.diff(z_model), 10.0)
+    thickness_km = thickness_m / 1000.0
+
+    if step is None:
+        step = 1
+    indices_to_render = range(0, len(positions), step)
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(test_frequencies)))
+
+    for idx in tqdm(indices_to_render, desc="Saving Sensitivity Kernels"):
+        fig, ax = plt.subplots(figsize=figsize, layout="constrained", dpi=save_dpi)
+        
+        pos_m = positions[idx]
+        vs_1d_ms = np.asarray(vs_matrix[:, idx], dtype=float)
+
+        if n_ext > 0:
+            vs_1d_ms = np.concatenate([vs_1d_ms, np.full(n_ext, vs_1d_ms[-1])])
+
+        vs_kms = vs_1d_ms / 1000.0
+        vp_kms = vs_kms * vp_vs_ratio
+        rho_gcm3 = np.full_like(vs_kms, density)
+        velocity_model = np.column_stack((thickness_km, vp_kms, vs_kms, rho_gcm3))
+
+        ps = PhaseSensitivity(*velocity_model.T)
+
+        for f_idx, f in enumerate(test_frequencies):
+            period = 1.0 / f
+            k = ps(period, mode=0, wave="rayleigh", parameter="velocity_s")
+            kernel = np.asarray(k.kernel, dtype=float)
+            if normalize:
+                kernel = kernel / np.asarray(thickness_m, dtype=float)
+            
+            ax.plot(kernel, k.depth * 1000.0, label=f"{f} Hz", linewidth=2.5, color=colors[f_idx])
+
+        ax.set_ylim(np.max(z_model), 0)
+        ax.set_xlim(0, x_max)
+        ax.set_xlabel("Sensitivity Kernel ($\partial c / \partial V_s$)", fontsize=14)
+        ax.set_ylabel("Depth (m)", fontsize=14)
+        ax.set_title(f"Rayleigh Wave Sensitivity\nat Position = {pos_m:.1f} m", fontsize=16, pad=20)
+        ax.grid(True, linestyle='--', alpha=0.7)
+        ax.legend(loc="lower right", fontsize=12)
+
+        save_path = os.path.join(save_dir, f"Sensitivity_Kernel_Pos_{pos_m:.1f}m.{save_fmt}")
+        fig.savefig(save_path, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
