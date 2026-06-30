@@ -39,7 +39,7 @@ Workflow:
     2. Per-window preprocessing via ``src.ani.preprocess`` with a selectable
        backend (config key ``preprocess.mode``): ``pure_numpy`` (legacy CPU
        benchmark), ``hybrid`` (scipy detrend/bandpass + torch
-       median/temporal-norm; Option A), or ``pure_torch`` (all-torch,
+       median/temporal-norm), or ``pure_torch`` (all-torch,
        GPU-tailored).
     3. Pre-computes whitening and block-sizing parameters.
     4. Spawns a hardware-aware worker pool with pre-warmed PyTorch models.
@@ -229,7 +229,7 @@ def _get_ingest_cfg(cfg: Mapping[str, Any]) -> tuple[int, bool]:
         if legacy is not None:
             logger.warning(
                 "Config key 'preprocess.decimation' is deprecated; "
-                "move it to 'ingest.decimation' to match the Option A pipeline."
+                "move it to 'ingest.decimation' to match the hybrid pipeline."
             )
             decimation = legacy
         else:
@@ -240,7 +240,7 @@ def _get_ingest_cfg(cfg: Mapping[str, Any]) -> tuple[int, bool]:
         if legacy is not None:
             logger.warning(
                 "Config key 'preprocess.diff' is deprecated; "
-                "move it to 'ingest.diff' to match the Option A pipeline."
+                "move it to 'ingest.diff' to match the hybrid pipeline."
             )
             diff = legacy
         else:
@@ -283,7 +283,14 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     fs_raw = float(get_cfg(cfg, ["data", "fs_raw"], required=True))
     first_chan = int(get_cfg(cfg, ["data", "first_chan"], required=True))
     last_chan = int(get_cfg(cfg, ["data", "last_chan"], required=True))
+    if last_chan < first_chan:
+        raise ValueError(f"data.last_chan ({last_chan}) < data.first_chan ({first_chan}).")
     nch_expected = last_chan - first_chan + 1
+    # Optional: absolute channel index of the file's first row (row 0). When set,
+    # [first_chan, last_chan] is mapped to file rows explicitly, so you can
+    # cross-correlate ANY sub-range of a pre-sliced file (e.g. only the
+    # high-SNR segment). When None, the layout is inferred at ingest below.
+    file_first_chan = get_cfg(cfg, ["data", "file_first_chan"], None)
     src_stride = int(get_cfg(cfg, ["data", "src_stride"], 10))
     min_length_sec = float(get_cfg(cfg, ["data", "min_length_sec"], 60.0))
     min_npts = int(min_length_sec * fs_raw)
@@ -299,7 +306,7 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     whiten_chunk_nch = int(get_cfg(cfg, ["preprocess", "whiten_chunk_nch"], 64))
     # Preprocessing backend: "pure_numpy" | "hybrid" | "pure_torch".
     # Default (key absent) preserves legacy behaviour: CPU -> pure_numpy,
-    # GPU -> hybrid (Option A). Validated here so a typo fails fast.
+    # GPU -> hybrid. Validated here so a typo fails fast.
     preprocess_mode = resolve_preprocess_mode(
         get_cfg(cfg, ["preprocess", "mode"], None), use_gpu
     )
@@ -337,19 +344,40 @@ def process_single_file(file_path: str | Path, cfg: Mapping[str, Any]) -> Option
     _, das_array, dt, npts, _ = load_data(in_path, mmap=mmap)
     data_raw = das_array[:] if isinstance(das_array, zarr.Array) else das_array
 
-    # Channel slicing -- handle both pre-sliced and full-cable inputs
+    # Channel slicing -- map the requested [first_chan, last_chan] window onto
+    # the file's rows. Supports full-cable files (absolute indices), files
+    # pre-sliced to exactly the window, and (now) pre-sliced files from which we
+    # want only a SUB-range. After this block, row 0 == channel `first_chan`,
+    # so the virtual-source indices (src_ch_all) stay consistent.
     nch_file = data_raw.shape[0]
-    if nch_file == nch_expected:
-        # File is already sliced to the target range
-        pass
+    if file_first_chan is not None:
+        # Explicit absolute mapping: file row 0 == channel file_first_chan.
+        lo = first_chan - int(file_first_chan)
+        hi = last_chan - int(file_first_chan)
+        if not (0 <= lo <= hi < nch_file):
+            logger.warning(
+                "[%s] channels [%d,%d] map to file rows [%d,%d], outside "
+                "[0,%d) for file_first_chan=%d; skipping.",
+                in_path.name, first_chan, last_chan, lo, hi, nch_file, int(file_first_chan),
+            )
+            return None
+        data_raw = data_raw[lo : hi + 1, :]
     elif nch_file > last_chan:
-        # File contains the full cable (or more); slice to the requested channels
+        # Full cable (more rows than last_chan): first_chan/last_chan are
+        # absolute row indices into the file.
         data_raw = data_raw[first_chan : last_chan + 1, :]
+    elif nch_expected <= nch_file:
+        # File pre-sliced with row 0 == first_chan: take the requested span
+        # (the whole file when last_chan is its last channel; a leading
+        # SUB-range otherwise). For a sub-range whose start differs from the
+        # file's first channel, set data.file_first_chan instead.
+        data_raw = data_raw[:nch_expected, :]
     else:
-        # File doesn't contain enough channels -- skip
+        # File doesn't contain enough channels for the requested window.
         logger.warning(
-            "[%s] nch_file=%d < last_chan+1=%d, skipping",
-            in_path.name, nch_file, last_chan + 1,
+            "[%s] file has %d channels but %d requested ([%d,%d]); "
+            "set data.file_first_chan if the file is pre-sliced. Skipping.",
+            in_path.name, nch_file, nch_expected, first_chan, last_chan,
         )
         return None
 

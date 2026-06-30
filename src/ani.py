@@ -726,7 +726,7 @@ def preprocess(
       scipy / numpy. This is the bit-exact reference used by the published
       baseline and by the fidelity tests/eval. Returns ``np.ndarray``.
 
-    - ``hybrid`` (Option A; numerical fidelity on CPU **or** GPU): detrend +
+    - ``hybrid`` (numerical fidelity on CPU **or** GPU): detrend +
       bandpass run on CPU with the same canonical scipy routines as
       ``pure_numpy`` (``scipy.signal.detrend`` + ``sosfiltfilt``), preserving
       the mathematically canonical zero-phase Butterworth response. A single
@@ -787,7 +787,7 @@ def preprocess(
         x_t = remove_median_torch(x_t)
         return temporal_normalization_torch(x_t, fs, float(ram_win))
 
-    # ---- mode == "hybrid" (Option A) ----
+    # ---- mode == "hybrid" ----
     x_np = convert_to_numpy(x) if is_tensor_in else np.asarray(x)
     if x_np.ndim != 2:
         raise ValueError(f"preprocess: expected 2D (nch x nt); got {x_np.shape}.")

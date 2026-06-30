@@ -9,11 +9,11 @@
 #   whiten + cross-correlation                         (torch, CPU)
 
 paths:
-  data_root: ./data/raw_urban #_zarr
-  output_root: ./data/ncf_raw_urban #_zarr
+  data_root: ./data/raw_urban  
+  output_root: ./data/ncf_raw_urban  
 
 runtime:
-  njobs: 8
+  njobs: 4
   use_gpu: false
   mmap: true
   frac_mem: 0.25
@@ -24,15 +24,25 @@ runtime:
 
 data:
   fs_raw: 250.0
+  # Channel window to cross-correlate (absolute cable indices). This may be a
+  # SUB-range of the cable / of a pre-sliced file -- e.g. set last_chan: 550 to
+  # process only the high-SNR segment 399-550. The loader maps [first_chan,
+  # last_chan] onto the file's rows automatically:
+  #   - full-cable file (rows = absolute channels): sliced directly;
+  #   - file pre-sliced so row 0 == first_chan: leading sub-range is taken.
   first_chan: 399
-  last_chan: 748
+  last_chan: 550 # 748         # e.g. 550 to use only the high-SNR segment
+  # file_first_chan: 399 # OPTIONAL. Absolute channel of the file's row 0. Set
+  #                      # this for a pre-sliced file when you want a sub-range
+  #                      # whose start differs from the file's first channel
+  #                      # (e.g. first_chan: 450 with files pre-sliced at 399).
   dx: 8.16
   src_stride: 10         # every 10th channel
   min_length_sec: 60.0
 
 # -----------------------------------------------------------------------------
 # Ingest stage: applied ONCE to the raw buffer, before per-window preprocessing.
-# Both keys live here (not under preprocess) to match src/ani.py Option A:
+# Both keys live here (not under preprocess) to match src/ani.py:
 #   - decimation: anti-aliased downsampling via decimate_raw()
 #   - diff:       strain -> strain-rate via differentiate_cpu() (np.gradient)
 # -----------------------------------------------------------------------------
@@ -55,7 +65,7 @@ preprocess:
   mode: pure_numpy
   f1: 1.0
   f2: 10.0
-  ram_win_sec: 0.0
+  ram_win_sec: 1.0    # 0.0 = 1-bit normalization
 
 xcorr:
   # method switch
@@ -64,7 +74,7 @@ xcorr:
 
 
   # whitening
-  is_spectral_whitening: false
+  is_spectral_whitening: true
   window_freq_hz: 0.0
 
   # lags of interest
@@ -86,7 +96,7 @@ perf:
 
 stacking:
   enabled: true
-  raw_root: ./data/ncf_raw_urban 
+  raw_root: ./data/ncf_raw_urban
   stacks_root: ./data/ncf_stacks_urban
   overwrite: false
 

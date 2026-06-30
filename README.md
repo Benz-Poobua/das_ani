@@ -194,6 +194,28 @@ All cross-correlation parameters live in a single YAML file. The eight top-level
 
 > Note: `decimation` and `diff` live under `ingest:` (they run once per file, before per-window preprocessing). The legacy `preprocess.decimation` / `preprocess.diff` locations are still accepted with a deprecation warning.
 
+#### Channel selection (whole cable or a sub-range)
+
+`data.first_chan` / `data.last_chan` are **absolute cable channel indices** defining the window to cross-correlate. They need **not** span the whole cable — set a sub-range to process only part of the array (e.g. a high-SNR segment), which is faster and avoids low-SNR channels biasing the gathers. The loader maps `[first_chan, last_chan]` onto each file's rows automatically:
+
+| File layout | Behaviour |
+|-------------|-----------|
+| Full cable (rows are absolute channels, `nch_file > last_chan`) | sliced directly as `[first_chan : last_chan+1]` |
+| Pre-sliced so row 0 == `first_chan` | the requested span is taken (the whole file when `last_chan` is its last channel; a leading **sub-range** otherwise) |
+| Pre-sliced, sub-range **not** starting at the file's first channel | set `data.file_first_chan` (the absolute channel of the file's row 0); the loader then maps any sub-range exactly |
+
+If the file has fewer channels than requested, that file is skipped with a warning. After slicing, row 0 always corresponds to `first_chan`, so virtual-source indices stay consistent.
+
+```yaml
+data:
+  first_chan: 399
+  last_chan: 480          # high-SNR segment only (not the full 399–748 cable)
+  # file_first_chan: 399  # only needed for a sub-range whose start differs
+                          # from the file's first channel
+```
+
+> A sub-range with `src_stride: 10` yields virtual sources `000, 010, …` up to `last_chan − first_chan`, each gather having `last_chan − first_chan + 1` channels; downstream stacking / dispersion / inversion handle the smaller gathers unchanged.
+
 #### Preprocessing backends (`preprocess.mode`)
 
 Every window passes through the same four stages — detrend → Tukey-tapered zero-phase Butterworth bandpass → per-sample median removal → temporal normalization (RAM or 1-bit) — but you choose **where** they execute:

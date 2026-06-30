@@ -848,51 +848,45 @@ def animate_sensitivity_kernels(
     vp_vs_ratio: float = 2.0, 
     density: float = 1.0, 
     x_max: float = 0.08,
+    ylim: Tuple[float, float] | None = None,
     max_model_depth: float | None = None,
     normalize: bool = False,
     step: int | None = None,
-    interval: int = 150
-) -> HTML:
+    interval_ms: int = 150,
+    save_indices: List[int] | None = None,
+    save_dir: str = "../results/inv_sensitivity_urban",
+    save_fmt: str = "png",
+    save_dpi: int = 300,
+) -> FuncAnimation:
     """
     Generates Rayleigh wave sensitivity kernels along a 2D seismic profile.
     
     :param positions: 1D array of horizontal positions along the cable (in meters).
-    :type positions: array_like
     :param vs_matrix: 2D shear wave velocity matrix (depth x positions) in m/s.
-    :type vs_matrix: numpy.ndarray
     :param z_grid: 1D array of depths (in meters).
-    :type z_grid: array_like
     :param test_frequencies: Frequencies to test in Hz. Default is [2.0, 3.0, 4.0, 5.0, 6.0].
-    :type test_frequencies: list of float, optional
     :param vp_vs_ratio: Ratio used to estimate Vp from Vs. Default is 2.0.
-    :type vp_vs_ratio: float, optional
     :param density: Constant density assumption in g/cm^3. Default is 1.0.
-    :type density: float, optional
     :param x_max: Maximum limit for the X-axis to keep the animation stable. Default is 0.08.
-    :type x_max: float, optional
+    :param ylim: Optional tuple (min_depth, max_depth) to manually set the y-axis limits.
     :param step: Frame step size. E.g., step=5 animates every 5th position. Default is None.
-    :type step: int or None, optional
-    :param interval: Milliseconds between frames. Lower is faster. Default is 150.
-    :type interval: int, optional
+    :param interval_ms: Milliseconds between frames. Lower is faster. Default is 150.
     :param max_model_depth: If set, extend the 1D model below the inverted grid
         (holding the deepest/half-space Vs constant) down to this depth before
-        computing kernels, so low frequencies form a real sensitivity lobe
-        instead of piling onto a spike at the grid floor. Default None (legacy).
-    :type max_model_depth: float, optional
+        computing kernels.
     :param normalize: If True, divide each kernel by its layer thickness
         (sensitivity per metre) so the thick terminal half-space is comparable to
         the thin layers above it. Default False.
-    :type normalize: bool, optional
-    :return: Interactive HTML widget displaying the animation in a Jupyter Notebook.
-    :rtype: IPython.display.HTML
+    :param save_indices: Optional list of frame indices to save as static high-res images.
+    :param save_dir: Directory where the static frames will be saved. Default is "../results/inv_sensitivity_urban".
+    :param save_fmt: Image format for the saved frames (e.g., "png"). Default is "png".
+    :param save_dpi: Resolution for the saved frames. Default is 300.
+    :returns: The constructed Matplotlib FuncAnimation object.
     """
     if test_frequencies is None:
         test_frequencies = [2.0, 3.0, 4.0, 5.0, 6.0]
     
     # 1. Pre-calculate static variables.
-    # Optionally extend the model below the inverted grid (constant half-space Vs)
-    # so the deepest test frequency forms a real sensitivity lobe instead of
-    # piling onto a terminal-half-space spike at the grid floor.
     z_depths = np.abs(np.asarray(z_grid, dtype=float))
     if max_model_depth is not None and max_model_depth > z_depths.max():
         dz = float(np.median(np.diff(z_depths)))
@@ -905,17 +899,20 @@ def animate_sensitivity_kernels(
     thickness_km = thickness_m / 1000.0
 
     # 2. Setup the static figure
-    fig, ax = plt.subplots(figsize=(5, 7))
+    fig, ax = plt.subplots(figsize=(5, 7), layout="constrained")
     lines = []
     
-    # Generate distinct colors for however many frequencies you pass
     colors = plt.cm.tab10(np.linspace(0, 1, len(test_frequencies)))
 
     for idx, f in enumerate(test_frequencies):
         line, = ax.plot([], [], label=f"{f} Hz", linewidth=2.5, color=colors[idx])
         lines.append(line)
 
-    ax.set_ylim(np.max(z_model), 0)
+    if ylim is not None:
+        ax.set_ylim(max(ylim), min(ylim))  # Force inverted y-axis
+    else:
+        ax.set_ylim(np.max(z_model), 0)
+        
     ax.set_xlim(0, x_max)
     
     ax.set_xlabel("Sensitivity Kernel ($\partial c / \partial V_s$)", fontsize=14)
@@ -926,7 +923,7 @@ def animate_sensitivity_kernels(
     ax.grid(True, linestyle='--', alpha=0.7)
     ax.legend(loc="lower right", fontsize=12)
     
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    saved_frames = set()
 
     # Animation internal functions
     def init():
@@ -939,18 +936,14 @@ def animate_sensitivity_kernels(
         pos_m = positions[idx]
         vs_1d_ms = np.asarray(vs_matrix[:, idx], dtype=float)
 
-        # Extend the profile downward with the deepest (half-space) Vs so the
-        # model reaches max_model_depth (no-op when n_ext == 0).
         if n_ext > 0:
             vs_1d_ms = np.concatenate([vs_1d_ms, np.full(n_ext, vs_1d_ms[-1])])
 
-        # Build local 1D velocity model for this specific position
         vs_kms = vs_1d_ms / 1000.0
         vp_kms = vs_kms * vp_vs_ratio
         rho_gcm3 = np.full_like(vs_kms, density)
         velocity_model = np.column_stack((thickness_km, vp_kms, vs_kms, rho_gcm3))
 
-        # Initialize Disba
         ps = PhaseSensitivity(*velocity_model.T)
 
         for f_idx, f in enumerate(test_frequencies):
@@ -958,27 +951,32 @@ def animate_sensitivity_kernels(
             k = ps(period, mode=0, wave="rayleigh", parameter="velocity_s")
             kernel = np.asarray(k.kernel, dtype=float)
             if normalize:
-                # sensitivity per metre, so the thick terminal half-space layer
-                # is comparable to the thin layers above it.
                 kernel = kernel / np.asarray(thickness_m, dtype=float)
             lines[f_idx].set_data(kernel, k.depth * 1000.0)
 
         title.set_text(f"Rayleigh Wave Sensitivity\nat Position = {pos_m:.1f} m")
+
+        if save_indices is not None and idx in save_indices:
+            if idx not in saved_frames:
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(save_dir, f"Sensitivity_Kernel_Pos_{pos_m:.1f}m.{save_fmt}")
+                fig.savefig(save_path, dpi=save_dpi, bbox_inches="tight", facecolor="white")
+                saved_frames.add(idx)
+
         return lines + [title]
 
-    # Render
     if step is None:
-        step = max(1, len(positions) // 100) # Auto-scale to ~100 frames max
+        step = max(1, len(positions) // 100) 
         
     frames_to_render = range(0, len(positions), step)
 
     ani = FuncAnimation(
         fig, update, frames=frames_to_render, 
-        init_func=init, blit=True, interval=interval
+        init_func=init, blit=True, interval=interval_ms
     )
 
-    plt.close(fig) # Prevent ghost plots
-    return HTML(ani.to_jshtml())
+    plt.close(fig) 
+    return HTML(ani.to_jshtml()) 
 
 def save_sensitivity_kernel_plots(
     positions: np.ndarray, 
@@ -988,6 +986,7 @@ def save_sensitivity_kernel_plots(
     vp_vs_ratio: float = 2.0, 
     density: float = 1.0, 
     x_max: float = 0.08,
+    ylim: Tuple[float, float] | None = None,
     max_model_depth: float | None = None,
     normalize: bool = False,
     step: int | None = None,
@@ -1004,6 +1003,7 @@ def save_sensitivity_kernel_plots(
     
     :param step: Step size across the positions array. If step=10, every 10th position is saved.
                  If None, defaults to step=1 (saves every single position).
+    :param ylim: Optional tuple (min_depth, max_depth) to manually set the y-axis limits.
     :param save_dir: Directory where the static frames will be saved. Default is "../results/inv_sensitivity_urban".
     :param save_fmt: Image format for the saved frames (e.g., "png"). Default is "png".
     :param save_dpi: Resolution for the saved frames. Default is 300.
@@ -1054,7 +1054,11 @@ def save_sensitivity_kernel_plots(
             
             ax.plot(kernel, k.depth * 1000.0, label=f"{f} Hz", linewidth=2.5, color=colors[f_idx])
 
-        ax.set_ylim(np.max(z_model), 0)
+        if ylim is not None:
+            ax.set_ylim(max(ylim), min(ylim))
+        else:
+            ax.set_ylim(np.max(z_model), 0)
+            
         ax.set_xlim(0, x_max)
         ax.set_xlabel("Sensitivity Kernel ($\partial c / \partial V_s$)", fontsize=14)
         ax.set_ylabel("Depth (m)", fontsize=14)
