@@ -23,7 +23,7 @@ from scipy.interpolate import griddata
 
 from pathlib import Path
 from tqdm.auto import tqdm
-from typing import Tuple, List, Literal, Callable, Any, Union, Optional
+from typing import Tuple, List, Literal, Callable, Union, Optional, Sequence
 
 from src.utils import parse_ncf_stack_filename, fk_filter, fk_transform
 from src.ncf import get_vs_number, process_single_file, prep_ncf
@@ -2660,6 +2660,96 @@ def animate_fv_pick(
     
     plt.close(fig)
     return ani
+
+def save_disp_picks(
+    fv_files: Sequence[Union[str, Path]],
+    picks_dir: Union[str, Path],
+    outdir: Union[str, Path],
+    *,
+    xmin: Optional[float] = None,
+    xmax: Optional[float] = None,
+    ymin: Optional[float] = None,
+    ymax: Optional[float] = None,
+    cmap: str = "viridis",
+    figsize: Tuple[float, float] = (10, 6),
+    dpi: int = 300,
+    fmt: str = "png"
+) -> None:
+    """
+    Renders and saves static f-v (frequency-velocity) panels for a list of files,
+    overlaying saved dispersion picks if they exist.
+
+    :param fv_files: List of paths to the pre-computed _fv.npz files.
+    :param picks_dir: Directory where the corresponding _pick.npy files are stored.
+    :param outdir: Destination directory for the saved images. Created if it doesn't exist.
+    :param xmin: Optional minimum frequency axis limit (Hz).
+    :param xmax: Optional maximum frequency axis limit (Hz).
+    :param ymin: Optional minimum phase velocity axis limit (m/s).
+    :param ymax: Optional maximum phase velocity axis limit (m/s).
+    :param cmap: Colormap for the dispersion image. Default is "viridis".
+    :param figsize: Figure dimensions (width, height) in inches. Default is (10, 6).
+    :param dpi: Resolution of the saved image. Default is 300.
+    :param fmt: Image format (e.g., "png", "pdf", "jpg"). Default is "png".
+    """
+    if not fv_files:
+        raise ValueError("No files found! Check your file path or glob pattern.")
+
+    out_path = Path(outdir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    picks_path = Path(picks_dir)
+
+    for fpath in tqdm(fv_files, desc=f"Saving to {out_path.name}"):
+        fpath_obj = Path(fpath)
+        data = np.load(fpath_obj, allow_pickle=True)
+        
+        # Move to CPU/NumPy if they are tensors
+        f_axis, v_axis, fv = data["f_axis"], data["v_axis"], data["fv"]
+        f_np = f_axis.cpu().numpy() if hasattr(f_axis, 'cpu') else np.asarray(f_axis)
+        v_np = v_axis.cpu().numpy() if hasattr(v_axis, 'cpu') else np.asarray(v_axis)
+        fv_np = fv.cpu().numpy() if hasattr(fv, 'cpu') else np.asarray(fv)
+        
+        fig, ax = plt.subplots(figsize=figsize, layout="constrained")
+        
+        extent = [f_np.min(), f_np.max(), v_np.min(), v_np.max()]
+        mesh = ax.imshow(
+            fv_np, 
+            extent=extent, 
+            aspect='auto', 
+            origin='lower', 
+            cmap=cmap,
+            interpolation='bicubic',  
+            vmin=np.nanmin(fv_np),
+            vmax=np.nanmax(fv_np)
+        )
+        
+        # Check for matching Pick file 
+        pick_fname = fpath_obj.name.replace("_fv.npz", "_pick.npy")
+        pick_file = picks_path / pick_fname
+        
+        if pick_file.exists():
+            pick_data = np.load(pick_file, allow_pickle=True).item()
+            ax.scatter(
+                pick_data['f'], pick_data['v'], 
+                color='red', s=30, edgecolors='white', linewidth=0.5, 
+                label="Saved Picks", zorder=10
+            )
+            ax.legend(loc='upper right')
+
+        ax.set_xlabel("Frequency (Hz)")
+        ax.set_ylabel("Phase velocity (m/s)")
+        fig.colorbar(mesh, ax=ax, label="Normalized Amplitude")
+
+        if xmin is not None: ax.set_xlim(left=xmin)
+        if xmax is not None: ax.set_xlim(right=xmax)
+        if ymin is not None: ax.set_ylim(bottom=ymin)
+        if ymax is not None: ax.set_ylim(top=ymax)
+
+        display_name = fpath_obj.name.replace("_fv.npz", "")
+        ax.set_title(f"Dispersion Viewer: {display_name}", pad=15)
+        
+        save_path = out_path / f"{display_name}_dispersion.{fmt}"
+        fig.savefig(save_path, dpi=dpi, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
 
 # ===========================================================================
 # 4. Plot Picks

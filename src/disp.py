@@ -512,88 +512,93 @@ def compute_dispersion_from_ncf(
 # 5. Regularize picks
 # =====================================================
 def regularize_dispersion_data(
-    x_raw: Sequence[float] | np.ndarray, 
-    y_raw: Sequence[float] | np.ndarray, 
-    z_raw: Sequence[float] | np.ndarray, 
-    f_min: float = 2.0, 
-    f_max: float = 6.0, 
-    f_step: float = 0.2
+    x_raw: Sequence[float] | np.ndarray,
+    y_raw: Sequence[float] | np.ndarray,
+    z_raw: Sequence[float] | np.ndarray,
+    f_min: float = 2.0,
+    f_max: float = 6.0,
+    f_step: float = 0.2,
+    min_points: int = 3,
+    extrapolate: bool = False,
 ) -> tuple[list[float], list[float], list[float], dict[float, dict[str, np.ndarray]]]:
     """
-    Regularizes scattered dispersion data onto a uniform frequency axis.
-    Averages duplicate frequencies (combining S1 and S2) and interpolates missing values.
-    
+    Regularizes scattered dispersion picks onto a uniform frequency axis, one
+    curve per station, for inversion.
+
+    Averages duplicate frequencies (combining S1 and S2) and linearly
+    interpolates onto ``f_target``. Crucially, by default it does **not**
+    extrapolate: target frequencies outside a station's actually-picked span are
+    dropped rather than filled with a flat edge velocity. This matters when
+    ``f_max`` is pushed to 8-9 Hz, where high-frequency coverage is sparse and
+    uneven -- constant extrapolation there would fabricate flat shallow
+    dispersion and bias the inversion. Interior gaps within the picked span are
+    still interpolated.
+
     :param x_raw: Raw spatial distances corresponding to the picks.
-    :type x_raw: array_like
     :param y_raw: Raw frequency values corresponding to the picks.
-    :type y_raw: array_like
     :param z_raw: Raw phase velocity values corresponding to the picks.
-    :type z_raw: array_like
-    :param f_min: Minimum frequency for the target uniform axis. Default is 2.0.
-    :type f_min: float, optional
-    :param f_max: Maximum frequency for the target uniform axis. Default is 6.0.
-    :type f_max: float, optional
-    :param f_step: Frequency step spacing for the target axis. Default is 0.2.
-    :type f_step: float, optional
-    :returns: A tuple containing flattened lists of regularized (x, y, z) data for plotting, 
-              and a dictionary mapping each distance to its cleaned 'f' and 'v' arrays for inversion.
+    :param f_min: Minimum frequency for the target uniform axis.
+    :param f_max: Maximum frequency for the target uniform axis.
+    :param f_step: Frequency step spacing for the target axis.
+    :param min_points: Minimum number of valid (in-span) grid points a station
+        must have to be kept; stations with fewer are skipped.
+    :param extrapolate: If True, restore the old behaviour and pad beyond the
+        picked span with the nearest velocity (constant extrapolation). Default
+        False -- out-of-span points are dropped, not fabricated.
+    :returns: A tuple of flattened lists of regularized (x, y, z) for plotting,
+              and a dict mapping each distance to its cleaned 'f' and 'v' arrays
+              for inversion. Each station's arrays cover only its picked span.
     :rtype: tuple[list[float], list[float], list[float], dict[float, dict[str, np.ndarray]]]
     """
-    # 1. Define the standard inversion frequency axis
-    # We add f_step/2 to f_max to ensure the final value is included in np.arange
-    f_target = np.arange(f_min, f_max + (f_step / 2), f_step) 
-    
-    regularized_profiles = {}
-    x_reg = []
-    y_reg = []
-    z_reg = []
+    # Standard inversion frequency axis (add f_step/2 so f_max is included).
+    f_target = np.arange(f_min, f_max + (f_step / 2), f_step)
 
-    unique_distances = np.unique(x_raw)
+    regularized_profiles: dict[float, dict[str, np.ndarray]] = {}
+    x_reg: list[float] = []
+    y_reg: list[float] = []
+    z_reg: list[float] = []
 
-    for dist in unique_distances:
-        # Extract raw data for this specific distance
-        mask = np.array(x_raw) == dist
-        f_station = np.array(y_raw)[mask]
-        v_station = np.array(z_raw)[mask]
-        
-        # --- Average duplicate frequencies (Combine S1 & S2) ---
+    x_arr = np.asarray(x_raw, dtype=float)
+    y_arr = np.asarray(y_raw, dtype=float)
+    z_arr = np.asarray(z_raw, dtype=float)
+
+    for dist in np.unique(x_arr):
+        sel = x_arr == dist
+        f_station = y_arr[sel]
+        v_station = z_arr[sel]
+
+        # --- Average duplicate frequencies (combine S1 & S2); np.unique sorts. ---
         f_unique = np.unique(f_station)
-        v_unique = np.array([np.mean(v_station[f_station == f_val]) for f_val in f_unique])
-        
-        # --- Mute/Drop data above f_max ---
-        valid = f_unique <= f_max
-        f_clean = f_unique[valid]
-        v_clean = v_unique[valid]
-        
-        # Skip if a station somehow has fewer than 2 points left
+        v_unique = np.array([np.nanmean(v_station[f_station == fv]) for fv in f_unique])
+
+        # --- Keep only real picks inside [f_min, f_max]. ---
+        in_band = (f_unique >= f_min - f_step / 2) & (f_unique <= f_max + f_step / 2)
+        finite = np.isfinite(f_unique) & np.isfinite(v_unique)
+        f_clean = f_unique[in_band & finite]
+        v_clean = v_unique[in_band & finite]
         if len(f_clean) < 2:
             continue
-            
-        # 2. Build the Interpolator for this station
+
+        # --- Interpolate onto the grid; do NOT extrapolate beyond the span. ---
+        fill = (v_clean[0], v_clean[-1]) if extrapolate else (np.nan, np.nan)
         interp_func = interp1d(
-            f_clean, 
-            v_clean, 
-            kind='linear', 
-            bounds_error=False, 
-            # Pad missing edges with the nearest valid velocity
-            fill_value=(v_clean[0], v_clean[-1]) 
+            f_clean, v_clean, kind="linear", bounds_error=False, fill_value=fill
         )
-        
-        # 3. Apply it to our standard target frequency axis
         v_target = interp_func(f_target)
-        
-        # Save to dictionary for inversion later
-        regularized_profiles[dist] = {
-            'f': f_target,
-            'v': v_target
-        }
-        
-        # Save to lists for plotting
-        x_reg.extend([dist] * len(f_target))
-        y_reg.extend(f_target)
-        z_reg.extend(v_target)
-        
+
+        ok = np.isfinite(v_target)
+        if int(ok.sum()) < min_points:
+            continue
+        f_keep = f_target[ok]
+        v_keep = v_target[ok]
+
+        regularized_profiles[dist] = {"f": f_keep, "v": v_keep}
+        x_reg.extend([dist] * len(f_keep))
+        y_reg.extend(f_keep.tolist())
+        z_reg.extend(v_keep.tolist())
+
     return x_reg, y_reg, z_reg, regularized_profiles
+
 
 # =====================================================
 # 6. Save regularized picks for inversion
